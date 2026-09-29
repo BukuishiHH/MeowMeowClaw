@@ -138,5 +138,13 @@ def load_settings(env_file: Optional[Union[str, Path]] = None) -> Settings:
     return settings
 
 
-# 全局单例
+def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
+    """加载项目配置(对外入口名, 语义与 load_settings 完全一致).
+
+    供 main.py 等入口在启动时调用; 每次调用都会重新读盘, 因此改完 .env 立即生效。
+    """
+    return load_settings(env_file)
+
+
+# 全局单例: 各处 import 即用, 例如 from backend.config import settings
 settings = load_settings()

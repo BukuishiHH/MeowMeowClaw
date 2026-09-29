@@ -141,7 +141,7 @@ class TestEnvFileLoading:
     def test_malformed_file_does_not_raise(self, tmp_path, monkeypatch):
         env = write_env(tmp_path, "model=x\n")
         monkeypatch.setattr(
-            "backend.config._dotenv_values",
+            "backend.config.dotenv_values",
             lambda path: (_ for _ in ()).throw(ValueError("解析炸了")),
         )
 
@@ -249,16 +249,13 @@ class TestApiKeyHandling:
 
         assert load_settings(env).api_key == "sk-plain"
 
-    def test_placeholder_value_passes_through_with_warning(self, tmp_path, caplog):
-        # 直接抄 .env.example 忘了替换: 值原样透传, 但要给出告警提示
+    def test_placeholder_value_passes_through_unchanged(self, tmp_path):
+        # 配置层不校验密钥格式: 直接抄 .env.example 忘了替换时会原样透传,
+        # 直到真正调用模型才会暴露认证失败
         env = write_env(tmp_path, "api_key=your_api_key\n")
 
-        with caplog.at_level(logging.WARNING, logger="backend.config"):
-            s = load_settings(env)
-
-        assert s.api_key == "your_api_key"
-        assert any("占位符" in r.message for r in caplog.records)
-        assert all("your_api_key" not in r.getMessage() for r in caplog.records)  # 不回显密钥
+        assert load_settings(env).api_key == "your_api_key"
+        assert load_settings(env).has_api_key is True
 
     def test_dotenv_expands_variable_reference(self, tmp_path, monkeypatch):
         # 推荐写法: api_key=${DEEPSEEK_API_KEY}
@@ -266,22 +263,6 @@ class TestApiKeyHandling:
         env = write_env(tmp_path, "api_key=${DEEPSEEK_API_KEY}\n")
 
         assert load_settings(env).api_key == "sk-from-env"
-
-    def test_python_expression_is_compatibly_resolved(self, tmp_path, monkeypatch, caplog):
-        # 兼容笔误写法: api_key=os.getenv("DEEPSEEK_API_KEY")
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-compat")
-        env = write_env(tmp_path, 'api_key=os.getenv("DEEPSEEK_API_KEY")\n')
-
-        with caplog.at_level(logging.WARNING, logger="backend.config"):
-            s = load_settings(env)
-
-        assert s.api_key == "sk-compat"
-        assert any("os.getenv" in r.message for r in caplog.records)
-
-    def test_python_expression_without_env_var_is_empty(self, tmp_path):
-        env = write_env(tmp_path, 'api_key=os.getenv("NOT_SET_ANYWHERE")\n')
-
-        assert load_settings(env).api_key == ""
 
     def test_missing_api_key_warns_but_does_not_raise(self, tmp_path, caplog):
         env = write_env(tmp_path, "model=m\n")

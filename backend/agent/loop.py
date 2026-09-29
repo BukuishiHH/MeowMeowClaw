@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from backend.agent.context import ContextBuilder
 from backend.agent.tools.registry import ToolRegistry
+from backend.config import settings
 from backend.providers.base import FINISH_REASON_ERROR, LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,8 @@ class AgentLoop:
         tools: 工具注册表
         context: System Prompt / messages 构建器
         model: 按次覆盖 provider 的默认模型; None 表示用 provider 自己的默认模型
-        max_iterations: 单轮对话内 "模型<->工具" 往返次数上限, 防止死循环
+        max_iterations: 单轮对话内 "模型<->工具" 往返次数上限, 防止死循环;
+            None 表示读取配置文件(backend/config.py -> .env 的 max_iterations, 默认 32)
 
     注意:
         - 只有完整跑完的一轮(模型给出最终回答)才写入 _session_history,
@@ -61,13 +63,14 @@ class AgentLoop:
         tools: ToolRegistry,
         context: ContextBuilder,
         model: Optional[str] = None,
-        max_iterations: int = 32,
+        max_iterations: Optional[int] = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.context = context
         self.model = model
-        self.max_iterations = max_iterations
+        # 未显式指定时, 取配置文件里的值(.env 的 max_iterations)
+        self.max_iterations = settings.max_iterations if max_iterations is None else max_iterations
         # 工具调用签名滑动窗口, 用于防爆(同一调用反复重试)
         self._tool_call_history: list[str] = []
         # 跨轮次的会话历史(不含 system, system 每轮由 ContextBuilder 重建)

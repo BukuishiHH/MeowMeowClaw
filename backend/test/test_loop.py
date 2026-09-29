@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import backend.agent.loop as loop_module
 from backend.agent.context import ContextBuilder
 from backend.agent.loop import (
     CIRCUIT_BREAK_PREFIX,
@@ -31,6 +32,7 @@ from backend.agent.loop import (
 )
 from backend.agent.tools import ReadFileTool
 from backend.agent.tools.registry import ToolRegistry
+from backend.config import Settings
 from backend.providers.base import (
     FINISH_REASON_ERROR,
     FINISH_REASON_STOP,
@@ -78,6 +80,12 @@ class ScriptedProvider(LLMProvider):
         if self._default is not None:
             return self._default
         raise AssertionError("脚本已用尽, 但主循环仍在调用 provider")
+
+
+@pytest.fixture(autouse=True)
+def isolate_config(monkeypatch):
+    """max_iterations 的默认值来自 config.settings, 这里固定住, 免受开发者本地 .env 影响."""
+    monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=32))
 
 
 def text_response(content: str) -> LLMResponse:
@@ -144,6 +152,37 @@ def all_keys(messages: list[dict[str, Any]]) -> set[str]:
 
 def find_message(messages: list[dict[str, Any]], role: str) -> dict[str, Any]:
     return next(m for m in messages if m["role"] == role)
+
+
+# ------------------------------------------------- 默认参数来自配置文件(config)
+
+
+class TestConfigDrivenDefaults:
+    @pytest.mark.asyncio
+    async def test_default_max_iterations_comes_from_config(self, monkeypatch):
+        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=7))
+        provider = ScriptedProvider(default=tool_response(make_call()))
+        loop = make_loop(provider)
+
+        assert loop.max_iterations == 7
+        assert "最大迭代次数 7" in await loop.run("hi")
+        assert len(provider.calls) == 7
+
+    def test_explicit_argument_overrides_config(self, monkeypatch):
+        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=7))
+
+        assert make_loop(ScriptedProvider(text_response("x")), max_iterations=3).max_iterations == 3
+
+    def test_no_argument_reads_config_at_construction_time(self, monkeypatch):
+        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=5))
+        first = make_loop(ScriptedProvider(text_response("x")))
+        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=9))
+        second = make_loop(ScriptedProvider(text_response("x")))
+
+        assert (first.max_iterations, second.max_iterations) == (5, 9)
+
+    def test_repr_shows_effective_max_iterations(self):
+        assert "32" in repr(make_loop(ScriptedProvider(text_response("x"))))
 
 
 # ------------------------------------------------------------------ 正常文本回复

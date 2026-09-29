@@ -27,7 +27,16 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec
 import pytest
 
 from backend.agent.tools import BaseTool
-from backend.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from backend.providers.base import (
+    FINISH_REASON_CONTENT_FILTER,
+    FINISH_REASON_ERROR,
+    FINISH_REASON_LENGTH,
+    FINISH_REASON_STOP,
+    FINISH_REASON_TOOL_CALLS,
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+)
 
 # --------------------------------------------------------------- 测试替身与消费者
 
@@ -291,6 +300,7 @@ class TestLLMResponse:
             "tool_calls",
             "finish_reason",
             "usage",
+            "reasoning_content",  # 新增字段放在末尾, 不影响既有位置参数调用
         ]
 
     def test_content_is_required_but_may_be_none(self):
@@ -304,8 +314,9 @@ class TestLLMResponse:
         response = LLMResponse(content="hi")
 
         assert response.tool_calls == []
-        assert response.finish_reason == "stop"
+        assert response.finish_reason == FINISH_REASON_STOP
         assert response.usage == {}
+        assert response.reasoning_content is None
 
     def test_tool_calls_default_is_not_shared_between_instances(self):
         first, second = LLMResponse(content="a"), LLMResponse(content="b")
@@ -376,6 +387,74 @@ class TestLLMResponse:
                 "reasoning_content": "思考中",
             }
         ]
+
+    def test_reasoning_content_defaults_to_none(self):
+        assert LLMResponse(content="hi").reasoning_content is None
+
+    def test_pure_text_reasoning_reply_keeps_thinking_text(self):
+        # 纯文本推理回复(无工具调用)的思考过程不再丢失
+        response = LLMResponse(content="答案是 42", reasoning_content="先算 6*7")
+
+        assert response.has_tool_calls is False
+        assert response.reasoning_content == "先算 6*7"
+        assert response.content == "答案是 42"
+
+    def test_reasoning_content_coexists_with_tool_calls(self):
+        call = ToolCallRequest(id="c1", name="read_file", arguments={}, reasoning_content="按 call 的思考")
+        response = LLMResponse(
+            content=None, tool_calls=[call], reasoning_content="整轮思考", finish_reason="tool_calls"
+        )
+
+        assert response.reasoning_content == "整轮思考"
+        assert response.tool_calls[0].reasoning_content == "按 call 的思考"  # 两级思考互不覆盖
+
+    def test_reasoning_content_participates_in_asdict_and_equality(self):
+        assert asdict(LLMResponse(content="hi", reasoning_content="思考"))["reasoning_content"] == "思考"
+        assert LLMResponse(content="hi", reasoning_content="思考") == LLMResponse(
+            content="hi", reasoning_content="思考"
+        )
+        assert LLMResponse(content="hi", reasoning_content="A") != LLMResponse(
+            content="hi", reasoning_content="B"
+        )
+
+
+# ------------------------------------------------------------ finish_reason 契约
+
+
+class TestFinishReasonContract:
+    """finish_reason 取值与 OpenAI 协议对齐, 上层统一引用常量而非硬编码字符串."""
+
+    def test_constants_match_openai_wire_values(self):
+        # 与 OpenAI Chat Completions 返回值逐字一致, Provider 才能原样透传
+        assert FINISH_REASON_STOP == "stop"
+        assert FINISH_REASON_LENGTH == "length"
+        assert FINISH_REASON_TOOL_CALLS == "tool_calls"
+        assert FINISH_REASON_CONTENT_FILTER == "content_filter"
+
+    def test_tool_calls_constant_is_plural(self):
+        # 回归防线: 曾把工具调用误记成 tool_call(单数), 与 OpenAI 实际返回值不符
+        assert FINISH_REASON_TOOL_CALLS != "tool_call"
+
+    def test_error_is_project_defined_not_a_wire_value(self):
+        wire_values = {
+            FINISH_REASON_STOP,
+            FINISH_REASON_LENGTH,
+            FINISH_REASON_TOOL_CALLS,
+            FINISH_REASON_CONTENT_FILTER,
+        }
+
+        assert FINISH_REASON_ERROR == "error"
+        assert FINISH_REASON_ERROR not in wire_values  # 项目自定义, 不会被服务端返回
+
+    def test_default_finish_reason_is_stop_constant(self):
+        assert LLMResponse(content="hi").finish_reason == FINISH_REASON_STOP
+        assert LLMResponse.__dataclass_fields__["finish_reason"].default == FINISH_REASON_STOP
+
+    def test_constants_are_exported_from_package(self):
+        import backend.providers as providers
+
+        assert providers.FINISH_REASON_TOOL_CALLS == "tool_calls"
+        assert providers.FINISH_REASON_ERROR == "error"
 
 
 # ---------------------------------------------------------------- 抽象基类约束

@@ -7,7 +7,7 @@
   * ``ToolRegistry`` / ``ContextBuilder`` 用 ``MagicMock(spec=...)`` 替身, 隔离工具与提示词实现;
   * 直接单元测试 ``_check_tool_loop`` 的阈值与滑动窗口, 并回归"熔断阈值必须真的可达";
 - 真实实现为辅: 端到端用例用真实 ContextBuilder + 真实 ToolRegistry + 真实 ReadFileTool,
-  只把模型替换成脚本, 验证 "模型要工具 -> 真读盘 -> 回填 -> 最终回答" 整条链路。
+  只把模型替换成脚本, 验证 "模型要工具 -> 真读盘 -> 回填 -> 最终回答" 整条链路.
 
 运行: pytest backend/test/test_loop.py -v
 """

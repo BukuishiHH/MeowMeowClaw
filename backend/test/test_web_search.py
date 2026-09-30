@@ -5,7 +5,7 @@
   不产生任何网络请求;
 - 替身会记录 **执行线程名**, 用来验证 ``DDGS().text()`` 确实被 ``asyncio.to_thread``
   丢进了工作线程(而不是阻塞事件循环);
-- 覆盖超时、异常、无结果、结果结构异常、超长截断、依赖缺失等分支。
+- 覆盖超时、异常、无结果、结果结构异常、超长截断、依赖缺失等分支.
 
 运行: pytest backend/test/test_web_search.py -v
 """
@@ -40,13 +40,13 @@ network_only = pytest.mark.skipif(
 )
 TCP_PROBE_TIMEOUT = 5.0
 
-SPEC_DESCRIPTION = "搜索互联网获取最新信息。当你需要查询实时信息、最新新闻或不确定的知识时使用。"
+SPEC_DESCRIPTION = "搜索互联网获取最新信息. 当你需要查询实时信息、最新新闻或不确定的知识时使用."
 
 SAMPLE_RESULTS = [
     {
         "title": "MeowMeowClaw 项目主页",
         "href": "https://example.com/meow",
-        "body": "一个不依赖编排框架的自定义 Agent。",
+        "body": "一个不依赖编排框架的自定义 Agent.",
     },
     {
         "title": "第二篇结果",
@@ -153,7 +153,7 @@ class TestResultFormatting:
         assert result == (
             "### 1. MeowMeowClaw 项目主页\n"
             "链接: https://example.com/meow\n"
-            "一个不依赖编排框架的自定义 Agent。\n"
+            "一个不依赖编排框架的自定义 Agent.\n"
         )
 
     @pytest.mark.asyncio
@@ -344,7 +344,7 @@ class TestEmptyAndErrors:
             result = await tool.execute(query="q")
 
         elapsed = time.monotonic() - started
-        assert result == "搜索出错: 搜索超时（0.05秒）"
+        assert result == "搜索出错: 搜索超时(0.05秒)"
         assert elapsed < 0.9, f"超时后未及时返回, 耗时 {elapsed:.2f}s"
         assert any("超时" in r.message for r in caplog.records)
 
@@ -442,8 +442,8 @@ class TestRegistryIntegration:
 
 
 # ============================================================ 真实联网连通性检测
-# 说明: 这一组用例会真的访问外网, 失败通常代表**环境连通性问题**而不是代码缺陷。
-# 三层探测(裸 TCP -> ddgs 库 -> WebSearchTool)是为了把问题定位到具体层次。
+# 说明: 这一组用例会真的访问外网, 失败通常代表**环境连通性问题**而不是代码缺陷.
+# 三层探测(裸 TCP -> ddgs 库 -> WebSearchTool)是为了把问题定位到具体层次.
 
 
 @pytest.mark.network
@@ -461,7 +461,7 @@ class TestRealNetwork:
     def test_connectivity_probe(self):
         """连通性探针: 逐目标打印结果, 只要求"当前环境至少有一条外网通路".
 
-        这样才能把"完全无外网"与"只是搜索引擎被拒/被墙"区分开。
+        这样才能把"完全无外网"与"只是搜索引擎被拒/被墙"区分开.
         """
         targets = (("duckduckgo.com", 443), ("pypi.org", 443), ("1.1.1.1", 53))
         results = {}

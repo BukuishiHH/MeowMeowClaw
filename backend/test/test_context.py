@@ -7,7 +7,7 @@
     并断言读取的**精确路径与编码**;
   * 用 ``MagicMock`` 顶替模块内 ``datetime``, 冻结 `now()` 以断言时间格式与"实时取值"语义;
 - 真实文件系统为辅: 用 tmp_path 跑一遍真实读盘, 防止 Mock 假设与真实行为脱节;
-- 验收标准: build_system_prompt() 必须同时含"人设内容"与"当前日期时间"。
+- 验收标准: build_system_prompt() 必须同时含"人设内容"与"当前日期时间".
 
 运行: pytest backend/test/test_context.py -v
 """

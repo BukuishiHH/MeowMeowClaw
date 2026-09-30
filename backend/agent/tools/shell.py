@@ -1,6 +1,6 @@
 """Shell 命令执行工具(工作区内执行, 带危险命令黑名单防护).
 
-⚠️ 安全声明: 本工具把「执行任意 Shell 命令」的能力交给模型, 黑名单只能拦住
+⚠️ 安全声明: 本工具把"执行任意 Shell 命令"的能力交给模型, 黑名单只能拦住
 **显式书写**的危险命令, 无法防御 `$(...)`/反引号/base64 解码执行/脚本文件等绕过手段.
 它是**护栏而非沙箱**. 生产环境应当: 放在容器或受限用户下运行、或默认不注册本工具.
 """
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # 命令执行超时(秒)与输出上限(字符)
 EXEC_TIMEOUT_SECONDS = 60
 MAX_OUTPUT_CHARS = 10000
-TRUNCATE_NOTICE = "\n...(输出过长，已截断)"
+TRUNCATE_NOTICE = "\n...(输出过长, 已截断)"
 
 # 危险命令黑名单(正则, 匹配时忽略大小写)
 # 说明: 这是**黑名单**, 只覆盖常见破坏性命令; 顺序即优先级, 命中即返回该条模式
@@ -107,7 +107,7 @@ class ExecTool(BaseTool):
         """
         for pattern in self.deny_patterns:
             if re.search(pattern, command, re.IGNORECASE):
-                return f"安全拦截：检测到危险命令模式 '{pattern}'"
+                return f"安全拦截: 检测到危险命令模式 '{pattern}'"
         return None
 
     # ------------------------------------------------------------------ 执行
@@ -146,7 +146,7 @@ class ExecTool(BaseTool):
             except asyncio.TimeoutError:
                 await self._terminate(process)
                 logger.warning("命令执行超时(%s 秒), 已终止: %r", EXEC_TIMEOUT_SECONDS, command)
-                return f"命令执行超时（{EXEC_TIMEOUT_SECONDS}秒），已终止"
+                return f"命令执行超时({EXEC_TIMEOUT_SECONDS}秒), 已终止"
         except Exception as exc:  # noqa: BLE001 任何异常都转成文本, 不炸主循环
             logger.warning("命令执行异常: %r (%r)", command, exc)
             return f"[命令执行异常] {exc!r}"
@@ -158,8 +158,8 @@ class ExecTool(BaseTool):
         try:
             if os.name == "posix" and hasattr(os, "killpg"):
                 pgid = os.getpgid(process.pid)
-                # 安全阀: 只有子进程处于**自己的**进程组(由 start_new_session 保证)时才整组清理。
-                # 否则 killpg 会打到我们自己的进程组 —— 那等于自杀/误杀父进程。
+                # 安全阀: 只有子进程处于**自己的**进程组(由 start_new_session 保证)时才整组清理.
+                # 否则 killpg 会打到我们自己的进程组 -- 那等于自杀/误杀父进程.
                 if pgid != os.getpgid(0):
                     os.killpg(pgid, signal.SIGKILL)
                 else:

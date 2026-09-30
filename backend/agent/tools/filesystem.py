@@ -5,7 +5,7 @@ from backend.agent.tools import BaseTool
 
 class ReadFileTool(BaseTool):
     """
-    读取本地文件工具，带工作区路径防护，超长内容自动截断
+    读取本地文件工具, 带工作区路径防护, 超长内容自动截断
     Args:
         workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
     """
@@ -110,7 +110,7 @@ class WriteFileTool(BaseTool):
 
 class ListDirTool(BaseTool):
     """
-    列出目录内容，带工作区防护，目录末尾加/，附带文件大小，名称排序
+    列出目录内容, 带工作区防护, 目录末尾加/, 附带文件大小, 名称排序
     Args:
         workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
     """

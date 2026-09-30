@@ -10,7 +10,7 @@
   并断言"被安全拦截时不得产生任何 IO 副作用";
 - 真实文件系统为辅: 关键路径用 tmp_path 再跑一遍, 校验 Mock 的假设与 OS 真实语义一致,
   防止 Mock 与真实契约脱节;
-- 契约校验: name / description / parameters(OpenAI JSON Schema) 与 BaseTool 抽象契约。
+- 契约校验: name / description / parameters(OpenAI JSON Schema) 与 BaseTool 抽象契约.
   说明: 路径校验用的是 ``str.startswith``, 存在同前缀兄弟目录绕过缺口, 见 TestKnownGaps.
 
 运行: pytest backend/test/test_filesystem.py -v
@@ -143,12 +143,12 @@ class TestReadFileMocked:
 
     @pytest.mark.asyncio
     async def test_reads_relative_path_as_utf8_text(self, workspace):
-        mock = mock_open(read_data="你好，MeowMeowClaw")
+        mock = mock_open(read_data="你好, MeowMeowClaw")
         with patch("builtins.open", mock):
             result = await ReadFileTool(workspace).execute(file_path="src/main.py")
 
         assert isinstance(result, str)
-        assert result == "你好，MeowMeowClaw"
+        assert result == "你好, MeowMeowClaw"
         mock.assert_called_once_with(resolve(workspace, "src/main.py"), "r", encoding="utf-8")
 
     @pytest.mark.asyncio

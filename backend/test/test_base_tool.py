@@ -37,7 +37,7 @@ async def test_minimal_tool_execute():
     assert ret == "exec result: {'msg': 'hello'}"
 
 def test_abc_abstract_enforce():
-    # 缺任意抽象成员，实例化直接抛TypeError，验证ABC约束生效
+    # 缺任意抽象成员, 实例化直接抛TypeError, 验证ABC约束生效
     class BadTool(BaseTool):
         # 故意不实现name、description等抽象属性
         pass

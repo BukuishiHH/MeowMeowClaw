@@ -5,7 +5,7 @@
   Provider 用真实实现(离线构造, 不发网络请求)以验证装配参数, 工具链则真的读写 tmp_path;
 - ``interactive_loop()``: 用真实 ``AgentLoop`` + Mock Provider 驱动, 只把 ``input()`` 换成脚本化的
   假实现(取尽即抛 EOFError, 防止用例写错时死循环), 从而稳定复现各命令与 Ctrl+C/Ctrl+D 分支;
-- ``main()``: Mock 掉 ``build_agent`` 与 ``asyncio.run``, 只验证启动流程与异常兜底。
+- ``main()``: Mock 掉 ``build_agent`` 与 ``asyncio.run``, 只验证启动流程与异常兜底.
 
 运行: pytest backend/test/test_main.py -v
 """

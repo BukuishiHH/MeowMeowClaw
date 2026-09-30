@@ -5,7 +5,7 @@
   保证结果可复现;
 - 用 ``monkeypatch`` 伪造环境变量/当前工作目录, 覆盖"环境变量覆盖 .env""相对路径不随 cwd 漂移"等分支;
 - 用 ``mock`` 注入解析失败、目录创建失败等异常路径;
-- 验收: 配置文件默认工作目录必须是**与 backend/ 同级的 workspace/**, 且真实存在。
+- 验收: 配置文件默认工作目录必须是**与 backend/ 同级的 workspace/**, 且真实存在.
 
 运行: pytest backend/test/test_config.py -v
 """

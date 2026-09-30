@@ -54,7 +54,7 @@ class AgentLoop:
           错误/熔断/超时的半截过程不写, 避免污染后续对话;
         - reasoning_content 只保留在 LLMResponse 上, 不回填进 messages
           (DeepSeek 等要求多轮时不能回传 reasoning_content);
-        - 同一实例不建议并发调用 run(), 内部状态(_session_history 等)未加锁。
+        - 同一实例不建议并发调用 run(), 内部状态(_session_history 等)未加锁.
     """
 
     def __init__(
@@ -189,7 +189,7 @@ class AgentLoop:
         注意:
             - function.arguments 必须是 JSON **字符串**, 而 ToolCallRequest.arguments 是 dict;
             - content 为 None 时回填空串, 兼容对 null 敏感的网关;
-            - 不回填 reasoning_content, 避免多轮时被上游拒绝。
+            - 不回填 reasoning_content, 避免多轮时被上游拒绝.
         """
         return {
             "role": "assistant",

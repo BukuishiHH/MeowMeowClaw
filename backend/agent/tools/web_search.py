@@ -1,7 +1,7 @@
 """DuckDuckGo 联网搜索工具.
 
-依赖 ``ddgs``(旧包名 ``duckduckgo_search`` 也兼容): ``pip install ddgs``。
-未安装时本模块依然可被导入, 只是执行时返回可读的提示文本。
+依赖 ``ddgs``(旧包名 ``duckduckgo_search`` 也兼容): ``pip install ddgs``.
+未安装时本模块依然可被导入, 只是执行时返回可读的提示文本.
 """
 
 import asyncio
@@ -24,7 +24,7 @@ DEFAULT_MAX_RESULTS = 5
 MAX_RESULTS_LIMIT = 20    # 上限护栏: 防止模型要 1000 条把上下文打爆
 MAX_OUTPUT_CHARS = 8000
 SEARCH_TIMEOUT_SECONDS = 20
-TRUNCATE_NOTICE = "\n...(内容过长，已截断)"
+TRUNCATE_NOTICE = "\n...(内容过长, 已截断)"
 
 
 class WebSearchTool(BaseTool):
@@ -35,7 +35,7 @@ class WebSearchTool(BaseTool):
         - ``DDGS().text()`` 是**同步阻塞**调用, 用 ``asyncio.to_thread`` 丢进线程池执行,
           避免卡住事件循环(同时用 ``asyncio.wait_for`` 加上超时护栏);
         - 每次搜索新建一个 ``DDGS`` 实例, 避免跨线程复用同一个客户端;
-        - 任何异常(含超时、网络错误、结果结构变化)都转成文本返回, 不抛给上层。
+        - 任何异常(含超时、网络错误、结果结构变化)都转成文本返回, 不抛给上层.
     """
 
     @property
@@ -44,7 +44,7 @@ class WebSearchTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "搜索互联网获取最新信息。当你需要查询实时信息、最新新闻或不确定的知识时使用。"
+        return "搜索互联网获取最新信息. 当你需要查询实时信息、最新新闻或不确定的知识时使用."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -91,7 +91,7 @@ class WebSearchTool(BaseTool):
             )
         except asyncio.TimeoutError:
             logger.warning("搜索超时(%s 秒): %r", SEARCH_TIMEOUT_SECONDS, query)
-            return f"搜索出错: 搜索超时（{SEARCH_TIMEOUT_SECONDS}秒）"
+            return f"搜索出错: 搜索超时({SEARCH_TIMEOUT_SECONDS}秒)"
         except Exception as exc:  # noqa: BLE001 搜索失败不该炸主循环
             logger.warning("搜索失败: %r (%r)", query, exc)
             return f"搜索出错: {exc}"

@@ -4,7 +4,7 @@
 - 用 ``unittest.mock.MagicMock(spec=BaseTool)`` 伪造工具实例(隔离真实工具实现),
   ``spec=BaseTool`` 会让 async 的 ``execute`` 自动变成 ``AsyncMock``, 从而验证:
   注册、查重、定义查询、按名路由执行、kwargs 解包、异常包装、repr 等行为;
-- 另用最小真实子类(EchoTool / StrictTool)做集成校验, 防止 Mock 与真实契约脱节。
+- 另用最小真实子类(EchoTool / StrictTool)做集成校验, 防止 Mock 与真实契约脱节.
 
 运行: pytest backend/test/test_tool_registry.py -v
 """

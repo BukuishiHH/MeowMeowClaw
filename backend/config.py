@@ -2,7 +2,7 @@
 约定:
     - 配置文件为项目根目录下的 ``.env``(与 ``backend/`` 同级)
     - 取值优先级: **系统环境变量 > .env 文件 > 代码默认值**
-    - 工作目录默认预设为与 ``backend/`` 同级的 ``workspace/``，加载时自动创建。
+    - 工作目录默认预设为与 ``backend/`` 同级的 ``workspace/``, 加载时自动创建.
 用法::
     from backend.config import settings
     print(settings.workspace, settings.max_iterations)
@@ -141,7 +141,7 @@ def load_settings(env_file: Optional[Union[str, Path]] = None) -> Settings:
 def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
     """加载项目配置(对外入口名, 语义与 load_settings 完全一致).
 
-    供 main.py 等入口在启动时调用; 每次调用都会重新读盘, 因此改完 .env 立即生效。
+    供 main.py 等入口在启动时调用; 每次调用都会重新读盘, 因此改完 .env 立即生效.
     """
     return load_settings(env_file)
 

@@ -6,7 +6,7 @@
   输出拼装、截断、超时清理与异常兜底;
 - 真实进程为辅: 另用真实 shell 跑一批用例(echo / pwd / 退出码 / 非 UTF-8 / 真实超时),
   校验 Mock 假设与真实行为一致, 防止 Mock 失真;
-- 安全防护: 黑名单逐条覆盖 + 大小写不敏感 + 子类可扩展, 并断言"拦截时不创建任何进程"。
+- 安全防护: 黑名单逐条覆盖 + 大小写不敏感 + 子类可扩展, 并断言"拦截时不创建任何进程".
 
 运行: pytest backend/test/test_shell.py -v
 """
@@ -197,7 +197,7 @@ class TestDenyPatterns:
     def test_dangerous_commands_are_blocked(self, tool, command, pattern):
         verdict = tool._is_dangerous(command)
 
-        assert verdict == f"安全拦截：检测到危险命令模式 '{pattern}'"
+        assert verdict == f"安全拦截: 检测到危险命令模式 '{pattern}'"
 
     @pytest.mark.parametrize("command", SAFE_SAMPLES)
     def test_safe_commands_pass(self, tool, command):
@@ -316,7 +316,7 @@ class TestExecuteWithMockedProcess:
 
         result = await tool.execute(command="sudo rm -rf /")
 
-        assert result.startswith("安全拦截：")
+        assert result.startswith("安全拦截:")
         assert spawn.await_count == 0  # 拦截时不创建任何进程
 
     @pytest.mark.asyncio
@@ -326,7 +326,7 @@ class TestExecuteWithMockedProcess:
 
         result = await tool.execute(command="mkfs.ext4 /dev/sda1")
 
-        assert result.startswith("安全拦截：")
+        assert result.startswith("安全拦截:")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kwargs", [{}, {"command": ""}, {"command": "   "}, {"command": None}])
@@ -372,14 +372,14 @@ class TestTimeout:
 
         result = await tool.execute(command="sleep 999")
 
-        assert result == "命令执行超时（0.05秒），已终止"
+        assert result == "命令执行超时(0.05秒), 已终止"
         killpg.assert_called_once()                       # 杀的是整个进程组
         state["process"].wait.assert_awaited()            # 并回收子进程
         state["process"].kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_never_kills_own_process_group(self, tool, fake_spawn, monkeypatch):
-        """安全阀回归: 子进程若与父进程同组, 绝不能 killpg —— 那会连测试进程一起杀掉."""
+        """安全阀回归: 子进程若与父进程同组, 绝不能 killpg -- 那会连测试进程一起杀掉."""
         state, _ = fake_spawn
         state["process"] = make_process(hang=True)
         monkeypatch.setattr(shell_module, "EXEC_TIMEOUT_SECONDS", 0.05)
@@ -391,7 +391,7 @@ class TestTimeout:
 
         killpg.assert_not_called()                          # 绝不杀自己所在的进程组
         state["process"].kill.assert_called_once()          # 退化为杀单进程
-        assert result == "命令执行超时（0.05秒），已终止"
+        assert result == "命令执行超时(0.05秒), 已终止"
 
     @pytest.mark.asyncio
     async def test_fallback_to_single_process_kill(self, tool, fake_spawn, monkeypatch):
@@ -420,7 +420,7 @@ class TestTimeout:
         monkeypatch.setattr(shell_module.os, "killpg", MagicMock())
         monkeypatch.setattr(shell_module.os, "getpgid", lambda pid: pid)
 
-        assert await tool.execute(command="sleep 999") == "命令执行超时（5秒），已终止"
+        assert await tool.execute(command="sleep 999") == "命令执行超时(5秒), 已终止"
 
     @pytest.mark.asyncio
     async def test_timeout_is_logged(self, tool, fake_spawn, monkeypatch, caplog):
@@ -487,7 +487,7 @@ class TestRealShell:
         result = await tool.execute(command="sleep 30")
 
         elapsed = time.monotonic() - started
-        assert result == "命令执行超时（0.3秒），已终止"
+        assert result == "命令执行超时(0.3秒), 已终止"
         assert elapsed < 5, f"超时后未及时返回, 耗时 {elapsed:.2f}s"
 
     @pytest.mark.asyncio
@@ -497,7 +497,7 @@ class TestRealShell:
 
         result = await tool.execute(command=f"rm -rf {tmp_path}")
 
-        assert result.startswith("安全拦截：")
+        assert result.startswith("安全拦截:")
         assert target.exists()  # 文件毫发无损
 
 

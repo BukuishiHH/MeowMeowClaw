@@ -7,7 +7,7 @@
   保证被测代码面对的是真正的 SDK 数据结构(pydantic extra="allow" 等行为都是真的);
   只有 SDK 校验不通过的畸形响应(如 finish_reason=None / 缺 message)才用 SimpleNamespace 模拟网关异常返回;
 - 端到端: 把 LLM 返回的 tool_call 经 ToolCallRequest 送进真实 ToolRegistry + 真实 ReadFileTool,
-  验证 "LLM JSON -> ToolCallRequest -> registry -> 工具" 整条链路。
+  验证 "LLM JSON -> ToolCallRequest -> registry -> 工具" 整条链路.
 
 运行: pytest backend/test/test_openai_compat.py -v
 """

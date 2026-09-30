@@ -5,7 +5,7 @@
   重定向/超时/头部逻辑, 只是不发真实请求, 因此能验证 "async with 是否真的关了连接",
   比整体 mock 掉 AsyncClient 保真得多;
 - DNS 解析默认打桩成公网 IP(autouse), 单测零网络依赖; 内外网判定用例按需覆盖;
-- 另有一组 `RUN_NETWORK_TESTS=1` 才跑的真实联网用例。
+- 另有一组 `RUN_NETWORK_TESTS=1` 才跑的真实联网用例.
 
 运行: pytest backend/test/test_web_fetch.py -v
 """
@@ -31,15 +31,15 @@ from backend.agent.tools.web_fetch import (
 
 PUBLIC_IP = "93.184.216.34"  # 任意公网地址, 仅用于打桩解析结果
 SPEC_DESCRIPTION = (
-    "抓取指定 URL 的网页内容。当你需要阅读某个具体网页的详细内容时使用。"
-    "通常配合 web_search 工具先搜索再抓取。"
+    "抓取指定 URL 的网页内容. 当你需要阅读某个具体网页的详细内容时使用."
+    "通常配合 web_search 工具先搜索再抓取."
 )
 
 HTML_PAGE = """<html><head><title>标题</title></head><body>
 <h1>大标题</h1>
-<p>正文第一段, 带一个<a href="https://example.com/next">链接</a>。</p>
+<p>正文第一段, 带一个<a href="https://example.com/next">链接</a>. </p>
 <p><img src="https://example.com/a.png" alt="图"></p>
-<p>正文第二段。</p>
+<p>正文第二段. </p>
 </body></html>"""
 
 
@@ -106,7 +106,7 @@ class TestToolContract:
         """规格写死的数值必须钉字面量."""
         assert fetch_module.FETCH_TIMEOUT_SECONDS == 15
         assert MAX_OUTPUT_CHARS == 12000
-        assert TRUNCATE_NOTICE == "\n...(内容过长，已截断)"
+        assert TRUNCATE_NOTICE == "\n...(内容过长, 已截断)"
         assert fetch_module.ALLOWED_SCHEMES == ("http", "https")
 
     def test_is_base_tool_with_expected_name(self, tool):
@@ -159,7 +159,7 @@ class TestUrlSafety:
 
         result = await tool.execute(url=url)
 
-        assert result in {"安全拦截：只允许 http/https 协议", f"[错误] URL 格式不正确: {url}"}
+        assert result in {"安全拦截: 只允许 http/https 协议", f"[错误] URL 格式不正确: {url}"}
         assert "client" not in record  # 根本没发请求
 
     @pytest.mark.parametrize("kwargs", [{}, {"url": ""}, {"url": "   "}, {"url": None}])
@@ -215,7 +215,7 @@ class TestSsrfProtection:
 
         result = await tool.execute(url=url)
 
-        assert result.startswith("安全拦截：禁止访问本机/内网地址"), result
+        assert result.startswith("安全拦截: 禁止访问本机/内网地址"), result
         assert "client" not in record  # 拦截时绝不发请求
 
     @pytest.mark.asyncio
@@ -225,7 +225,7 @@ class TestSsrfProtection:
 
         result = await tool.execute(url="http://localtest.me/")
 
-        assert result == "安全拦截：禁止访问本机/内网地址 (localtest.me -> 127.0.0.1)"
+        assert result == "安全拦截: 禁止访问本机/内网地址 (localtest.me -> 127.0.0.1)"
         assert "client" not in record
 
     @pytest.mark.asyncio
@@ -351,7 +351,7 @@ class TestFetchAndConvert:
     async def test_non_2xx_returns_status_text(self, fetched, status):
         tool, _ = fetched(lambda request: httpx.Response(status, content=b"x"))
 
-        assert await tool.execute(url="https://example.com/") == f"抓取失败：HTTP {status}"
+        assert await tool.execute(url="https://example.com/") == f"抓取失败: HTTP {status}"
 
     @pytest.mark.asyncio
     async def test_redirects_are_followed(self, fetched):

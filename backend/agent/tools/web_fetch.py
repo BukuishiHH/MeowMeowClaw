@@ -5,7 +5,7 @@
     - 默认**拒绝**回环/内网/链路本地/保留地址(SSRF 防护): 模型可能被网页内容诱导去抓
       `http://127.0.0.1:7897`、`http://169.254.169.254/`(云元数据)、路由器后台等本机/内网资源;
     - 已知局限: `follow_redirects=True` 时, 若远端 302 跳到内网地址, 本次抓取仍会发出请求
-      (只做发起前检查, 未做逐跳校验); 另存在 DNS 重绑定窗口(check 与实际连接各解析一次)。
+      (只做发起前检查, 未做逐跳校验); 另存在 DNS 重绑定窗口(check 与实际连接各解析一次).
 """
 
 import asyncio
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 FETCH_TIMEOUT_SECONDS = 15
 MAX_OUTPUT_CHARS = 12000
 MAX_HTML_BYTES = 2 * 1024 * 1024   # 只转换前 2MB, 避免超大页面拖垮转换(输出本来就要截断)
-TRUNCATE_NOTICE = "\n...(内容过长，已截断)"
+TRUNCATE_NOTICE = "\n...(内容过长, 已截断)"
 EMPTY_NOTICE = "(未提取到正文内容)"
 ALLOWED_SCHEMES = ("http", "https")
 
@@ -63,7 +63,7 @@ def _is_blocked_ip(ip: Any) -> bool:
 
     用 ``is_global`` 统一判定, 比 ``is_private`` 更严格: 例如 100.64.0.0/10(CGNAT,
     Tailscale 等也在用)在 Python 3.11 里 ``is_private`` 为 False, 但同样不该被 Agent
-    访问 —— 它覆盖回环/内网/链路本地/保留/基准测试/组播/未指定等全部情况。
+    访问 -- 它覆盖回环/内网/链路本地/保留/基准测试/组播/未指定等全部情况.
     """
     return not ip.is_global
 
@@ -82,7 +82,7 @@ class WebFetchTool(BaseTool):
         - HTML 用 html2text 转 Markdown(保留链接、忽略图片、不自动换行);
           非 HTML 内容(纯文本/JSON 等)原样返回;
         - 连续空行折叠为单个空行, 超过 12000 字符截断;
-        - 所有异常都转成文本返回, 不抛给上层。
+        - 所有异常都转成文本返回, 不抛给上层.
     """
 
     def __init__(self, allow_private: bool = False) -> None:
@@ -100,7 +100,7 @@ class WebFetchTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "抓取指定 URL 的网页内容。当你需要阅读某个具体网页的详细内容时使用."
+            "抓取指定 URL 的网页内容. 当你需要阅读某个具体网页的详细内容时使用."
             "通常配合 web_search 工具先搜索再抓取."
         )
 
@@ -133,7 +133,7 @@ class WebFetchTool(BaseTool):
 
         parsed = urlparse(url)
         if parsed.scheme.lower() not in ALLOWED_SCHEMES:
-            return "安全拦截：只允许 http/https 协议"
+            return "安全拦截: 只允许 http/https 协议"
         if not parsed.netloc or not parsed.hostname:
             return f"[错误] URL 格式不正确: {url}"
 
@@ -173,7 +173,7 @@ class WebFetchTool(BaseTool):
         """
         host = hostname.strip("[]")  # IPv6 字面量带方括号
         if host.lower() == "localhost" or host.lower().endswith(".localhost"):
-            return f"安全拦截：禁止访问本机/内网地址 ({hostname})"
+            return f"安全拦截: 禁止访问本机/内网地址 ({hostname})"
 
         candidates = [host]
         if not _is_ip_literal(host):
@@ -189,7 +189,7 @@ class WebFetchTool(BaseTool):
             except ValueError:
                 continue
             if _is_blocked_ip(ip):
-                return f"安全拦截：禁止访问本机/内网地址 ({hostname} -> {ip})"
+                return f"安全拦截: 禁止访问本机/内网地址 ({hostname} -> {ip})"
         return None
 
     # ------------------------------------------------------------------ 正文转换

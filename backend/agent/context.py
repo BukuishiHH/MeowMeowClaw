@@ -9,9 +9,9 @@
     messages = builder.build_messages(history=history, current_message="帮我改个 bug")
 
 人设文件的查找顺序(前者优先):
-    1. workspace/identity_file     —— 工作区里的人设, 随项目走
-    2. backend/identity_file       —— 项目自带兜底人设(identity.md 就放在这里)
-两者都不可用时回退 DEFAULT_IDENTITY。
+    1. workspace/identity_file     -- 工作区里的人设, 随项目走
+    2. backend/identity_file       -- 项目自带兜底人设(identity.md 就放在这里)
+两者都不可用时回退 DEFAULT_IDENTITY.
 """
 
 import logging

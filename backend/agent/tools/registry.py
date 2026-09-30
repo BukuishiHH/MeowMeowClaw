@@ -47,7 +47,7 @@ class ToolRegistry:
             result = await tool.execute(**arguments)
             return result
         except Exception as e:
-            # 捕获所有异常，包装成字符串返回，避免Agent中断
+            # 捕获所有异常, 包装成字符串返回, 避免Agent中断
             return f"执行工具 [{name}] 发生异常: {str(e)}"
 
     def list_tools(self) -> List[str]:

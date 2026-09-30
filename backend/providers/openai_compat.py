@@ -53,7 +53,7 @@ class OpenAICompatProvider(LLMProvider):
     注意:
         - 无可用密钥时, AsyncOpenAI 在构造阶段直接抛 OpenAIError(快速失败, 不打哑炮);
         - api_key 不会出现在 __repr__ 与日志中;
-        - 应用退出时调用 ``await provider.aclose()`` 释放连接池。
+        - 应用退出时调用 ``await provider.aclose()`` 释放连接池.
     """
 
     def __init__(

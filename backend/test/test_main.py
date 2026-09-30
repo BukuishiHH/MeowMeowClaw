@@ -27,6 +27,9 @@ from backend.providers.openai_compat import OpenAICompatProvider
 
 WORKSPACE = "/tmp/fake-workspace"
 
+# build_agent() 应当注册的工具清单(新增工具时只改这一处, 计数与断言自动跟随)
+EXPECTED_TOOLS = ("read_file", "write_file", "list_dir", "exec", "web_search")
+
 
 # --------------------------------------------------------------------- 测试替身
 
@@ -125,8 +128,8 @@ class TestBuildAgent:
         assert agent.provider.api_key == config.api_key
         assert agent.provider.base_url == config.base_url
         assert agent.provider.model == config.model
-        # 三个文件工具都注册了
-        assert agent.tools.list_tools() == ["read_file", "write_file", "list_dir", "exec"]
+        # 工具清单与预期完全一致(多一个少一个都要失败)
+        assert agent.tools.list_tools() == list(EXPECTED_TOOLS)
         # Context 与 Loop 的配置
         assert isinstance(agent.context, ContextBuilder)
         assert agent.context.workspace == config.workspace
@@ -148,8 +151,8 @@ class TestBuildAgent:
         main_module.build_agent()
 
         out = capsys.readouterr().out
-        assert "已注册工具(3 个)" in out
-        for name in ("read_file", "write_file", "list_dir"):
+        assert f"已注册工具({len(EXPECTED_TOOLS)} 个)" in out
+        for name in EXPECTED_TOOLS:
             assert name in out
 
     def test_startup_output_does_not_leak_api_key(self, monkeypatch, capsys):

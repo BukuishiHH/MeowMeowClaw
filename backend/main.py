@@ -37,9 +37,10 @@ PROMPT = "\n你 > "
 EXIT_COMMANDS = {"/exit", "/quit", "/q"}
 
 BANNER = r"""
-   /\_/\    MeowMeowClaw
-  ( =.= )   一个会用工具的小爪子
-   > ^ <    输入内容开始对话, /exit 退出
+    /\\_/\\
+   ( • w • )    MeowMeowClaw
+    >     <     一个会用工具的小猫
+                输入内容开始对话，/exit 退出
 """
 
 

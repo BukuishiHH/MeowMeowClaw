@@ -28,7 +28,7 @@ from backend.providers.openai_compat import OpenAICompatProvider
 WORKSPACE = "/tmp/fake-workspace"
 
 # build_agent() 应当注册的工具清单(新增工具时只改这一处, 计数与断言自动跟随)
-EXPECTED_TOOLS = ("read_file", "write_file", "list_dir", "exec", "web_search")
+EXPECTED_TOOLS = ("read_file", "write_file", "list_dir", "exec", "web_search", "web_fetch")
 
 
 # --------------------------------------------------------------------- 测试替身

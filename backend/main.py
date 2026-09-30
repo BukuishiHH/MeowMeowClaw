@@ -26,6 +26,7 @@ from backend.agent.loop import AgentLoop  # noqa: E402
 from backend.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool  # noqa: E402
 from backend.agent.tools.shell import ExecTool
 from backend.agent.tools.web_search import WebSearchTool
+from backend.agent.tools.web_fetch import WebFetchTool
 from backend.agent.tools.registry import ToolRegistry  # noqa: E402
 from backend.config import Settings, load_config  # noqa: E402
 from backend.providers.openai_compat import OpenAICompatProvider  # noqa: E402
@@ -74,6 +75,7 @@ def build_agent() -> AgentLoop:
     tools.register(ListDirTool(config.workspace))
     tools.register(ExecTool(config.workspace))
     tools.register(WebSearchTool())
+    tools.register(WebFetchTool())
 
     context = ContextBuilder(config.workspace, config.identity_file)
 

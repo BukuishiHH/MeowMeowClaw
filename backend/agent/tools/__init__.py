@@ -1,4 +1,5 @@
 from .base import BaseTool
-from .filesystem import ReadFileTool, WriteFileTool, ListDirTool
+from .filesystem import ListDirTool, ReadFileTool, WriteFileTool
+from .shell import ExecTool
 
-__all__ = ["BaseTool", "ReadFileTool", "WriteFileTool", "ListDirTool"]
+__all__ = ["BaseTool", "ExecTool", "ListDirTool", "ReadFileTool", "WriteFileTool"]

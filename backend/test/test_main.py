@@ -126,7 +126,7 @@ class TestBuildAgent:
         assert agent.provider.base_url == config.base_url
         assert agent.provider.model == config.model
         # 三个文件工具都注册了
-        assert agent.tools.list_tools() == ["read_file", "write_file", "list_dir"]
+        assert agent.tools.list_tools() == ["read_file", "write_file", "list_dir", "exec"]
         # Context 与 Loop 的配置
         assert isinstance(agent.context, ContextBuilder)
         assert agent.context.workspace == config.workspace

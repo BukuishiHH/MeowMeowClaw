@@ -324,17 +324,18 @@ class TestSkillsSummarySection:
 
         assert "## 可用技能" not in prompt
 
-    def test_summary_is_appended_at_the_end(self, workspace, identity):
+    def test_skills_section_is_before_volatile_tail(self, workspace, identity):
         b = ContextBuilder(workspace, identity, skills_summary="- exec (exec/SKILL.md): 执行命令\n")
 
         with patch(f"{MODULE}.datetime", freeze_time(FROZEN)):
             prompt = b.build_system_prompt()
 
-        # 传入的 summary 自带末尾换行, 拼接后保持原样
-        assert prompt.endswith("## 可用技能\n- exec (exec/SKILL.md): 执行命令\n")
-        assert "## 可用技能" in prompt
+        # 技能属于低频变化内容, 放在长期记忆/时间之前; 时间固定收尾
+        assert "## 可用技能\n- exec (exec/SKILL.md): 执行命令" in prompt
+        assert prompt.index("## 可用技能") < prompt.index("## 当前时间")
+        assert prompt.endswith(f"## 当前时间\n{FROZEN_TEXT}")
 
-    def test_skills_section_comes_after_memory(self, workspace, identity):
+    def test_skills_section_comes_before_memory(self, workspace, identity):
         memory_dir = workspace / "memory"
         memory_dir.mkdir()
         (memory_dir / "MEMORY.md").write_text("记忆", encoding="utf-8")
@@ -343,7 +344,35 @@ class TestSkillsSummarySection:
         with patch(f"{MODULE}.datetime", freeze_time(FROZEN)):
             prompt = b.build_system_prompt()
 
-        assert prompt.index("## 长期记忆") < prompt.index("## 可用技能")
+        assert prompt.index("## 可用技能") < prompt.index("## 长期记忆\n")
+
+    def test_system_prompt_is_ordered_by_volatility(self, workspace, identity):
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("记忆内容", encoding="utf-8")
+        b = ContextBuilder(
+            workspace,
+            identity,
+            skills_summary="技能摘要",
+            long_term_provider=lambda: "召回内容",
+        )
+
+        with patch(f"{MODULE}.datetime", freeze_time(FROZEN)):
+            prompt = b.build_system_prompt()
+
+        sections = [
+            "## 工作区",
+            "## 长期记忆维护约定",
+            "## 可用技能",
+            "## 长期记忆\n",
+            "## 长期记忆召回",
+            "## 当前时间",
+        ]
+        positions = [prompt.index(section) for section in sections]
+
+        assert positions == sorted(positions)
+        assert len(set(positions)) == len(positions)
+        assert prompt.endswith(f"## 当前时间\n{FROZEN_TEXT}")
 
     def test_explicit_empty_string_adds_nothing(self, workspace, identity):
         b = ContextBuilder(workspace, identity, skills_summary="")
@@ -504,5 +533,7 @@ class TestLongTermInjection:
 
         prompt = b.build_system_prompt()
 
+        # 稳定内容在前: 技能 < 长期记忆 < 结构化召回 < 当前时间
+        assert prompt.index("## 可用技能") < prompt.index("手工长期记忆")
         assert prompt.index("手工长期记忆") < prompt.index("结构化召回")
-        assert prompt.index("结构化召回") < prompt.index("## 可用技能")
+        assert prompt.index("结构化召回") < prompt.index("## 当前时间")

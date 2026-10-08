@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 27 个源码模块 / 约 4800 行; 测试 21 个文件 / **773 个用例**(765 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 27 个源码模块 / 约 4800 行; 测试 21 个文件 / **774 个用例**(766 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -135,7 +135,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/memory/jsonl.py` | 535 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行 | `JsonlSessionStore` |
 | `meowmeowclaw/memory/noop.py` | 42 | 长期记忆占位实现(v1 由 MEMORY.md 承担) | `NoopLongTermStore` |
 | `meowmeowclaw/memory/filelock.py` | 110 | 跨进程 advisory 文件锁(flock/msvcrt) | `FileLock` / `async_file_lock` |
-| `meowmeowclaw/agent/context.py` | 194 | System Prompt: 人设/时间/工作区/记忆约定/长期记忆/召回注入/技能 | `ContextBuilder.build_system_prompt()` / `build_messages()` |
+| `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
 | `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
@@ -367,7 +367,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 765 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 766 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -381,7 +381,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | --- | ---: | --- |
 | `test_bootstrap.py` | 12 | 装配(工具/技能/Context/Loop)、ConfigError/SkillConfigError、导入边界 |
 | `test_cli.py` | 25 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码 |
-| `agent/test_context.py` | 47 | 人设/时间/记忆约定、自定义 memory_path、长期记忆召回注入 |
+| `agent/test_context.py` | 48 | 人设/时间/记忆约定、召回注入、System Prompt 稳定度排序 |
 | `agent/test_loop.py` | 41 | 消息格式、防爆阈值、run_turn 历史快照/完成态、max_iterations 注入 |
 | `skills/test_catalog.py` | 36 | frontmatter 边界、索引/摘要、坏 YAML 跳过、重名报错、内置资源可发现 |
 | `skills/test_tool.py` | 30 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
@@ -411,7 +411,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 21 个测试文件 / 773 用例(agent/skills/tools/memory/channels 分层)
+├── tests/                       # 21 个测试文件 / 774 用例(agent/skills/tools/memory/channels 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源

@@ -147,13 +147,27 @@ class ContextBuilder:
     # ------------------------------------------------------------------ 对外方法
 
     def build_system_prompt(self) -> str:
-        """拼接完整 System Prompt: 人设 + 时间 + 工作区 + 记忆约定 + 长期记忆 + 技能."""
+        """
+        拼接完整 System Prompt
+
+        段落按 **稳定 -> 易变** 排序, 以便服务端 prefix caching 命中更长的公共前缀:
+            人设 -> 工作区 -> 记忆维护约定 -> 可用技能
+                 -> 长期记忆 -> 长期记忆召回 -> 当前时间(最末尾)
+
+        - 人设/工作区/维护约定几乎不变;
+        - 可用技能只在技能增删/升级时变化;
+        - MEMORY.md 会随 Agent 写笔记而变化;
+        - 结构化召回按请求变化(M6 注入点, 默认空);
+        - 当前时间每分钟变化, 放最后只影响尾部缓存。
+        """
         sections = [
             self._load_identity(),
-            f"## 当前时间\n{self._format_now()}",
             f"## 工作区\n所有文件操作都限制在工作区目录内, 根目录: {self.workspace}",
             LONG_TERM_MEMORY_GUIDE.format(memory_path=self.memory_path),
         ]
+
+        if self.skills_summary:  # 技能比长期记忆稳定, 放前面
+            sections.append(f"## 可用技能\n{self.skills_summary}")
 
         memory = self._load_memory()
         if memory:  # 无记忆内容时不输出空的长期记忆章节
@@ -163,8 +177,8 @@ class ContextBuilder:
         if recalled:  # M6 注入点: 结构化长期记忆召回(默认空, Prompt 行为不变)
             sections.append(f"## 长期记忆召回\n{recalled}")
 
-        if self.skills_summary:  # 无技能时不输出空章节
-            sections.append(f"## 可用技能\n{self.skills_summary}")
+        # 当前时间最易变, 固定放最后: 只让尾部失效, 保护前面的公共前缀
+        sections.append(f"## 当前时间\n{self._format_now()}")
 
         return "\n\n".join(sections)
 

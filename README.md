@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 23 个源码模块 / 约 3900 行; 测试 18 个文件 / **722 个用例**(714 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 25 个源码模块 / 约 4300 行; 测试 19 个文件 / **737 个用例**(729 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -136,6 +136,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
 | `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
+| `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
+| `meowmeowclaw/channels/qq_private.py` | 387 | QQ 私聊: active 指针 / 6h 惰性轮换 / 最小指令集 | `QqPrivateService` / `QqPrivateActiveStore` |
 | `meowmeowclaw/bootstrap.py` | 142 | **组合根**: 配置 -> Provider -> 工具 -> 技能 -> 记忆 -> Context/Loop | `build_application()` / `Application` / `ConfigError` |
 | `meowmeowclaw/cli.py` | 313 | **交付层**: banner / 启动信息 / REPL / 会话命令 / 退出码 | `main()` / `interactive_loop()` / `_handle_command()` |
 
@@ -358,7 +360,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 714 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 729 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -379,6 +381,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `memory/test_models.py` | 28 | 会话键 canonical/storage_id、消息投影、元数据/摘要 |
 | `memory/test_jsonl_store.py` | 27 | SessionStore 契约 + JSONL 布局/损坏行/归档/短 ID |
 | `test_conversation.py` | 13 | ConversationService 编排、窗口、fail-soft、同会话串行、agent 缓存 |
+| `channels/test_qq_private.py` | 15 | QQ active 指针/6h 轮换/重启恢复/命令/跨渠道删除 |
 | `tools/test_base.py` | 3 | 工具基类抽象约束 |
 | `tools/test_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
 | `tools/test_filesystem.py` | 91 | 三件套读写/截断/异常分支、resolve_in_workspace、同前缀绕过回归 |
@@ -399,7 +402,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 18 个测试文件 / 722 用例(agent/skills/tools/memory 分层)
+├── tests/                       # 19 个测试文件 / 737 用例(agent/skills/tools/memory/channels 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -427,6 +430,9 @@ MeowMeowClaw/
     │   ├── jsonl.py             # JsonlSessionStore 实现
     │   └── errors.py            # 记忆层错误类型
     ├── conversation.py          # ConversationService: 记忆 <-> AgentLoop 编排
+    ├── channels/                # 渠道适配层(传输无关 + QQ 私聊)
+    │   ├── base.py              # IncomingMessage / OutgoingMessage
+    │   └── qq_private.py        # active 指针 + 6h 轮换 + 最小指令集
     └── llm/                     # LLMProvider - OpenAICompatProvider
 ```
 
@@ -434,7 +440,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- 记忆系统已完成 M1-M3(存储层 + `ConversationService` 编排 + CLI 进程会话/命令), **尚未接入 QQ**(见 `docs/MEMORY_DESIGN.md` M4+); 无流式输出与多 Agent 编排
+- 记忆系统已完成 M1-M4(存储层 + 编排 + CLI + QQ 私聊服务层), QQ 的 **OneBot/NapCat 传输适配器**尚未接入; 无流式输出与多 Agent 编排
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入), 结构化 `LongTermStore` 待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
 - 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(命令黑名单绕过、抓取重定向/重绑定、provider 契约边界)

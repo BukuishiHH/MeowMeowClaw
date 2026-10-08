@@ -1,611 +1,553 @@
-# MeowMeowClaw 记忆系统设计（v1 设计稿）
+# MeowMeowClaw 记忆系统设计（v1：单用户 / CLI + QQ 私聊）
 
-> 状态：**设计分析稿，未实施**
-> 前提：单用户、多渠道（CLI / 飞书 / QQ 等）；短期用 JSONL 落地，接口预留 MySQL / Redis 等后端
-> 关联：`docs/ARCHITECTURE.md`（项目分层与技能设计）
-
----
-
-## 1. 目标与非目标
-
-### 目标
-
-1. 支持同一用户从多个渠道持续对话，且：
-   - **短期对话上下文按会话隔离**（不同渠道/群聊/私聊互不串话）；
-   - **长期记忆跨渠道共享**（换渠道仍记得"我是谁、我的偏好、正在做的事"）。
-2. 提供稳定的存储接口：v1 用 JSONL 即可跑，未来换 MySQL / Redis / SQLite 时不改调用方。
-3. 明确并发模型：同一用户多端并发、同会话连续消息、跨进程写入都不损坏数据。
-4. 明确存储位置、权限、安全边界与演进路线。
-
-### 非目标（v1 不做）
-
-- 多用户 / 多租户的产品化（但接口与命名空间必须预留）；
-- 向量检索、embedding 语义召回（长期记忆先做结构化存取，检索后置）；
-- 记忆的自动"人格演化"与复杂冲突消解；
-- 渠道接入本身（见前文渠道分析，不在此文档展开）。
+> 状态：**范围与细节已确认，待实施**
+> v1 包含：短期记忆（按渠道隔离）+ `MEMORY.md` 最简长期记忆（跨渠道共享、Agent 可写）
+> 群聊、结构化长期记忆、多用户、多后端、加密均为"预留扩展"，见 §11
+> 关联：`docs/ARCHITECTURE.md`
 
 ---
 
-## 2. 核心结论（决策记录）
+## 0. 本次范围收窄对比
 
-| # | 决策 | 说明 |
+| 维度 | 前一版通用设计 | v1 确认范围 |
 |---|---|---|
-| D1 | **短期记忆按会话隔离** | 键 = 渠道 + 会话范围 + 会话 ID；群聊以群为会话，私聊以用户为会话 |
-| D2 | **长期记忆跨渠道共享** | 命名空间 = `user:<user_id>`；记录保留来源渠道/会话，便于审计与冲突处理 |
-| D3 | **短期历史与长期记忆分仓、分层** | 短期 = 原始对话流水（transcript）；长期 = 提炼后的可复用事实，二者不混存 |
-| D4 | **接口全异步（async）** | JSONL 后端用 `asyncio.to_thread` 包装同步 IO；为 aiomysql / redis.asyncio 留路 |
-| D5 | **门面 + 仓储** | `MemoryService` 门面对外；`SessionStore` / `LongTermStore` 两个仓储各自可替换 |
-| D6 | **存储位置：`<workspace>/memory/`** | 默认 workspace 内，`memory_dir` 可配置；不放在项目根，也不与普通文件工具区域混用 |
-| D7 | **文件工具禁止访问记忆目录** | 防止 Agent 通过 read/write/list 读取、污染或泄露自己的记忆 |
-| D8 | **并发 = 会话内串行 + 命名空间锁 + 单写者优先** | 同一会话同一时刻只跑一轮；长期记忆按 namespace 串行；多进程优先收敛为单写者服务 |
-| D9 | **JSONL 一轮一行（turn 原子）** | 记录 `schema_version`、`turn_id`、`seq`、UTC 时间戳；而不是一条消息一行 |
-| D10 | **AgentLoop 不直接持有存储** | 由 `ConversationService` 负责装载/回写；AgentLoop 只负责模型↔工具循环 |
-| D11 | **JSONL → (SQLite) → MySQL/Redis** | 接口不变；Redis 只做缓存/锁/去重/队列，不作为唯一持久层 |
-| D12 | **长期记忆写入受控** | 默认仅显式 `记住…` 或高置信度提炼写入；不自动保存模型的任意输出 |
+| 用户 | 预留多用户/多租户 | **仅单用户**（接口仍保留 namespace） |
+| 渠道 | CLI / 飞书 / QQ / 群聊 | **CLI + QQ 私聊**（不含飞书、不含群聊） |
+| 短期记忆 | 完整设计 | **本次实现**，各渠道严格隔离 |
+| 长期记忆 | 结构化 LongTermStore | **仅 `MEMORY.md` 文件级最简机制**（Agent 写、Prompt 读、跨渠道共享）；LongTermStore 只预留接口 |
+| 会话策略 | 未定 | CLI 进程生命周期；QQ 闲置 6 小时轮换 |
+| 会话清理 | 未定 | **不自动清理**；`/clear [会话标识] [--purge]` 手动指定 |
+| 存储 | JSONL + MySQL/Redis 设计 | **仅 JSONL**，抽象接口保证可换 |
+| 加密 | 待定 | **不加密**，仅文件权限 0700/0600 |
+| 群聊 | 支持设计 | **暂不支持**，字段与接口预留 |
+
+---
+
+## 1. 范围
+
+### 1.1 v1 做什么
+
+- 单用户，两种渠道：**CLI**（进程生命周期会话）与 **QQ 私聊**（闲置 6 小时轮换）；
+- **短期记忆**：完整 turn 的持久化、按会话装载、窗口裁剪、清空/新建/列出/删除；
+- **最简长期记忆**：`MEMORY.md` 文件由 Agent 通过 `write_file` 维护，`ContextBuilder` 每次拼进 System Prompt；同一用户的各渠道共享该文件；
+- 存储抽象接口 `SessionStore` + 唯一 JSONL 实现；
+- 预留 `LongTermStore` 抽象 + `NoopLongTermStore` + `ContextBuilder` 注入点（将来结构化长期记忆用）；
+- `/sessions`、短 ID、`/clear`、`/clear <id>`、`/clear <id> --purge`、`/new`；
+- 为群聊预留 `scope/group`、`sender_id` 等字段与命名空间设计；
+- 明确并发、存储位置、工具访问边界、保留策略与测试策略。
+
+### 1.2 v1 不做什么
+
+- 不做结构化长期记忆（不实现 LongTermStore 的存储/召回/提炼/遗忘）；
+- 不做群聊、飞书或其他渠道；
+- 不做多用户/多租户；
+- 不做 MySQL/Redis/SQLite 后端（只保证接口可换）；
+- 不做加密、不做向量检索、不做摘要压缩（预留接口）；
+- 不做附件/图片/语音的存储（仅预留字段）；
+- **不做自动清理/自动过期**（所有会话无限期保留，删除仅手动）。
+
+---
+
+## 2. 已确认决策记录
+
+| # | 决策 | 确认结果 |
+|---|---|---|
+| D1 | 抽象接口与实现 | 定义 `SessionStore` 抽象接口 + **唯一 JSONL 实现**，后续可换后端 |
+| D2 | 渠道共享边界 | **短期记忆各渠道严格隔离；长期记忆（`MEMORY.md`）有意跨渠道共享** |
+| D3 | `MEMORY.md` 定位 | **v1 最简长期记忆机制**：Agent 用 `write_file` 写、`ContextBuilder` 读入 Prompt；不经过 LongTermStore |
+| D4 | 加密 | **不加密**；目录 0700、文件 0600、不入 git、备份提示 |
+| D5 | CLI 会话 | 每次启动 = **全新会话**，进程退出即结束，绝不自动恢复 |
+| D6 | 会话文件保留 | **全面落盘、无限期保留、不自动清理** |
+| D7 | `/clear` | **无参 = 归档当前会话**；`/clear <id>` = 归档指定会话；**`--purge` = 永久删除** |
+| D8 | `/new` | **创建新会话**（新 session_id）；旧会话保持非归档状态、不受影响 |
+| D9 | CLI 多进程 | 每个进程独立 session_id，互不干扰；启动日志打印 session_id |
+| D10 | QQ 计时锚点 | **用户最后一条消息到达时间**；机器人回复不刷新 |
+| D11 | QQ 超时判断 | **惰性判断**（收到新消息时比较当前时间与最后活动时间） |
+| D12 | QQ active 指针 | **持久化**（联系人 → 当前 session_id + 最后活动时间），重启可恢复 |
+| D13 | QQ 超时旧会话 | 轮换后**归档保留，不自动删除** |
+| D14 | QQ 超时提示 | 固定文案：**"已开始新对话"** |
+| D15 | QQ 上下文恢复 | 6 小时内恢复最近 **20 轮 / 50000 字符**（可配置） |
+| D16 | QQ 指令集 | **`/help`、`/new`、`/clear`、`/sessions`**；仅私聊、仅本人可用 |
+| D17 | QQ 并发 | 同一联系人消息**排队串行**处理 |
+| D18 | 进程部署 | QQ 机器人服务与 CLI **可能同时运行在同一台机器**，文件所有权互不冲突 |
+| D19 | 多模态 | 仅存文本；图片/语音/附件仅预留字段，不处理 |
+| D20 | 短期存储内容 | 完整 turn（含工具调用与结果）；单条工具结果默认截断 **8000 字符**并标记 |
+| D21 | 时间戳 | **UTC epoch millis + ISO8601** 两种都存 |
+| D22 | 写入失败 | **fail-soft**：告警并继续回复用户，不中断对话 |
+| D23 | 群聊预留 | 现在加 `scope=group`、`sender_id`、群 ID 字段；触发规则/权限未来在渠道层实现 |
+| D24 | 长期接口预留 | `LongTermStore` Protocol + `NoopLongTermStore` + `ContextBuilder` 注入点；v1 不实现其存储 |
+| D25 | 编排 | `ConversationService`：解析会话 → 装载 → 调 `AgentLoop` → 回写 turn → 处理指令；AgentLoop 接收历史快照 |
+| D26 | 存储位置 | 默认 `<workspace>/memory/`，可通过 `memory_dir` 配置覆盖 |
+| D27 | 工具访问边界 | `sessions/`、`active/`、`archive/` 对文件工具**全禁**；`MEMORY.md` **可读可写**（写入前自动备份） |
+| D28 | 后端升级时机 | 多用户/多渠道服务化/群聊/需要查询事务时：优先 SQLite，其次 MySQL；Redis 仅做缓存/锁/去重/队列 |
+| D29 | 手动清理 | 所有会话不自动清理；通过 `/clear [id] [--purge]` 手动指定删除；**允许跨渠道删除** |
+| D30 | 会话标识发现 | 新增 **`/sessions`** 指令 + **短 ID**（storage_id 起 8 位的最短唯一前缀）；命令按前缀解析 |
+| D31 | 清空/轮换后的身份 | 归档或轮换后**生成新的 session 实例 id**，避免归档文件与活跃文件重名/短 ID 冲突 |
+| D32 | `MEMORY.md` 写入保护 | 每次 Agent 写入前**自动备份 `MEMORY.md.bak`**；System Prompt 明确"先读后写、保留旧内容"；**不做大小/频率限制** |
+| D33 | 跨渠道删除 | CLI 与 QQ 均可删除对方渠道的会话；QQ 指令仍限本人私聊 |
+| D34 | `MEMORY.md.bak` 备份份数 | **单份滚动备份**（每次写入覆盖上一份） |
+| D35 | `/sessions` 展示 | 默认列出**活跃 + 归档**；展示短 ID、状态、渠道、时间、轮数，并支持复制完整键 |
+| D36 | 短 ID 规则 | 最短唯一前缀，**最少 8 位**；冲突自动加长 |
+| D37 | "已开始新对话"提示范围 | 超时轮换、`/new`、跨渠道删除导致重建，三场景统一使用 |
+| D38 | `--purge` 确认 | 直接执行；输入短 ID 视为确认，不做二次确认 |
 
 ---
 
 ## 3. 概念模型
 
 ```
-                      ┌──────────────────────────────┐
-                      │        MemoryService         │  门面：策略 / 编排 / 命令
-                      └──────────────┬───────────────┘
-              ┌──────────────────────┴──────────────────────┐
-              ▼                                             ▼
-   ┌────────────────────────┐                    ┌────────────────────────┐
-   │      SessionStore      │                    │     LongTermStore      │
-   │  短期：每会话的对话流水   │                    │  长期：跨会话的事实/偏好  │
-   │  Key: SessionKey       │                    │  Key: namespace        │
-   │  Backend: JSONL / SQL  │                    │  Backend: JSONL / SQL  │
-   └────────────────────────┘                    └────────────────────────┘
-              ▲                                             ▲
-              │ 最近 N 轮 / 摘要                              │ 召回结果
-   ┌──────────┴─────────────────────────────────────────────┴──────────┐
-   │                ConversationService（会话编排）                      │
-   │  载入历史 → 组装 Context → 调 AgentLoop → 按轮次回写 → 触发提炼     │
-   └────────────────────────────────────────────────────────────────────┘
+                    ┌──────────────────────────────────────────┐
+                    │            ConversationService           │
+                    │  会话解析 / 超时轮换 / 装载 / 回写 / 指令  │
+                    └───────┬──────────────────────────┬───────┘
+                            │                          │
+              ┌─────────────┴─────────────┐            │ 读/写
+              ▼                           ▼            ▼
+   ┌────────────────────────┐   ┌────────────────────────┐
+   │      SessionStore      │   │  MEMORY.md（长期，跨渠道）│
+   │  短期：每会话 turn 流水  │   │  Agent write_file 维护   │
+   │  v1: JsonlSessionStore │   │  ContextBuilder 读入 Prompt│
+   └────────────────────────┘   └────────────────────────┘
+                            ┌────────────────────────┐
+                            │ LongTermStore（预留）    │
+                            │ v1: Noop（不参与）       │
+                            └────────────────────────┘
 ```
 
-### 关键概念
-
-| 概念 | 含义 | 粒度 |
-|---|---|---|
-| Session（会话） | 一段连续对话的容器；上下文、清空、并发锁的作用单位 | 渠道 + 会话范围 + 会话 ID |
-| SessionKey | 会话的结构化标识 | 见 §6 |
-| Turn（轮次） | 一次"用户输入 → 模型最终回答"的完整过程；可能包含多次工具调用 | 原子写入单位 |
-| Transcript（流水） | 短期记忆中按顺序保存的消息集合（含 tool 消息） | 每会话一个逻辑流 |
-| LongTermRecord | 长期记忆中的一条事实/偏好/摘要 | 每用户命名空间内 |
-| Namespace | 长期记忆的隔离域 | v1 恒为 `user:default`；未来为 `user:<id>` / `tenant:<id>` |
-
-### 短期 vs 长期的边界（重要）
-
-- **短期**：原始消息、工具调用与结果；用于"接得上话"；**按会话隔离**；会随对话增长而被窗口裁剪/摘要。
-- **长期**：跨会话可复用的信息（"用户偏好 Python""正在做 MeowMeowClaw 项目""不要用 exec"）；**跨渠道共享**；写入受策略控制。
-- 跨渠道的连续感应通过**长期记忆**获得，而不是把不同渠道的原始对话混进同一个 transcript。
-
----
-
-## 4. 短期记忆是否区分渠道？
-
-### 结论：必须区分
-
-理由：
-
-1. **上下文语义不同**：CLI 里可能在调试代码，飞书里在讨论工作，QQ 群里在闲聊；混在一起会让模型"答非所问"，并把 A 渠道的内容泄露到 B 渠道。
-2. **并发安全**：若所有渠道共用一个会话，两条并发消息会交错写入同一历史，模型看到的消息顺序可能错乱，甚至互相"抢答"。
-3. **群聊与私聊必须隔离**：群里其他人可见的消息不应进入私聊上下文；不同群之间也必须隔离。
-4. **渠道格式差异**：@、附件、卡片、消息长度限制等属于渠道层语义，不应污染通用上下文。
-
-### 会话粒度建议
-
-| 渠道场景 | SessionKey 形态（示例） | 说明 |
-|---|---|---|
-| CLI | `cli:direct` | 单用户单会话；需要并行时用 `/new` 生成 `cli:direct:<n>` |
-| 飞书私聊 | `feishu:p2p:<open_id>` | 按用户；同一用户多设备共享同一会话 |
-| 飞书群聊 | `feishu:group:<chat_id>` | 按群；发言者信息逐条记录在消息元数据里 |
-| 飞书话题 | `feishu:group:<chat_id>:<thread_id>` | 若启用话题线程，可细分到 thread |
-| QQ 私聊 | `qq:private:<uin>` | 按用户 |
-| QQ 群聊 | `qq:group:<group_id>` | 按群 |
-
-补充规则：
-
-- 群聊的"会话"属于群，不属于某个用户；消息记录需附 `sender_id`，长期记忆仍按用户命名空间写入（只记录与该用户相关的部分）。
-- CLI 默认延续上一次会话（否则每次启动都失忆）；提供 `/new`（新会话）与 `/clear`（清空当前会话）两个不同语义。
-- 同一用户跨渠道不共享短期历史；长期记忆承担"跨渠道连续感"。
-
----
-
-## 5. 长期记忆是否区分渠道？
-
-### 结论：不区分渠道，但按"命名空间 + 来源元数据"设计
-
-- 单用户多渠道 → 长期记忆天然应共享：偏好、身份、项目状态等与渠道无关。
-- 但**接口必须按 namespace 隔离**，v1 使用 `user:default` 即可；未来接多用户/租户时直接切 `user:<id>`、`tenant:<id>`。
-- 每条记录保留**来源元数据**：`source_channel`、`source_session`、`source_message_id`、`created_at`，用于：
-  - 冲突时判断谁更新、谁更可信；
-  - 用户说"忘掉刚才在飞书说的那条"时可精准删除；
-  - 审计与调试。
-- 渠道特有、临时性的信息不要进长期记忆；如需保存，用 `kind` / `tags` 标注作用域（例如 `scope=channel:qq`），而不是另开一套存储。
-
----
-
-## 6. 会话键（SessionKey）设计
-
-### 6.1 结构化字段
-
-```
-SessionKey:
-  channel:        str    # cli / feishu / qq / ...
-  scope:          str    # direct / p2p / group / thread
-  conversation_id:str    # 渠道内的会话标识（用户 open_id、群 chat_id、CLI 名称）
-  user_id:        str?   # 渠道内的用户标识（私聊必填；群聊为发送者）
-  tenant_id:      str?   # 飞书等平台租户（未来多租户用）
-```
-
-- 内存里始终用结构化对象，序列化为规范字符串（canonical key）用于日志、索引与持久化；
-- 规范字符串建议包含版本前缀：`v1:feishu:p2p:ou_xxx`，为将来键格式变化留迁移空间。
-
-### 6.2 文件名不能直接用 `session_key`
-
-用户设想 `_get_session_path` 把 `:` 替换为 `_`，**作为 JSONL 后端的私有实现可以理解，但作为持久标识不安全**：
-
-| 问题 | 说明 |
+| 概念 | 说明 |
 |---|---|
-| 碰撞 | `a:b_c` 与 `a_b:c` 都变成 `a_b_c`；渠道与 ID 中可能出现 `_` |
-| 越界 | key 若含 `../` 或 `/`，拼接后可逃逸出 sessions 目录 |
-| Windows 兼容 | `:` 在 Windows 文件名中非法；`?`、`*`、`<`、`>`、`"` 等也需处理 |
-| 长度/Unicode | 群/用户 ID 可能很长或含非 ASCII，直接进文件名不稳 |
-| 不可逆 | `list_sessions()` 无法从文件名可靠还原原始 key |
-
-### 6.3 建议的存储 ID
-
-- 逻辑 key：保留完整规范字符串，写入会话元数据/索引；
-- 物理文件名：`<storage_id>.jsonl`，其中
-  - 优先方案：`storage_id = base32(sha256(canonical_key))[:26]`（定长、无特殊字符、跨平台）；
-  - 可读性方案：`<channel>__<urlquote(conversation_id, safe="")>__<short_hash>`，便于人工排查；
-- `sessions/index.jsonl`（或 `meta.json`）保存 `storage_id ↔ canonical_key ↔ 元数据` 的映射，`list_sessions()` 读索引而不是反解文件名。
+| Session（会话） | 一段连续对话的容器；短期记忆的隔离与并发单位 |
+| SessionKey | `channel + scope + conversation_id (+user_id)`；会话实例 id 不可复用 |
+| Turn | 一轮"用户输入 → 模型最终回答"（含工具调用/结果）；**原子写入单位** |
+| SessionStore | 短期记忆仓储抽象；v1 唯一实现 JSONL |
+| `MEMORY.md` | v1 的长期记忆文件；Agent 维护、Prompt 注入、跨渠道共享 |
+| LongTermStore | 结构化长期记忆预留接口；v1 = Noop |
+| ConversationService | 编排层：会话解析、轮换、装载、回写、指令处理 |
+| 短 ID | storage_id 的最短唯一前缀，供 `/sessions` 与 `/clear <id>` 使用 |
 
 ---
 
-## 7. 对预设 5 个方法的逐条分析
+## 4. 会话生命周期
 
-> 总评：5 个方法作为 **JSONL 后端的内部实现**是合理的起点；但不适合直接作为对外接口。
-> 主要问题：文件路径泄漏进接口、缺少轮次原子性与锁、缺少窗口化、缺少会话元数据、把"清空"简单等同于删文件。
+### 4.1 CLI：进程生命周期绑定
 
-### 7.1 `_get_session_path(session_key) -> str`
+```
+启动 CLI
+  → 生成 session_id (UUID)
+  → SessionKey = "v1:cli:session:<uuid>"
+  → 空历史启动（不恢复旧会话）
+  → 每轮：load_recent → AgentLoop.run → append_turn
+  → /new：生成新 session_id，旧会话留在 sessions/
+  → /clear：归档当前会话 + 生成新 session_id
+  → /clear <id> [--purge]：归档/永久删除指定会话
+  → /sessions：列出会话与短 ID
+  → /exit：退出；文件保留
+```
 
-- **合理**：后端内部需要从逻辑会话映射到物理文件；私有命名（`_`）方向正确。
-- **问题**：
-  1. `:` → `_` 有碰撞与越界风险（见 §6.2）；
-  2. 返回 `str` 把"路径"暴露为契约，换 MySQL/Redis 后无意义；
-  3. 目录不存在时的创建时机、权限、锁文件位置未定义。
-- **建议**：留在 `JsonlSessionStore` 内部，改名为 `_path_for(storage_id)`；对外只接受 `SessionKey`，路径概念不出存储层。
+规则：
 
-### 7.2 `save_message(session_key, message: dict)`
+- 每次启动都是新会话，绝不自动恢复；
+- `/new`：仅切换新会话，旧会话**不归档**、仍留在 `sessions/`；
+- `/clear`：归档当前会话到 `archive/`，并生成新 session_id（D31，避免身份复用）；
+- `/clear <id>`：归档指定会话；若目标是当前会话，同样生成新 session_id；
+- `/clear <id> --purge`：永久删除指定会话（含归档副本）；
+- 多进程互不干扰；启动日志打印 session_id 与短 ID。
 
-- **合理**：append-only JSONL + `ensure_ascii=False` 适合中文；追加写入天然适合"日志型"数据。
-- **问题**：
-  1. **原子性**：一轮对话包含 user / assistant(tool_calls) / tool / assistant(final) 多条消息，逐条 append 时进程崩溃会产生"半轮"；恢复后模型可能看到不完整上下文；
-  2. **并发**：多进程/多协程同时 append 会交错甚至写坏行；需要锁或单写者；
-  3. **时间**：本地 ISO 时间不利于排序与跨时区，建议 **UTC epoch millis 或 UTC ISO8601**，另存来源时区；
-  4. **元数据不足**：缺少 `id`、`turn_id`、`seq`、`schema_version`、`channel/sender`、`token 估算`等，后续做窗口化/去重/审计会缺信息；
-  5. **幂等**：IM 渠道会重推事件；同一 `message_id` 重复写入会污染历史，需要入口去重或写入幂等键；
-  6. **校验**：任意 dict 直接落盘，坏数据会一直留在流水中，读取方必须容错。
-- **建议**：改为 `append_turn(session_key, messages, *, turn_id, meta)`，一轮写一行、一次 `write()` 调用；行内含 `schema_version / seq / ts / messages[]`；写入前置校验与幂等键。
+### 4.2 QQ 私聊：闲置 6 小时轮换
 
-### 7.3 `get_history(session_key) -> list[dict]`
+```
+收到 QQ 私聊消息
+  → contact = "v1:qq:private:<uin>"
+  → 读 active 指针(contact → session_id, last_activity_ms)
+  → 若指针不存在 / 对应会话文件缺失 / now-last_activity > 6h:
+        · 旧会话归档
+        · 生成新 session_id，更新 active 指针
+        · 回复"已开始新对话"
+  → 否则沿用当前会话
+  → 装载最近窗口(20 轮 / 50000 字符)
+  → AgentLoop.run
+  → append_turn
+  → 更新 active.last_activity_ms = 本次用户消息到达时间
+```
 
-- **合理**：逐行解析、跳过空行、文件不存在返回空列表；"剥掉 timestamp 再返回"符合 OpenAI messages 契约。
-- **问题**：
-  1. **全量读取**：历史无限增长时每次全读，O(n) 且上下文会超模型窗口；接口必须支持 `limit` / `max_chars`（或 token 预算）与"从最近往前取"；
-  2. **字段剥离硬编码**：未来还有 `turn_id/seq/channel` 等内部字段；应做显式投影 `to_llm_messages()`，而不是删一个 timestamp；
-  3. **并发读**：写入方正在 append 时可能读到半行；需跳过最后一条不完整 JSON 并告警；
-  4. **可变性**：直接返回内部列表/字典引用会被调用方误改，应返回新对象；
-  5. **性能**：大文件每次解析开销大；JSONL 后端可加"最近 N 条"的尾部读取优化，但接口语义不应依赖文件实现。
-- **建议**：`load_recent(session_key, *, max_messages=None, max_chars=None) -> list[SessionMessage]`；由上层 `ContextWindowPolicy` 决定预算；坏行跳过 + 计数上报。
+规则：
 
-### 7.4 `clear(session_key)`
+- 计时锚点 = 用户最后一条消息到达时间；机器人回复不刷新；
+- 惰性判断；服务重启靠持久化 active 指针恢复；
+- 超时、`/new`、`/clear`、外部删除导致会话失效时，统一回复提示语 **"已开始新对话"**；
+- 仅私聊，且指令仅本人可用；群聊字段预留不启用。
 
-- **合理**：用户需要"清空上下文"；文件删除最简单。
-- **问题**：
-  1. **语义**：删除 = 不可恢复；是否需要归档（审计、误删恢复、"清空但保留长期记忆摘要"）应先定义；
-  2. **并发**：必须与写入共用同一把锁；否则 clear 与 append 竞争会复活旧数据或写回被删文件；
-  3. **一致性**：内存中的 `AgentLoop._session_history` 也要同步清空，否则"删了文件但模型还记得"；
-  4. **长期记忆**：`/clear` 是否清长期记忆？两者应分开：`/clear` 只清当前会话；`/forget` 才删除指定长期记忆。
-- **建议**：接口区分 `clear_session(session_key, archive: bool = True)` 与 `purge_all()`；文档化语义；实现用 tmp+rename 重写或移动到 `archive/`。
+### 4.3 会话键、短 ID 与存储 ID
 
-### 7.5 `list_sessions() -> list[str]`
+| 场景 | 逻辑键（canonical key） | 说明 |
+|---|---|---|
+| CLI | `v1:cli:session:<uuid>` | 每个进程一个；`/clear`/`/new` 后更换 uuid |
+| QQ 联系人（逻辑） | `v1:qq:private:<uin>` | 只用于 active 指针 |
+| QQ 会话实例 | `v1:qq:private:<uin>:<uuid>` | 超时/清空/新建后更换 uuid |
 
-- **合理**：管理/调试需要枚举会话；扫描 `.jsonl` 简单直接。
-- **问题**：
-  1. 需要反解文件名 → 不可靠（§6.2）；
-  2. 只返回 key，没有 `updated_at / message_count / last_message`，无法排序、清理与展示；
-  3. 空会话（清空后留下的空文件）是否算一个会话未定义；
-  4. 每次全目录扫描，会话多时慢；MySQL/Redis 后端语义不同。
-- **建议**：`list_sessions() -> list[SessionMeta]`；JSONL 后端维护 `index.jsonl`；返回按 `updated_at` 倒序。
+- 物理文件名 `storage_id = base32(sha256(canonical_key))[:26]`，规避 `:`、`/`、`..`、Windows 非法字符与超长；
+- **短 ID**：对当前列出的会话取 `storage_id` 的**最短唯一前缀（最少 8 位，冲突时自动加长）**；
+- 命令解析：`/clear <前缀>`、`/clear <前缀> --purge`；前缀冲突时报候选列表；
+- 逻辑键完整保存于文件头与 `/sessions` 输出（可复制）。
 
-### 7.6 接口还缺什么
+### 4.4 指令集
 
-| 缺失能力 | 用途 |
-|---|---|
-| `get_meta(session_key)` / `upsert_meta` | 会话展示、恢复、列表排序 |
-| `exists(session_key)` | 避免无意义建文件 |
-| `append_turn`（批量 + 原子） | 半轮崩溃问题、减少锁次数 |
-| `load_recent(limit/budget)` | 上下文窗口控制 |
-| `compact(session_key)` / `rotate` | 长会话压缩、摘要、归档 |
-| `close()` / `health()` | 生命周期与可观测性 |
-| `namespace` 级长期记忆接口 | 跨渠道共享（与 SessionStore 职责不同） |
-| 锁/事务钩子 | 并发正确性（见 §10） |
+| 指令 | CLI | QQ 私聊 | 语义 |
+|---|---|---|---|
+| `/exit` | ✅ | — | 退出 CLI |
+| `/new` | ✅ | ✅ | 新建会话；旧会话保留在 `sessions/` |
+| `/clear` | ✅ | ✅ | 归档当前会话，并新建会话 |
+| `/clear <id>` | ✅ | ✅ | 归档指定会话（若为当前会话则同时新建） |
+| `/clear <id> --purge` | ✅ | ✅ | 永久删除指定会话（含归档副本） |
+| `/sessions` | ✅ | ✅ | 列出会话（短 ID / 状态 / 渠道 / 时间 / 轮数） |
+| `/help` | ✅ | ✅ | 指令帮助 |
+| `/tools` `/skills` | ✅ | — | CLI 调试指令 |
+
+### 4.5 会话发现与手动清理
+
+- `/sessions` 输出示例：
+
+```
+短ID      状态      渠道   创建时间(UTC)         最后活动(UTC)         轮数
+a1b2c3d4  active    cli    2026-01-01T09:00:00Z  2026-01-01T09:20:00Z  12
+e5f6a7b8  archived  qq     2025-12-31T10:00:00Z  2025-12-31T11:00:00Z  33
+```
+
+- 默认列出**活跃 + 归档**，`--active` / `--archived` 可过滤；
+- 所有会话**不自动清理**；磁盘占用由用户自行监控；
+- 允许跨渠道删除：CLI 可归档/删除 QQ 会话，QQ 也可操作 CLI 会话；QQ 指令仅本人私聊可用；
+- 删除指定会话时若该会话正被另一进程使用：归档/删除在会话级文件锁内执行；QQ 服务下次装载发现文件缺失时按新会话处理并提示"已开始新对话"。
 
 ---
 
-## 8. 接口设计（示意，非实现）
+## 5. 短期记忆数据模型
 
-### 8.1 数据模型
+### 5.1 Turn 记录（JSONL 行，示意）
 
+```json
+{
+  "type": "turn",
+  "schema_version": 1,
+  "seq": 12,
+  "turn_id": "01J8Z...",
+  "ts_ms": 1760000000123,
+  "ts_iso": "2026-01-01T00:00:00.123Z",
+  "messages": [
+    {"role": "user", "content": "帮我看下 README", "ts_ms": 1760000000000},
+    {"role": "assistant", "content": null, "tool_calls": [ ... ], "ts_ms": 1760000000050},
+    {"role": "tool", "tool_call_id": "call_1", "content": "...(截断标记)", "ts_ms": 1760000000080},
+    {"role": "assistant", "content": "看完了...", "ts_ms": 1760000000120}
+  ],
+  "meta": {
+    "channel": "cli",
+    "scope": "session",
+    "sender_id": null,
+    "truncated_tool_results": 1
+  }
+}
 ```
-SessionKey:  channel, scope, conversation_id, user_id?, tenant_id?
-SessionMessage:
-    id, role, content, name?, tool_call_id?, tool_calls?,
-    ts, turn_id, seq, sender_id?, channel?, raw?
-SessionMeta:
-    storage_id, key, channel, scope, conversation_id, user_id?,
-    created_at, updated_at, message_count, turn_count,
-    schema_version, last_message_preview?, extra?
-MemoryRecord:
-    id, namespace, kind(fact/preference/summary/…), content,
-    tags[], confidence, source_session?, source_message_id?,
-    created_at, updated_at, expires_at?, extra?
-```
 
-- `SessionMessage` 是"存储视角"，`to_llm_messages()` 负责投影成 OpenAI messages；
-- `MemoryRecord` 是"长期记忆视角"，与原始消息解耦。
+会话文件第一行为 `type: "header"`，保存 `storage_id / session_key / channel / scope / conversation_id / user_id? / created_at`；后续行为 turn。
 
-### 8.2 SessionStore（短期，按会话）
+### 5.2 存什么 / 不存什么
+
+| 内容 | 是否落盘 | 说明 |
+|---|---|---|
+| user / assistant 文本 | ✅ | 完整保存 |
+| assistant `tool_calls` | ✅ | 保持 OpenAI 消息格式 |
+| tool 结果 | ✅ | 单条默认截断 8000 字符，加截断标记 |
+| 时间戳 | ✅ | turn 与消息带 `ts_ms`；turn 额外带 ISO |
+| 渠道/发送者 | ✅ | `meta.channel / scope / sender_id`（群聊预留） |
+| 图片/语音/附件 | ❌（预留字段） | v1 不存内容 |
+| 长期记忆 | ⚠️ | **`MEMORY.md` 承担**（系统外机制，见 §9.4）；LongTermStore 为 Noop |
+
+### 5.3 时间戳
+
+- `ts_ms`：UTC epoch millis，排序与超时判断的权威字段；
+- `ts_iso`：UTC ISO8601，仅供人工排查；
+- 不依赖本地时区；turn 内顺序以 `seq` 与数组顺序为准。
+
+### 5.4 上下文窗口与截断
+
+| 项 | v1 默认 | 可配置 |
+|---|---|---|
+| 装载轮数 | 20 轮 | ✅ `max_turns` |
+| 装载字符上限 | 50,000 字符 | ✅ `max_chars` |
+| 工具结果截断 | 8,000 字符/条 | ✅ `max_tool_result_chars` |
+| 超出窗口 | 丢弃最旧的整轮 | — |
+| 摘要压缩 | 不做，仅预留接口 | 未来 |
+
+### 5.5 写入失败语义
+
+- **fail-soft**：append 失败只记录 warning/metrics，正常回复用户；
+- 由于每轮从 store 装载，append 失败意味着该轮不在下一轮上下文中（已知代价）；
+- 绝不因记忆故障阻塞回复；启动时做一次目录可写健康检查并提示。
+
+---
+
+## 6. 抽象接口设计（签名示意，非实现）
+
+### 6.1 SessionStore（短期，v1 唯一实现 = JSONL）
 
 ```
 async append_turn(key, messages, *, turn_id=None, meta=None) -> SessionMeta
-async load_recent(key, *, max_messages=None, max_chars=None) -> list[SessionMessage]
+async load_recent(key, *, max_turns=None, max_chars=None) -> list[SessionMessage]
 async get_meta(key) -> SessionMeta | None
-async clear(key, *, archive=True) -> None
-async list_sessions() -> list[SessionMeta]
-async compact(key) -> None
+async list_sessions(*, include_archived=True) -> list[SessionSummary]
+async archive(key) -> None          # /clear：移动到 archive/
+async purge(key) -> None            # /clear --purge：永久删除
 async close() -> None
 ```
 
-语义要点：
+- `append_turn`：一轮原子写入（内部加锁）；
+- `load_recent`：从最近往前取整轮，坏行跳过并告警；
+- `list_sessions`：扫描活跃/归档文件头 + 末行，返回短 ID、状态、时间、轮数；
+- `archive`：`sessions/<id>.jsonl → archive/<id>.jsonl`；
+- `purge`：删除活跃与归档中的对应文件。
 
-- `append_turn`：一轮原子写入；内部加锁/事务；
-- `load_recent`：越界参数有默认；坏尾行跳过；
-- `clear`：幂等；默认归档；
-- 所有方法失败抛统一的 `MemoryStoreError`，由上层决定降级策略。
-
-### 8.3 LongTermStore（长期，按命名空间）
+### 6.2 LongTermStore（预留，v1 = Noop）
 
 ```
-async add(namespace, record) -> MemoryRecord
-async upsert(namespace, record) -> MemoryRecord        # 按 id/内容指纹去重
-async search(namespace, *, query=None, kinds=(), tags=(), limit=20) -> list[MemoryRecord]
-async delete(namespace, record_id) -> None
-async clear(namespace) -> None
+async recall(namespace, *, query=None, limit=20) -> list[MemoryRecord]
+async remember(namespace, record) -> MemoryRecord
+async forget(namespace, record_id) -> None
 async list_namespaces() -> list[str]
 async close() -> None
 ```
 
-- v1 的 JSONL 实现 `search` 只做关键词/标签过滤；
-- 未来 SQL 后端可用 `LIKE/FULLTEXT`，或另加向量索引，接口保持不变。
+- v1 用 `NoopLongTermStore`：`recall` 返回空，其余方法无操作；
+- namespace：现在 `user:default`；未来 `user:<id>`、`group:<id>`；
+- 结构化长期记忆落地后，`MEMORY.md` 可作为迁移来源，见 §11.2。
 
-### 8.4 MemoryService（门面，业务策略）
+### 6.3 ConversationService（编排层）
 
-职责：
+1. **会话解析**：CLI 进程 session_id；QQ 读 active 指针 + 6 小时惰性轮换；
+2. **装载**：`load_recent(key, 20 轮 / 50k 字符)`；
+3. **执行**：历史快照交给 `AgentLoop.run(user_message, history=...)`；
+4. **回写**：`append_turn`；更新 QQ active 指针；
+5. **指令**：`/sessions`、`/new`、`/clear [id] [--purge]`、`/help`；
+6. **并发**：同一会话串行；不同会话并行；跨渠道删除走会话级锁。
 
-1. `recall(session_key) -> str`：长期记忆 → 注入 System Prompt 的文本（按 token 预算裁剪）；
-2. `record_turn(session_key, user_message, agent_messages)`：写短期流水 + 触发长期提炼策略；
-3. 命令语义：`clear_session`、`new_session`、`remember(text)`、`forget(id/query)`、`export()`；
-4. 策略：何时摘要、何时提炼长期记忆、敏感信息过滤、写入失败降级。
+### 6.4 与 AgentLoop 的边界
 
-### 8.5 为什么接口现在就要 async
+- `AgentLoop` 不再负责持久化：`run()` 接收历史快照，本轮临时 state 留在单次调用内；
+- 短期上下文由 ConversationService 装载/回写；
+- 好处：纯逻辑、易测、可并发；代价：需调整 AgentLoop 签名与测试（实现阶段处理）。
 
-- 当前 AgentLoop 已全异步；JSONL 很快，但一旦调用方按同步接口写，将来换 aiomysql / redis.asyncio 就要改 AgentLoop、Service、测试与渠道层；
-- JSONL 后端用 `await asyncio.to_thread(...)` 包装即可，代价可接受；
-- 若担心事件循环阻塞，也可先用同步实现 + 上层 `to_thread`，但**接口签名保持异步**。
+### 6.5 异步与错误
+
+- 接口全部 `async`；JSONL 用短 IO，将来 MySQL/Redis 直接适配；
+- 统一 `MemoryStoreError`；
+- 读失败返回空历史 + warning；写失败 fail-soft；
+- 启动时检查目录可写与 `schema_version` 兼容。
 
 ---
 
-## 9. JSONL 后端设计
+## 7. JSONL 后端设计
 
-### 9.1 文件布局
+### 7.1 目录布局
 
 ```
 <workspace>/memory/
 ├── sessions/
-│   ├── index.jsonl              # storage_id ↔ canonical_key ↔ meta
-│   ├── <storage_id>.jsonl       # 每会话一个 turn 流水
-│   └── <storage_id>.jsonl.lock  # 跨进程锁(可选)
-├── long_term/
-│   ├── facts.jsonl              # 长期记忆记录(追加写)
-│   └── namespaces.json          # 命名空间索引(可选)
-├── archive/                     # clear/compact 后的归档
-└── MEMORY.md                    # 兼容旧版的人设式记忆(迁移后只读或废弃)
+│   ├── <storage_id>.jsonl
+│   └── <storage_id>.jsonl.lock
+├── archive/
+│   └── <storage_id>.jsonl
+├── active/
+│   └── qq_private.jsonl        # QQ: uin → 当前 session_id + last_activity_ms
+└── MEMORY.md                   # v1 长期记忆（Agent 维护，跨渠道）
+    └── MEMORY.md.bak           # 写入前自动备份（滚动一份）
 ```
 
-### 9.2 流水行 schema（示意）
+- `memory_dir` 默认 `<workspace>/memory`，可配置；
+- 目录 0700、文件 0600；明文存储（D4）。
 
-```json
-{
-  "schema_version": 1,
-  "seq": 12,
-  "turn_id": "01J8Z...",
-  "ts": 1760000000123,
-  "messages": [
-    {"role": "user", "content": "帮我看下 README", "ts": 1760000000000},
-    {"role": "assistant", "content": null, "tool_calls": [ ... ], "ts": 1760000000050},
-    {"role": "tool", "tool_call_id": "call_1", "content": "...", "ts": 1760000000080},
-    {"role": "assistant", "content": "看完了...", "ts": 1760000000120}
-  ],
-  "meta": {"channel": "feishu", "sender_id": "ou_xxx", "token_estimate": 812}
-}
-```
+### 7.2 记录格式
 
-- **一轮一行**：工具调用与结果跟随该轮一起落盘，避免半轮；
-- `seq` 在会话锁内单调递增，是排序的可靠依据；`ts` 仅作展示；
-- `schema_version` 支持未来字段演进；未知字段读取时忽略但保留。
+- 文件第一行：`{"type":"header","schema_version":1,"storage_id":...,"session_key":...,...}`；
+- 其后每行一个 turn（§5.1）；
+- 追加写：`json.dumps(..., ensure_ascii=False, separators=(",", ":")) + "\n"`；
+- 字段只增不删；读取忽略未知字段。
 
-### 9.3 写入与恢复
+### 7.3 写入、读取与恢复
 
-- append 一行：`json.dumps(..., ensure_ascii=False, separators=(",", ":")) + "\n"`；
-- 同一进程内用 `asyncio.Lock`；跨进程用文件锁（`fcntl.flock` / `portalocker`），锁文件与数据文件同目录；
-- 需要更强持久性时 `flush + os.fsync`（每轮一次，性能可接受）；崩溃时最多丢最后一轮；
-- 读取时遇到不完整行：跳过并 `logger.warning`，不阻塞后续读取；
-- 重写类操作（clear/compact）一律 `写 .tmp → fsync → os.replace`，避免"删到一半"；
-- 文件权限：目录 `0700`、文件 `0600`。
+- 同一会话写入前取进程内 `asyncio.Lock`；跨进程操作（含跨渠道删除）加会话级文件锁；
+- 一轮一次 `write()`；可选每轮 `flush/fsync`；
+- 读取跳过损坏/半行并告警；
+- `archive`/`purge` 用 `tmp + os.replace` 或 `os.replace` 保证原子；
+- **不做自动清理/压缩/过期**；磁盘监控由用户负责。
 
-### 9.4 索引与列举
+### 7.4 `/sessions` 的数据来源
 
-- `index.jsonl` 每条记录：`storage_id, key, channel, scope, conversation_id, user_id, created_at, updated_at, counts`；
-- 每次 append/clear 后顺手更新（同一会话锁内），或采用"惰性重建"（扫描所有文件首尾行）；
-- `list_sessions()` 只读索引，不反解文件名；索引损坏时可重建。
+- 扫描 `sessions/*.jsonl` 与 `archive/*.jsonl`：
+  - 读第一行 header → 逻辑键、渠道、创建时间；
+  - 读最后一行 turn → 最后活动、轮数（v1 单用户规模可接受；若变慢再加 sidecar meta）；
+  - 计算短 ID（最短唯一前缀，至少 8 位）；
+- 输出排序：最后活动时间倒序。
 
-### 9.5 压缩、轮转与摘要
+### 7.5 QQ active 指针
 
-- 触发条件：文件行数/字节数超阈值，或加载时超出上下文预算；
-- 流程：把最旧的 K 轮交给模型生成摘要 → 写入 `long_term`（`kind=summary`）或会话头部 `summary` 记录 → 归档原文件并重写保留尾部；
-- 摘要失败不得丢数据：先写归档，再做替换；
-- `MEMORY.md` 的旧内容在迁移时转为 `kind=fact` 记录或保留为手工维护的"人设补充"，由 LongTermStore 读取并参与 `recall()`。
-
-### 9.6 JSONL 的局限与退出条件
-
-| 局限 | 触发换后端的信号 |
-|---|---|
-| 无索引/查询弱 | 需要按内容/时间/标签检索，或会话数 > 数千 |
-| 无事务、改写成本高 | 需要编辑/删除单条消息、跨表一致性 |
-| 并发依赖文件锁 | 多进程/多服务同时写同一会话 |
-| 无原生 TTL/自增/聚合 | 需要统计、限流、审计报表 |
-| 明文存储 | 需要加密/权限分级/合规 |
-
-出现上述任一信号，优先升级到 **SQLite**（本地、事务、零运维），再视部署形态升级 MySQL。
+- 文件：`active/qq_private.jsonl`，追加事件：
+  - `{"type":"activate","uin":...,"session_id":...,"at_ms":...}`
+  - `{"type":"activity","uin":...,"session_id":...,"at_ms":...}`
+  - `{"type":"clear","uin":...,"at_ms":...}`
+- 按 `uin` 取最新事件；写者只有 QQ 服务（单实例；可加 `.lock` 防误启多实例）；
+- 若 active 指向的会话文件缺失（被 CLI 删除/归档），QQ 服务按新会话处理并提示"已开始新对话"。
 
 ---
 
-## 10. 并发设计（同一用户多渠道）
+## 8. 并发设计
 
-### 10.1 场景矩阵
+### 8.1 场景与策略
 
-| 场景 | 风险 | 处理 |
+| 场景 | 风险 | v1 策略 |
 |---|---|---|
-| 不同渠道并发 | 短期本应隔离；长期共享会并发写 | 短期按会话互不影响；长期按 namespace 锁 |
-| 同渠道同会话连续消息 | 上下文交错、重复回复 | 会话内串行（队列/锁） |
-| 同渠道多设备 | 同一 SessionKey | 同上，串行 + 消息按 seq 排序 |
-| CLI 进程 + 渠道服务进程 | 文件级竞争 | 单写者优先；否则文件锁 |
-| IM 平台重推事件 | 重复写入/重复回复 | `event_id` 去重 + 幂等键 |
-| 一轮中途崩溃 | 半轮上下文 | 按轮原子写；待回复消息进入待处理队列 |
-| `/clear` 与写入并发 | 数据复活/丢失 | clear 与 append 共用同一把会话锁 |
+| CLI 与 QQ 服务同时运行 | 共享 `memory/` | 文件所有权分离；无共享索引；跨渠道删除加会话级文件锁 |
+| 同一 CLI 进程 | 单线程交互 | 天然串行 |
+| 同一 QQ 联系人连发消息 | 上下文交错 | 每联系人队列/锁，整轮串行 |
+| QQ 服务重启 | active 丢失 | active 指针持久化，重启恢复 |
+| 跨渠道删除活跃会话 | 写入复活/指针失效 | 会话文件锁 + QQ 装载时校验文件存在性 |
+| `/clear`/`/new` 与写入并发 | 数据复活/丢失 | 同一会话锁内执行，归档后生成新 session id |
+| 记忆写入失败 | 上下文缺失 | fail-soft + 告警 |
 
-### 10.2 锁的分层
+### 8.2 锁的分层
 
-```
-全局              → 不使用（会串行化所有会话）
-每 SessionKey     → 进程内 asyncio.Lock（弱引用字典）+ 跨进程文件锁（可选）
-每 Namespace      → 长期记忆写入锁（user:<id>）
-每存储实例        → close() 时统一释放
-```
+- **进程内**：`SessionKey → asyncio.Lock`（弱引用/LRU），同会话串行；
+- **跨进程**：会话级文件锁（`<storage_id>.jsonl.lock`），用于"两个进程可能动同一会话"的兜底（v1 主要为跨渠道删除）；
+- **QQ active 文件**：单实例写者 + 启动 `.lock` 防误启多实例；
+- 不使用全局锁。
 
-- **进程内**：用一个 `dict[SessionKey, asyncio.Lock]`（弱引用或带 LRU 清理），保证同一会话同时只有一轮在跑；
-- **跨进程**：`fcntl.flock` 包住"读历史 → 追加一轮"的临界区；锁粒度是单个会话文件；
-- **不要**把全局锁放在模型调用外层：不同会话必须能并行；
-- 同一会话是否要在整个模型调用期间持锁？
-  - **v1 推荐：持锁整轮**。单用户场景下同会话本来就不该并行；实现简单、顺序严格；
-  - 未来高并发可改为"短锁读快照 + 写时乐观校验（seq/version）+ 冲突重试"。
+### 8.3 幂等与崩溃恢复
 
-### 10.3 单写者原则（推荐演进方向）
-
-- **阶段 1（CLI 单进程）**：进程内锁即可，无需文件锁；
-- **阶段 2（多渠道服务）**：一个常驻 gateway 进程拥有所有渠道与存储；CLI 若同时运行，改为连接该服务（本地 socket/HTTP），不再直接写文件；
-- **阶段 3（多进程/多机）**：MySQL 事务 + Redis 分布式锁；文件锁退化为迁移期兼容。
-
-单写者能同时解决：文件锁复杂度、事件顺序、长期记忆冲突、限流与审计。
-
-### 10.4 长期记忆的并发与冲突
-
-- 同一 namespace 的写入用锁串行；
-- 记录级去重：`id`（ULID）+ `content_hash` + `(namespace, kind, normalized_content)` 唯一约束（SQL 后端）；
-- 冲突策略：
-  - 显式 `记住` 优先于自动提炼；
-  - 新记录覆盖旧记录时保留 `supersedes` 链，不物理删除；
-  - 时间相近的冲突交给用户确认（渠道回复"有两条冲突的偏好，采用哪条？"）；
-- `forget` 支持按 id、关键词、来源会话删除；删除也要走锁与审计。
-
-### 10.5 幂等与事件去重
-
-- 渠道层收到事件先按 `(channel, event_id)` 查重（内存 + 持久化去重表）；
-- 记忆层的 `append_turn` 接受 `turn_id`/`message_id`，重复写入直接跳过；
-- 回复失败重试时，用 `reply_id` 防止重复发送（渠道适配层职责）。
-
-### 10.6 崩惯恢复
-
-- 写入顺序：**先落待处理事件（pending）→ 生成回复 → 落 turn → 标记完成**；
-- 若在模型调用中崩溃：重启后能看到 pending，可选择重试或回复"刚才处理中断了"；
-- 若在落 turn 时崩溃：turn 原子写保证要么完整要么没有；不完整行读取时跳过；
-- `clear`/`compact` 用 tmp+rename，崩溃不会留下半改文件。
+- QQ 渠道层按 `(channel, event_id)` 去重，防止平台重推造成重复 turn/回复；
+- `turn_id` 用于写入去重（实现阶段定粒度）；
+- 崩溃最多丢最后一轮；已落盘 turn 完整；
+- 归档/删除使用原子替换，崩溃不会留下半改文件。
 
 ---
 
-## 11. 存储位置放哪里？
+## 9. 存储位置、工具边界与安全
 
-### 候选对比
+### 9.1 位置
 
-| 方案 | 优点 | 缺点 | 结论 |
+- 默认 `<workspace>/memory/`，`memory_dir` 可配置；
+- 不放项目根；随 workspace 一起备份；不入 git。
+
+### 9.2 工具访问策略（D27）
+
+| 路径 | read_file | write_file | list_dir |
 |---|---|---|---|
-| A. 项目根 `meowmeowclaw/memory/` | 直观 | 污染代码库；wheel 安装后不可写；备份/权限混乱 | ❌ |
-| B. `<workspace>/memory/` | workspace 已是运行时数据目录；可被 `.env` 绝对路径整体迁移；现有 `MEMORY.md` 预留位置一致 | 与 Agent 可操作的文件区重叠，需禁止工具访问 | ✅ **推荐** |
-| C. XDG `~/.local/share/meowmeowclaw/` | 符合 Linux 应用规范；安装形态友好 | 与当前"仓库根 workspace"心智不一致；需要新配置 | 后续可选 |
-| D. 独立 `data_dir` 配置 | 最灵活 | v1 多一个配置项与概念 | 以 B 为默认，保留 `memory_dir` 覆盖 |
+| `memory/sessions/**` | ❌ | ❌ | ❌ |
+| `memory/active/**` | ❌ | ❌ | ❌ |
+| `memory/archive/**` | ❌ | ❌ | ❌ |
+| `memory/MEMORY.md` | ✅ | ✅（写入前自动备份） | ✅ |
+| 其他工作区 | ✅ | ✅ | ✅ |
 
-### 推荐
+- 实现层在 `resolve_in_workspace` 之上加 ToolPolicy 例外：仅放行 `memory/MEMORY.md`；
+- `write_file` 命中 `memory/MEMORY.md` 时：先把现有内容复制到 `memory/MEMORY.md.bak`，再写入新内容；
+- 目的：既允许 Agent 维护长期记忆，又尽量防止一次覆盖清空。
 
-- 默认：`<workspace>/memory/`，并新增配置项 `memory_dir`（默认取 `<workspace>/memory`）；
-- 用户已经可以通过 `.env workspace=/abs/path` 整体迁移数据；将来要拆开时只需设 `memory_dir=/var/lib/...`；
-- 项目根只保留 `identity.md` 等源码级资源，不存运行时记忆；
-- **工具隔离**：在文件工具的路径策略中把 `memory_dir` 加入拒绝列表（读/写/列举都拒绝），或至少禁止写入与列举；否则 Agent 可以读取自己的记忆（隐私/注入风险）或改写记忆文件。
-- 权限与备份：目录 `0700`、文件 `0600`；`memory/` 不入 git；建议随 workspace 一起备份；
-- 安装形态下（wheel）`workspace` 已建议配置绝对路径，记忆自然跟着走。
+### 9.3 无加密的已知风险（已接受）
 
----
+- JSONL 与 `MEMORY.md` 均为明文，包含完整对话与笔记；
+- 依赖 0700/0600 权限、单用户环境、机器账号安全；
+- 备份/同步会复制明文；未来需要时再引入加密（§11.5）。
 
-## 12. 与现有代码的集成点
+### 9.4 `MEMORY.md`：v1 最简长期记忆
 
-| 位置 | 现状 | 记忆系统接入方式 |
-|---|---|---|
-| `paths.py` | 项目根/workspace/identity 唯一来源 | 增加 `DEFAULT_MEMORY_DIR = DEFAULT_WORKSPACE / "memory"` 或由 config 解析 |
-| `config.py` | 纯解析 Settings | 增加 `memory_dir`、`memory_backend`（jsonl/sqlite/mysql）、`session_limit` 等；仍保持无副作用 |
-| `bootstrap.py` | 组合根装配 Application | 构造 `MemoryService` 并注入 `Application`；按配置选择后端 |
-| `agent/loop.py` | 持有 `_session_history` | 两种路线：① 注入 store+key；② 抽出 `ConversationService`，AgentLoop 接收历史快照（推荐②） |
-| `agent/context.py` | 直接读 `workspace/memory/MEMORY.md` | 改为注入 `long_term_provider`/`recall` 文本；存储细节下沉到 LongTermStore |
-| `cli.py` | `/clear` 调 `agent.clear_history()` | 改为调 `MemoryService.clear_session()`，并同步内存历史；新增 `/new`、`/remember`、`/forget`（后两者可选） |
-| `tools/filesystem.py` | 工作区路径防护 | 在 `resolve_in_workspace` 或 ToolPolicy 中拒绝记忆目录 |
-| 渠道适配层（未来） | 无 | 只调用 `ConversationService.handle(session_key, incoming)`，不直接碰存储 |
-| `tests/` | 现有 loop/context 测试 | 增加 SessionStore/LongTermStore 契约测试、并发测试、崩溃恢复测试、迁移测试 |
-
-### AgentLoop 改造建议（二选一）
-
-- **方案 A（改动小）**：`AgentLoop(store, session_key, ...)`，`run()` 内 load/append。优点是快；缺点是控制流与持久化耦合，并发/测试复杂。
-- **方案 B（推荐）**：新增 `ConversationService`，负责 `load_recent → ContextBuilder → AgentLoop.run(history) → append_turn`；`AgentLoop.run(user_message, *, history=None)` 改为可接收外部历史快照，内部仍保留无 store 的纯逻辑。
-- 方案 B 让 AgentLoop 保持"可替换、可并发（每会话一实例）"，也为将来换编排/多 Agent 留空间。
+- **定位**：短期对话之外、跨渠道共享的长期笔记；由 Agent 自己维护，不经过 LongTermStore；
+- **读取**：`ContextBuilder` 每次构建 System Prompt 时读取并拼接（保留现有行为）；
+- **写入**：Agent 通过 `write_file("memory/MEMORY.md", ...)` 写入；每次写入前自动备份 `MEMORY.md.bak`；
+- **Prompt 约定**（实现时写入 System Prompt）：
+  1. 修改长期记忆前必须先 `read_file` 读取当前内容；
+  2. 合并/追加后整体写回，不得清空已有笔记；
+  3. 只记录稳定、可复用的事实/偏好，不记录临时对话细节；
+  4. 不写入密钥、密码等敏感信息；
+- **不限制大小/频率**（D32）；风险由备份与 Prompt 约定缓解；
+- 由于跨渠道共享，CLI 的笔记 QQ 能看到，反之亦然——这是有意设计。
 
 ---
 
-## 13. 演进到 MySQL / Redis
+## 10. 测试策略
 
-### 13.1 接口不变，替换后端
-
-- `MemoryService` 只依赖 `SessionStore` / `LongTermStore` 协议；
-- `bootstrap` 根据 `memory_backend` 选择实现；
-- 数据迁移工具（JSONL → SQL）作为一次性脚本/模块，按 `schema_version` 与 `storage_id` 去重导入。
-
-### 13.2 MySQL 表结构草案
-
-| 表 | 关键字段 | 索引 |
-|---|---|---|
-| `sessions` | `storage_id PK, session_key UNIQUE, channel, scope, conversation_id, user_id, created_at, updated_at, message_count, turn_count, meta JSON` | `UNIQUE(session_key)`、`(user_id, updated_at)` |
-| `messages` | `id PK, storage_id FK, seq, turn_id, role, content JSON, ts, sender_id, meta JSON` | `(storage_id, seq)`、`(turn_id)` |
-| `memory_records` | `id PK, namespace, kind, content, tags JSON, confidence, source_session, source_message_id, created_at, updated_at, expires_at, superseded_by` | `(namespace, kind, updated_at)`、`FULLTEXT(content)`（可选） |
-| `events`（去重/幂等） | `channel, event_id PK/UNIQUE, received_at, status` | 主键/唯一键 |
-
-- `append_turn` 在事务内插入 messages 并更新 sessions 计数；
-- `load_recent` 用 `WHERE storage_id=? ORDER BY seq DESC LIMIT ?` 再反转；
-- `clear` 支持事务内删除或归档表；
-- 迁移期间可"双写 + 读新后端回退旧后端"。
-
-### 13.3 Redis 的定位
-
-- **适合**：热会话缓存（最近 N 条）、分布式锁、事件去重（SETNX+TTL）、限流、任务队列/Streams；
-- **不适合**：作为长期记忆与审计的唯一持久层（持久化策略与容量约束）；
-- 推荐组合：**SQL 主存储 + Redis 缓存/锁/队列**；
-- 接口无需感知 Redis，可在 `MemoryService` 层加缓存装饰器（cache-aside）。
-
-### 13.4 迁移顺序建议
-
-```
-JSONL → SQLite（本地、事务、零运维，接口不变） → MySQL（服务化/多进程）
-                     ↘ Redis 仅做缓存/锁/队列（可选，提前或并行）
-```
-
-即使单用户，只要进入"多进程多渠道"，SQLite 也比 JSONL 更省心（事务、索引、单文件备份）。
-
----
-
-## 14. 记忆写入策略与安全
-
-### 14.1 什么进入长期记忆
-
-| 来源 | 是否写入 | 说明 |
-|---|---|---|
-| 用户显式"记住…/以后都…" | ✅ 直接写 | 最高优先级 |
-| 系统提炼（对话摘要、稳定偏好） | ⚠️ 受控写 | 需置信度阈值、去重、可追溯；可先入"候选区" |
-| 模型自由输出 | ❌ 默认不写 | 防止幻觉/注入污染 |
-| 渠道原始消息 | ❌ 不进长期 | 只进短期 transcript |
-| 工具结果 | ❌ | 除非提炼出结论且被确认 |
-
-### 14.2 安全要点
-
-- 渠道消息默认**不可信**：prompt injection 可能诱导模型调用工具或写记忆；长期写入必须受策略与权限约束；
-- 记忆目录禁止被 read/write/list 工具访问（§11）；
-- 敏感信息过滤：API key、密码、证件号等在落盘前打码/拒绝写入（至少长期记忆禁止）；
-- 权限：目录 0700、文件 0600；备份加密可选；
-- 审计：记录来源会话、写入时间、策略版本；删除采用软删/归档；
-- 命令权限：远程渠道默认禁用 `exec`，文件工具限制到会话工作区；`/forget`、`/clear` 仅私聊/白名单可用。
-
----
-
-## 15. 上下文窗口与摘要策略
-
-- `load_recent` 只保证"取最近若干"；上层 `ContextWindowPolicy` 负责：
-  1. 预留 System Prompt 与工具定义预算；
-  2. 优先保留最近 N 轮完整对话；
-  3. 超出预算时用会话摘要（`kind=summary`）替换更早的轮次；
-  4. 必要时触发 `compact` 落盘，避免每次重新摘要；
-- 摘要记录带 `covers_seq_range`，加载时"摘要 + 尾部原始轮次"组合；
-- 不把长期记忆全量塞进 Prompt：`recall()` 按当前输入做过滤/打分，限制条数与字符数。
-
----
-
-## 16. 测试策略（设计阶段先定契约）
-
-| 测试类型 | 内容 |
+| 类型 | 覆盖内容 |
 |---|---|
-| 契约测试 | 同一组用例对 JSONL/SQLite/MySQL 后端参数化，接口行为一致 |
-| 崩溃恢复 | 半行 JSON、部分 turn、进程中断后恢复 |
-| 并发 | 同会话两任务串行、不同会话并行、多进程文件锁 |
-| 幂等 | 重复 event_id/turn_id 不重复写入 |
-| 迁移 | JSONL → SQLite/MySQL 导入后消息数、顺序、元数据一致 |
-| 安全 | 工具无法访问 memory 目录；长期写入策略拒绝敏感内容 |
-| 上下文 | 超预算时摘要+尾部组合正确、不丢最近轮次 |
+| 契约测试 | SessionStore 行为规格（JSONL 实现通过；未来后端复用） |
+| CLI 会话 | 每次启动新会话；`/clear` 归档+新建；`/new` 切换；`/sessions` 列出；多进程隔离 |
+| QQ 会话 | 6 小时前沿用/之后轮换；active 指针持久化；重启恢复；提示语；`/new`/`/clear` |
+| 会话管理 | 短 ID 解析（唯一/冲突）；`/clear <id>`；`--purge`；归档与永久删除 |
+| 跨渠道 | CLI 删除 QQ 会话后 QQ 服务重建会话并提示；QQ 删除 CLI 会话 |
+| 窗口与截断 | 20 轮/50k 字符；不切开 turn；8000 字符工具结果截断 |
+| 并发 | 同联系人串行；不同会话并行；归档/删除与写入互斥 |
+| 崩溃恢复 | 半行 JSON、部分 turn、归档替换中断 |
+| 工具边界 | sessions/active/archive 全禁；MEMORY.md 可读写、写前备份 |
+| 长期记忆 | MEMORY.md 拼接进 Prompt；备份文件生成；Prompt 约定生效（行为级） |
+| 预留接口 | NoopLongTermStore 行为稳定；ContextBuilder 注入点不影响现状 |
 
 ---
 
-## 17. 分期落地建议（不涉及实现）
+## 11. 未来扩展（v1 不实现）
+
+### 11.1 群聊
+
+- 增加 `scope=group`、群 ID；记录 `sender_id`（字段已预留）；
+- 会话 = 群（可选 group+thread）；触发规则（@/前缀/白名单）在渠道层；
+- 长期记忆命名空间 `group:<id>` 与 `user:<id>` 并存；
+- 工具权限收紧（群聊默认禁 `exec`）；
+- 目标零迁移：接口与文件格式不变，只加渠道层与策略。
+
+### 11.2 结构化长期记忆（LongTermStore）
+
+- 实现 JSONL/SQLite/MySQL 后端，命名空间 `user:default → user:<id>`；
+- 写入策略：显式"记住/忘记"优先，自动提炼后置且受控；
+- `MEMORY.md` 可作为迁移来源（解析为 `MemoryRecord`），也可保留为人工/Agent 共写的补充；
+- `ContextBuilder` 注入 `recall()` 结果，与 `MEMORY.md` 并存或替代。
+
+### 11.3 其他模态
+
+- 图片/语音/附件元数据与本地缓存路径；是否接入多模态模型另行评估。
+
+### 11.4 多用户 / 服务化与存储升级（D28）
+
+- 触发条件：多用户、多渠道常驻服务、群聊、需要查询/事务/审计；
+- 路径：**JSONL → SQLite → MySQL**；Redis 仅做缓存/锁/去重/队列；
+- 接口不变，替换后端；迁移按 `storage_id/session_key` 去重导入；
+- 并发从"文件所有权互斥"升级为"DB 事务 + 分布式锁"。
+
+### 11.5 加密
+
+- 在 0700/0600 之外引入信封加密/密钥管理；
+- 加密单元（会话文件或整库）、检索与迁移另做设计；
+- v1 不做，风险已记录。
+
+---
+
+## 12. 实施里程碑（v1）
 
 | 里程碑 | 内容 | 退出标准 |
 |---|---|---|
-| M0 | 本文档评审、字段/命名/键格式冻结 | 决策表评审通过 |
-| M1 | `SessionKey`/`SessionMessage`/`SessionMeta` 类型 + JSONL `SessionStore` | 契约测试 + 崩溃/并发测试通过 |
-| M2 | `ConversationService` + AgentLoop 历史注入；CLI 接入；`/clear` `/new` | CLI 多轮、重启恢复一致 |
-| M3 | `LongTermStore` + `MemoryService.recall/remember/forget`；ContextBuilder 注入 | 跨渠道共享记忆、显式写入可用 |
-| M4 | 并发完善：文件锁、事件去重、待处理队列 | 两进程并发写不坏数据 |
-| M5 | 压缩/摘要/窗口策略 | 长会话不超模型窗口 |
-| M6 | SQLite 后端 + 迁移工具；Redis 缓存/锁可选 | 后端可切换、数据可迁移 |
-| M7 | 渠道接入（飞书/QO 等）使用 `ConversationService` | 多渠道闭环 |
+| M0 | 本文档评审通过 | 决策表确认 |
+| M1 | `SessionKey/SessionMessage/SessionMeta/SessionSummary` 类型 + `SessionStore` 接口 + JSONL 实现 | 契约测试通过 |
+| M2 | `ConversationService` + AgentLoop 历史快照改造 | 装载/回写/窗口正确 |
+| M3 | CLI 接入：进程会话、`/sessions`、`/new`、`/clear [id] [--purge]` | 命令与文件行为测试通过 |
+| M4 | QQ 私聊接入：active 指针、6h 惰性轮换、提示语、最小指令集 | 超时/重启/跨渠道删除测试通过 |
+| M5 | `MEMORY.md` 长期记忆：写入备份、Prompt 约定、ContextBuilder 拼接 | 备份/合并行为符合约定 |
+| M6 | `LongTermStore` Protocol + Noop + 注入点 | 现状 Prompt 行为不变 |
+| M7 | 并发/崩溃/工具边界/文档收口 | 全部测试通过、文档同步 |
 
 ---
 
-## 18. 待决问题
+## 13. 执行细节确认（无待决项）
 
-1. CLI 每次启动的默认会话：延续上次，还是按日期自动新会话？（建议默认延续 + `/new`）
-2. 群聊中 bot 的触发规则（@、前缀、白名单）与会话粒度（群 vs 群+用户）？
-3. 长期记忆写入是否需要"候选区 + 用户确认"两步，还是高置信度直接写？
-4. 摘要使用哪个模型/是否单独预算，摘要失败时如何降级？
-5. 是否需要向量检索（若需要，嵌入模型与存储从哪一层引入）？
-6. 记忆是否需要加密（v1 依赖文件权限，还是直接引入加密）？
-7. `/remember` 的持久对象：用户级（跨渠道）还是会话级？两者如何共存？
-8. 何时从 JSONL 升级 SQLite（按会话数、消息量还是多进程需求触发）？
+以下细节已按默认值确认，直接作为实现约束：
+
+| 项 | 确认结果 |
+|---|---|
+| `MEMORY.md.bak` | 单份滚动备份，每次 Agent 写入前覆盖 |
+| `/sessions` 输出 | 默认活跃 + 归档；短 ID、状态、渠道、创建/最后活动时间、轮数；完整逻辑键可复制 |
+| 短 ID | 最短唯一前缀，最少 8 位，冲突自动加长 |
+| "已开始新对话"提示 | 超时轮换、`/new`、跨渠道删除导致重建，三场景统一使用 |
+| `--purge` | 直接执行，输入短 ID 即视为确认 |
+
+M1 实施范围：`SessionKey` / `SessionMessage` / `SessionMeta` / `SessionSummary` 类型 + `SessionStore` 抽象接口 + JSONL 实现 + 契约测试。

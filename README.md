@@ -3,7 +3,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 17 个源码模块 / 约 2450 行; 测试 14 个文件 / **630 个用例**(622 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 18 个源码模块 / 约 2500 行; 测试 15 个文件 / **633 个用例**(625 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -26,6 +26,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `/exit`(`/quit` `/q`) | 退出 |
 | `/clear` | 清空对话历史与工具调用记录 |
 | `/tools` | 查看已注册工具 |
+| `/skills` | 查看已发现的内置技能 |
 
 ### 配置项(`.env`, 与 `meowmeowclaw/` 同级)
 
@@ -62,8 +63,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ 入口 / 交互层      main.py                                                 │
-│   build_agent() 装配 6 工具(+技能时加 load_skill) · 技能摘要 · REPL        │
+│ 入口 / 交互层      cli.py + bootstrap.py                                   │
+│   build_application() 装配 6 工具(+load_skill) · 技能摘要 · REPL           │
 └──────────────────────────────────────┬─────────────────────────────────────┘
                                        │                                      
 ┌──────────────────────────────────────▼─────────────────────────────────────┐
@@ -86,7 +87,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 ┌────────────────────────────────────────────────────────────────▼───────────┐
 │ 配置层             config.py :: Settings + load_config()                   │
 │   paths.py 唯一定位项目根/workspace/人设; .env 解析无副作用               │
-│   workspace 由 main.build_agent() 创建; 技能目录 = <包>/skills/builtin    │
+│   workspace 由 bootstrap.build_application() 创建; 技能目录同上           │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -121,7 +122,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/skills/tool.py` | 85 | `load_skill` 工具(技能子系统对 Agent 的唯一出口) | `LoadSkillTool` |
 | `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 241 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
-| `meowmeowclaw/main.py` | 232 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `_build_registry()` / `interactive_loop()` / `main()` |
+| `meowmeowclaw/bootstrap.py` | 122 | **组合根**: 配置 -> Provider -> 工具 -> 技能 -> Context/Loop | `build_application()` / `Application` / `ConfigError` |
+| `meowmeowclaw/cli.py` | 169 | **交付层**: banner / 启动信息 / REPL / 命令 / 退出码 | `main()` / `interactive_loop()` / `_handle_command()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -192,7 +194,7 @@ description: 在工作区内执行 Shell 命令的用法与安全限制
 | 环节 | 实现 |
 | --- | --- |
 | 扫描 / 解析 | `skills/loader.py :: SkillCatalog`(importlib.resources、启动扫描一次、坏 YAML 跳过、重名报错) |
-| 注入提示词 | `main.build_agent()` 把 `catalog.summary()` 传给 `ContextBuilder(skills_summary=...)`, `build_system_prompt()` 追加 `## 可用技能` 章节 |
+| 注入提示词 | `bootstrap.build_application()` 把 `catalog.summary()` 传给 `ContextBuilder(skills_summary=...)`, `build_system_prompt()` 追加 `## 可用技能` 章节 |
 | 按需取回 | `skills/tool.py :: LoadSkillTool`(**有技能时才注册**), 模型调用 `load_skill(name="exec")` |
 | 技能不存在 | 返回 `[错误] 未找到技能: xxx. 可用技能: ...`, 把可用名字回给模型便于自纠 |
 | 越界防护 | 先按名**精确查内存索引**, 未知名直接返回错误, 不拼接路径、不触碰文件系统 |
@@ -334,15 +336,15 @@ registry.register(HttpGetTool())     # 注册后模型即可见
 ```
 
 **换模型 / 换服务**: 只改 `.env` 的 `model` + `base_url`; 非 OpenAI 协议则实现一个 `LLMProvider` 子类.
-**换编排**: `AgentLoop` 是独立一层, 可整体替换, `main.py` 只改装配代码.
+**换编排**: `AgentLoop` 是独立一层, 可整体替换, `bootstrap.py` 只改装配代码.
 
 ---
 
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 622 passed, 6 skipped, 2 xfailed
-pytest tests/test_loop.py -v
+pytest                                        # 全量: 625 passed, 6 skipped, 2 xfailed
+pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ```
 
@@ -350,20 +352,21 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 
 | 测试文件 | 用例 | 重点 |
 | --- | ---: | --- |
-| `test_base_tool.py` | 3 | 工具基类抽象约束 |
-| `test_tool_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
-| `test_filesystem.py` | 91 | 三件套读写/截断/异常分支、resolve_in_workspace、同前缀绕过回归 |
-| `test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
-| `test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
-| `test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
+| `test_bootstrap.py` | 12 | 装配(工具/技能/Context/Loop)、ConfigError/SkillConfigError、导入边界 |
+| `test_cli.py` | 20 | REPL 命令分支、启动输出、退出码、Ctrl+C/EOF 优雅退出 |
+| `agent/test_context.py` | 40 | 人设单路径读取与回退、时间实时取值、记忆/技能章节 |
+| `agent/test_loop.py` | 35 | 消息格式、防爆阈值、历史写入策略、max_iterations 显式注入 |
 | `skills/test_catalog.py` | 36 | frontmatter 边界、索引/摘要、坏 YAML 跳过、重名报错、内置资源可发现 |
 | `skills/test_tool.py` | 30 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
-| `test_context.py` | 47 | 人设查找链(工作区→项目根兜底)、时间实时取值、记忆/技能章节 |
+| `tools/test_base.py` | 3 | 工具基类抽象约束 |
+| `tools/test_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
+| `tools/test_filesystem.py` | 91 | 三件套读写/截断/异常分支、resolve_in_workspace、同前缀绕过回归 |
+| `tools/test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
+| `tools/test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
+| `tools/test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
-| `test_loop.py` | 35 | 消息格式、防爆阈值、历史写入策略、配置驱动默认值 |
-| `test_main.py` | 27 | 装配(工具/技能)、命令分支、Ctrl+C 优雅退出 |
-| `test_config.py` | 43 | 取值优先级、路径解析、非法值兜底、密钥掩码 |
+| `test_config.py` | 47 | 取值优先级、路径解析、非法值兜底、密钥掩码 |
 
 ---
 
@@ -375,12 +378,13 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 14 个测试文件 / 613 用例
+├── tests/                       # 15 个测试文件 / 633 用例(agent/skills/tools 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
-    ├── main.py                  # 入口(装配 + 交互)
-    ├── __main__.py              # python -m meowmeowclaw
+    ├── bootstrap.py             # 组合根: 装配 Application(不 print)
+    ├── cli.py                   # 交付层: banner / REPL / 命令 / 退出码
+    ├── __main__.py              # python -m meowmeowclaw -> cli.main()
     ├── agent/
     │   ├── context.py           # System Prompt / messages
     │   └── loop.py              # AgentLoop 控制流

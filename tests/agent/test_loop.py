@@ -155,7 +155,7 @@ def find_message(messages: list[dict[str, Any]], role: str) -> dict[str, Any]:
 class TestInjectedMaxIterations:
     @pytest.mark.asyncio
     async def test_injected_value_is_used(self):
-        # 生产路径: main.build_agent 把 config.max_iterations 传进来
+        # 生产路径: bootstrap.build_application 把 config.max_iterations 传进来
         provider = ScriptedProvider(default=tool_response(make_call()))
         loop = make_loop(provider, max_iterations=7)
 

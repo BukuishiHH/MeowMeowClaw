@@ -77,7 +77,7 @@ SAFE_SAMPLES = [
     "pwd",
     "git status",
     "pytest -q",
-    "python -m meowmeowclaw.main",
+    "python -m meowmeowclaw",
     "echo hello world",
     "cat README.md",
     "npm run build",

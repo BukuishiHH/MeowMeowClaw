@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-meowmeowclaw = "meowmeowclaw.main:main"
+meowmeowclaw = "meowmeowclaw.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["meowmeowclaw*"]

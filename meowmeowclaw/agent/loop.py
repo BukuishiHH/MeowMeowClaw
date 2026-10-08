@@ -72,7 +72,7 @@ class AgentLoop:
         self.tools = tools
         self.context = context
         self.model = model
-        # 未显式注入时使用模块兜底值; 生产路径由 main.build_agent 传入配置值
+        # 未显式注入时使用模块兜底值; 生产路径由 bootstrap.build_application 传入配置值
         self.max_iterations = (
             DEFAULT_MAX_ITERATIONS if max_iterations is None else max_iterations
         )

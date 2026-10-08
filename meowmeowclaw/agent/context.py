@@ -56,7 +56,7 @@ class ContextBuilder:
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.identity_path = Path(identity_path).expanduser().resolve()
-        # 技能摘要由调用方(如 main.build_agent)注入, ContextBuilder 不关心技能从哪来
+        # 技能摘要由调用方(如 bootstrap.build_application)注入, ContextBuilder 不关心技能从哪来
         self.skills_summary = skills_summary
 
     def __repr__(self) -> str:

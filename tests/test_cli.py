@@ -1,11 +1,9 @@
 """meowmeowclaw/cli.py 的 Mock 单元测试.
 
-测试策略:
-- ``interactive_loop`` 用 make_stub_application: 真实 AgentLoop + 替身 Provider,
-  input() 由 conftest 的 feed_input fixture 脚本化(取尽抛 EOFError, 防止死循环);
-- ``main`` 用 monkeypatch 顶掉 build_application / asyncio.run, 只验证启动流程、
-  退出码与用户可见输出;
-- 装配本身(工具/技能/Provider)见 test_bootstrap.py, 这里不重复测.
+- ``interactive_loop``: 真实 Application(JsonlSessionStore + ConversationService + 替身 Provider),
+  input() 由 conftest 的 feed_input fixture 脚本化;
+- 覆盖 /new、/clear [id] [--purge]、/sessions、/help、/tools、/skills 与失败兜底;
+- ``main``: monkeypatch build_application / asyncio.run, 验证启动输出与退出码。
 """
 
 from pathlib import Path
@@ -19,31 +17,52 @@ from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.bootstrap import Application, ConfigError
 from meowmeowclaw.config import Settings
-from meowmeowclaw.llm.base import FINISH_REASON_STOP, LLMProvider, LLMResponse
+from meowmeowclaw.conversation import ConversationService
+from meowmeowclaw.llm.base import (
+    FINISH_REASON_ERROR,
+    FINISH_REASON_STOP,
+    LLMProvider,
+    LLMResponse,
+)
+from meowmeowclaw.memory import (
+    JsonlSessionStore,
+    MemoryStoreError,
+    SessionKey,
+    SessionStoreError,
+)
 from meowmeowclaw.skills import Skill, SkillConfigError
 from meowmeowclaw.tools.filesystem import ReadFileTool
 from meowmeowclaw.tools.registry import ToolRegistry
 
+
 # --------------------------------------------------------------------- 测试替身
 
 
-class StubProvider(LLMProvider):
-    """最小真实 Provider: 记录 messages 快照, 可注入异常."""
+class ScriptedProvider(LLMProvider):
+    """按脚本返回回答; 可注入错误模拟 Provider 层失败."""
 
-    def __init__(self, answer: str = "模型回答", error: Optional[BaseException] = None) -> None:
-        self.answer = answer
+    def __init__(
+        self,
+        answers: Optional[list[str]] = None,
+        *,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        self._answers = list(answers or [])
         self.error = error
         self.calls: list[list[dict]] = []
 
     async def chat(self, messages, tools=None, model=None) -> LLMResponse:
-        self.calls.append(messages)
+        self.calls.append([dict(message) for message in messages])
         if self.error is not None:
-            raise self.error
-        return LLMResponse(content=self.answer, finish_reason=FINISH_REASON_STOP)
+            return LLMResponse(
+                content=f"[LLM调用失败] {self.error}", finish_reason=FINISH_REASON_ERROR
+            )
+        answer = self._answers.pop(0) if self._answers else "默认回答"
+        return LLMResponse(content=answer, finish_reason=FINISH_REASON_STOP)
 
 
 class FakeCatalog:
-    """轻量技能索引替身: 只实现 cli 用到的接口, 避免测试依赖真实内置资源."""
+    """轻量技能索引替身: 只实现 cli 用到的接口."""
 
     def __init__(self, skills=(), root: str = "/tmp/fake-skills") -> None:
         self._skills = list(skills)
@@ -62,6 +81,23 @@ class FakeCatalog:
         return "- exec (exec/SKILL.md): 执行命令\n" if self._skills else ""
 
 
+class RecordingStore:
+    """可注入 append 失败的 store 替身, 用于验证 fail-soft 提示."""
+
+    def __init__(self, *, append_error: Optional[BaseException] = None) -> None:
+        self.append_error = append_error
+        self.appended: list = []
+
+    async def load_recent(self, key, *, max_turns=None, max_chars=None):
+        return []
+
+    async def append_turn(self, key, messages, *, turn_id=None, meta=None):
+        if self.append_error is not None:
+            raise self.append_error
+        self.appended.append(list(messages))
+        return None  # type: ignore[return-value]
+
+
 def default_catalog() -> FakeCatalog:
     return FakeCatalog(
         [
@@ -76,26 +112,32 @@ def default_catalog() -> FakeCatalog:
     )
 
 
-def make_stub_application(
-    answer: str = "模型回答",
-    error: Optional[BaseException] = None,
-    catalog: Optional[FakeCatalog] = None,
+def cli_session(conversation_id: str = "sess-1") -> SessionKey:
+    return SessionKey(channel="cli", scope="session", conversation_id=conversation_id)
+
+
+def make_application(
+    tmp_path,
+    provider: LLMProvider,
+    *,
+    catalog=None,
+    store=None,
     config: Optional[Settings] = None,
 ) -> Application:
-    """真实 AgentLoop(含真实 ToolRegistry) + 替身 Provider / Context, 离线可跑."""
+    """真实 Application: JSONL store + ConversationService + 真实 AgentLoop(替身 Provider)."""
     config = config or Settings(
         model="test-model",
         api_key="sk-test-key",
         base_url="http://localhost:8000/v1",
         workspace=Path("/tmp/fake-workspace"),
         max_iterations=3,
+        memory_dir=tmp_path / "memory",
+        memory_max_turns=20,
+        memory_max_chars=50_000,
         source="/tmp/fake.env",
     )
-    provider = StubProvider(answer, error)
     registry = ToolRegistry()
     registry.register(ReadFileTool("/tmp"))
-
-    # 忠实模仿真实 ContextBuilder 的拼装规则(system + 历史 + 当前消息)
     context = MagicMock(spec=ContextBuilder)
     context.build_messages.side_effect = lambda history=None, current_message="": (
         [{"role": "system", "content": "SYS"}]
@@ -103,12 +145,21 @@ def make_stub_application(
         + ([{"role": "user", "content": current_message}] if current_message else [])
     )
 
-    agent = AgentLoop(
-        provider=provider,
-        tools=registry,
-        context=context,
-        model=config.model,
-        max_iterations=config.max_iterations,
+    def agent_factory(session_key: SessionKey) -> AgentLoop:
+        return AgentLoop(
+            provider=provider,
+            tools=registry,
+            context=context,
+            model=config.model,
+            max_iterations=config.max_iterations,
+        )
+
+    store = store or JsonlSessionStore(config.memory_dir)
+    conversation = ConversationService(
+        store,
+        agent_factory,
+        max_turns=config.memory_max_turns,
+        max_chars=config.memory_max_chars,
     )
     return Application(
         config=config,
@@ -116,7 +167,8 @@ def make_stub_application(
         registry=registry,
         catalog=catalog if catalog is not None else default_catalog(),
         context=context,
-        agent=agent,
+        session_store=store,
+        conversation=conversation,
     )
 
 
@@ -125,119 +177,214 @@ def make_stub_application(
 
 class TestInteractiveLoop:
     @pytest.mark.asyncio
-    async def test_prints_model_answer(self, feed_input, capsys):
-        app = make_stub_application("你好, 我是 MeowMeowClaw")
+    async def test_prints_model_answer_and_persists(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(["你好, 我是 MeowMeowClaw"])
+        app = make_application(tmp_path, provider)
+        key = cli_session()
         feed_input("hi", "/exit")
 
-        await cli_module.interactive_loop(app)
+        await cli_module.interactive_loop(app, key)
 
         out = capsys.readouterr().out
         assert "你好, 我是 MeowMeowClaw" in out
-        assert len(app.provider.calls) == 1
+        assert len(provider.calls) == 1
+        meta = await app.session_store.get_meta(key)
+        assert meta is not None
+        assert meta.turn_count == 1
 
     @pytest.mark.asyncio
-    async def test_exit_command_returns_without_calling_model(self, feed_input, capsys):
-        app = make_stub_application()
+    async def test_exit_command_returns_without_calling_model(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider()
+        app = make_application(tmp_path, provider)
         consumed = feed_input("/exit", "这一行不该被读取")
 
-        await cli_module.interactive_loop(app)
+        await cli_module.interactive_loop(app, cli_session())
 
-        assert consumed == ["/exit"]  # 立即退出, 不再消费后续输入
+        assert consumed == ["/exit"]
         assert "再见" in capsys.readouterr().out
-        assert app.provider.calls == []
+        assert provider.calls == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("command", ["/quit", "/Q", "/EXIT"])
-    async def test_exit_command_aliases_and_case(self, command, feed_input):
-        app = make_stub_application()
+    async def test_exit_command_aliases_and_case(self, command, tmp_path, feed_input):
+        provider = ScriptedProvider()
+        app = make_application(tmp_path, provider)
         consumed = feed_input(command, "/exit")
 
-        await cli_module.interactive_loop(app)
+        await cli_module.interactive_loop(app, cli_session())
 
-        assert consumed == [command]  # 别名同样立即退出
-        assert app.provider.calls == []
+        assert consumed == [command]
+        assert provider.calls == []
 
     @pytest.mark.asyncio
-    async def test_blank_input_is_skipped(self, feed_input):
-        app = make_stub_application()
+    async def test_blank_input_is_skipped(self, tmp_path, feed_input):
+        provider = ScriptedProvider()
+        app = make_application(tmp_path, provider)
         feed_input("", "   ", "/exit")
 
-        await cli_module.interactive_loop(app)
+        await cli_module.interactive_loop(app, cli_session())
 
-        assert app.provider.calls == []
-
-    @pytest.mark.asyncio
-    async def test_clear_command_empties_history(self, feed_input, capsys):
-        app = make_stub_application()
-        feed_input("第一问", "/clear", "/exit")
-
-        await cli_module.interactive_loop(app)
-
-        assert app.agent._session_history == []
-        assert "已清空对话历史与工具调用记录" in capsys.readouterr().out
+        assert provider.calls == []
 
     @pytest.mark.asyncio
-    async def test_tools_command_prints_registry(self, feed_input, capsys):
-        app = make_stub_application()
-        feed_input("/tools", "/exit")
+    async def test_help_and_unknown_command(self, tmp_path, feed_input, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
+        feed_input("/help", "/nope", "/exit")
 
-        await cli_module.interactive_loop(app)
+        await cli_module.interactive_loop(app, cli_session())
+
+        out = capsys.readouterr().out
+        assert "/new" in out and "/sessions" in out
+        assert "未知命令或参数: /nope" in out
+
+    @pytest.mark.asyncio
+    async def test_tools_and_skills_commands(self, tmp_path, feed_input, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
+        feed_input("/tools", "/skills", "/exit")
+
+        await cli_module.interactive_loop(app, cli_session())
 
         out = capsys.readouterr().out
         assert "已注册工具(1 个)" in out
         assert "read_file" in out
-
-    @pytest.mark.asyncio
-    async def test_skills_command_prints_catalog(self, feed_input, capsys):
-        app = make_stub_application()
-        feed_input("/skills", "/exit")
-
-        await cli_module.interactive_loop(app)
-
-        out = capsys.readouterr().out
         assert "已发现技能(1 个)" in out
         assert "exec (exec/SKILL.md): 执行命令" in out
 
     @pytest.mark.asyncio
-    async def test_unknown_command_prints_hint(self, feed_input, capsys):
-        app = make_stub_application()
-        feed_input("/nope", "/exit")
+    async def test_new_command_switches_session(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(["答1", "答2"])
+        app = make_application(tmp_path, provider)
+        first = cli_session("first")
+        feed_input("hi", "/new", "hi", "/exit")
 
-        await cli_module.interactive_loop(app)
+        await cli_module.interactive_loop(app, first)
 
         out = capsys.readouterr().out
-        assert "未知命令: /nope" in out
-        assert "/skills" in out
+        assert "已开始新会话" in out
+        summaries = await app.conversation.list_sessions()
+        assert len(summaries) == 2  # /new 之前的会话保留(sessions/), 新会话继续
+        assert all(summary.archived is False for summary in summaries)
+        assert {summary.turn_count for summary in summaries} == {1}
+        assert {summary.session_key for summary in summaries} >= {first}
+        assert any(summary.session_key != first for summary in summaries)
 
     @pytest.mark.asyncio
-    async def test_model_exception_is_reported_and_session_continues(self, feed_input, capsys):
-        app = make_stub_application(error=RuntimeError("boom"))
+    async def test_clear_archives_current_and_rotates(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(["答1", "答2"])
+        app = make_application(tmp_path, provider)
+        first = cli_session("first")
+        feed_input("hi", "/clear", "hi", "/exit")
+
+        await cli_module.interactive_loop(app, first)
+
+        out = capsys.readouterr().out
+        assert "已归档会话" in out
+        assert "已开始新会话" in out
+
+        archived = await app.session_store.get_meta(first)
+        assert archived is not None
+        assert archived.archived is True
+
+        summaries = await app.conversation.list_sessions()
+        assert len(summaries) == 2  # 归档的旧会话 + 新会话
+        assert {summary.archived for summary in summaries} == {True, False}
+
+    @pytest.mark.asyncio
+    async def test_clear_specific_session_by_short_id(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(["答A", "答B", "答C"])
+        app = make_application(tmp_path, provider)
+        target = cli_session("target")
+        current = cli_session("current")
+        # 预先落盘两个会话(provider 消费答A/答B)
+        await app.conversation.handle_message(target, "message-a")
+        await app.conversation.handle_message(current, "message-b")
+
+        feed_input(f"/clear {target.storage_id[:8]}", "/exit")
+
+        await cli_module.interactive_loop(app, current)
+
+        assert "已归档会话" in capsys.readouterr().out
+        target_meta = await app.session_store.get_meta(target)
+        assert target_meta is not None
+        assert target_meta.archived is True
+        current_meta = await app.session_store.get_meta(current)
+        assert current_meta is not None
+        assert current_meta.archived is False
+
+    @pytest.mark.asyncio
+    async def test_clear_purge_specific_session(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(["答A", "答B"])
+        app = make_application(tmp_path, provider)
+        target = cli_session("target")
+        current = cli_session("current")
+        await app.conversation.handle_message(target, "message-a")
+        await app.conversation.handle_message(current, "message-b")
+
+        feed_input(f"/clear {target.storage_id[:8]} --purge", "/exit")
+
+        await cli_module.interactive_loop(app, current)
+
+        assert "已永久删除会话" in capsys.readouterr().out
+        assert await app.session_store.get_meta(target) is None
+
+    @pytest.mark.asyncio
+    async def test_sessions_command_lists_sessions(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(["答A"])
+        app = make_application(tmp_path, provider)
+        key = cli_session("visible")
+        await app.conversation.handle_message(key, "message-a")
+
+        feed_input("/sessions", "/exit")
+
+        await cli_module.interactive_loop(app, key)
+
+        out = capsys.readouterr().out
+        assert key.storage_id[:8] in out
+        assert "active" in out
+        assert "*" in out  # 当前会话标记
+
+    @pytest.mark.asyncio
+    async def test_model_error_is_reported_and_not_persisted(self, tmp_path, feed_input, capsys):
+        provider = ScriptedProvider(error=RuntimeError("boom"))
+        app = make_application(tmp_path, provider)
+        key = cli_session()
         consumed = feed_input("hi", "/exit")
 
-        await cli_module.interactive_loop(app)  # 不抛异常
+        await cli_module.interactive_loop(app, key)
 
         assert consumed == ["hi", "/exit"]
-        assert "[异常] 本轮处理失败" in capsys.readouterr().out
+        assert "[LLM调用失败]" in capsys.readouterr().out
+        assert await app.session_store.get_meta(key) is None
 
     @pytest.mark.asyncio
-    async def test_keyboard_interrupt_at_prompt_is_graceful(self, monkeypatch, capsys):
-        app = make_stub_application()
+    async def test_persist_failure_prints_hint(self, tmp_path, feed_input, capsys):
+        store = RecordingStore(append_error=SessionStoreError("disk full"))
+        app = make_application(tmp_path, ScriptedProvider(["答1"]), store=store)
+        feed_input("hi", "/exit")
+
+        await cli_module.interactive_loop(app, cli_session())
+
+        assert "[提示] 本轮回答未能写入记忆" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_keyboard_interrupt_at_prompt_is_graceful(self, tmp_path, monkeypatch, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
 
         def raise_interrupt(prompt: str = "") -> str:
             raise KeyboardInterrupt
 
         monkeypatch.setattr("builtins.input", raise_interrupt)
 
-        await cli_module.interactive_loop(app)  # 不抛异常
+        await cli_module.interactive_loop(app, cli_session())
 
         assert "已按下 Ctrl+C" in capsys.readouterr().out
 
     @pytest.mark.asyncio
-    async def test_eof_at_prompt_is_graceful(self, feed_input, capsys):
-        app = make_stub_application()
-        feed_input()  # 第一行就取尽 -> EOFError
+    async def test_eof_at_prompt_is_graceful(self, tmp_path, feed_input, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
+        feed_input()
 
-        await cli_module.interactive_loop(app)  # 不抛异常
+        await cli_module.interactive_loop(app, cli_session())
 
         assert "输入已结束" in capsys.readouterr().out
 
@@ -246,25 +393,30 @@ class TestInteractiveLoop:
 
 
 class TestMain:
-    def test_prints_banner_and_starts_loop(self, monkeypatch, capsys):
-        app = make_stub_application()
-        coroutines = []
+    def _patch_loop(self, monkeypatch, app: Application) -> list:
+        coroutines: list = []
 
         def fake_run(coro):
             coroutines.append(coro)
-            coro.close()  # 不真正进入交互循环
+            coro.close()
             return None
 
         monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=app))
         monkeypatch.setattr(cli_module.asyncio, "run", fake_run)
+        return coroutines
+
+    def test_prints_banner_and_starts_loop(self, tmp_path, monkeypatch, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
+        coroutines = self._patch_loop(monkeypatch, app)
 
         code = cli_module.main()
 
         out = capsys.readouterr().out
         assert code == 0
-        assert cli_module.APP_NAME in out          # banner
+        assert cli_module.APP_NAME in out
         assert "发现 1 个技能: /tmp/fake-skills" in out
         assert "已注册工具(1 个)" in out
+        assert "会话      : v1:cli:session:" in out
         assert len(coroutines) == 1
 
     def test_missing_api_key_returns_code_1(self, monkeypatch, capsys):
@@ -294,23 +446,32 @@ class TestMain:
         out = capsys.readouterr().out
         assert code == 1
         assert "技能配置错误" in out
-        assert "技能名重复" in out
 
-    def test_missing_identity_prints_warning(self, monkeypatch, capsys, tmp_path):
-        app = make_stub_application()
+    def test_memory_store_error_returns_code_1(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_module,
+            "build_application",
+            MagicMock(side_effect=MemoryStoreError("disk full")),
+        )
+
+        code = cli_module.main()
+
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "记忆存储初始化失败" in out
+
+    def test_missing_identity_prints_warning(self, tmp_path, monkeypatch, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
         monkeypatch.setattr(cli_module, "IDENTITY_FILE", tmp_path / "missing-identity.md")
-        monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=app))
-        monkeypatch.setattr(cli_module.asyncio, "run", lambda coro: coro.close())
+        self._patch_loop(monkeypatch, app)
 
         cli_module.main()
 
-        out = capsys.readouterr().out
-        assert "[启动警告] 未找到人设文件" in out
+        assert "[启动警告] 未找到人设文件" in capsys.readouterr().out
 
-    def test_empty_catalog_prints_warning(self, monkeypatch, capsys):
-        app = make_stub_application(catalog=FakeCatalog([]))
-        monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=app))
-        monkeypatch.setattr(cli_module.asyncio, "run", lambda coro: coro.close())
+    def test_empty_catalog_prints_warning(self, tmp_path, monkeypatch, capsys):
+        app = make_application(tmp_path, ScriptedProvider(), catalog=FakeCatalog([]))
+        self._patch_loop(monkeypatch, app)
 
         cli_module.main()
 
@@ -318,33 +479,34 @@ class TestMain:
         assert "[启动警告] 未发现内置技能" in out
         assert "发现 0 个技能" not in out
 
-    def test_keyboard_interrupt_is_graceful(self, monkeypatch, capsys):
-        def raise_interrupt(coro):
-            coro.close()
-            raise KeyboardInterrupt
-
-        monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=make_stub_application()))
-        monkeypatch.setattr(cli_module.asyncio, "run", raise_interrupt)
-
-        code = cli_module.main()  # 不抛异常
-
-        assert code == 0
-        assert "已中断" in capsys.readouterr().out
-
-    def test_startup_output_does_not_leak_api_key(self, monkeypatch, capsys):
-        app = make_stub_application(
-            config=Settings(
-                model="test-model",
-                api_key="sk-super-secret",
-                base_url="http://localhost:8000/v1",
-                workspace=Path("/tmp/fake-workspace"),
-                max_iterations=3,
-                source="/tmp/fake.env",
-            )
+    def test_startup_output_does_not_leak_api_key(self, tmp_path, monkeypatch, capsys):
+        config = Settings(
+            model="test-model",
+            api_key="sk-super-secret",
+            base_url="http://localhost:8000/v1",
+            workspace=Path("/tmp/fake-workspace"),
+            max_iterations=3,
+            memory_dir=tmp_path / "memory",
+            source="/tmp/fake.env",
         )
-        monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=app))
-        monkeypatch.setattr(cli_module.asyncio, "run", lambda coro: coro.close())
+        app = make_application(tmp_path, ScriptedProvider(), config=config)
+        self._patch_loop(monkeypatch, app)
 
         cli_module.main()
 
         assert "sk-super-secret" not in capsys.readouterr().out
+
+    def test_keyboard_interrupt_is_graceful(self, tmp_path, monkeypatch, capsys):
+        app = make_application(tmp_path, ScriptedProvider())
+
+        def raise_interrupt(coro):
+            coro.close()
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=app))
+        monkeypatch.setattr(cli_module.asyncio, "run", raise_interrupt)
+
+        code = cli_module.main()
+
+        assert code == 0
+        assert "已中断" in capsys.readouterr().out

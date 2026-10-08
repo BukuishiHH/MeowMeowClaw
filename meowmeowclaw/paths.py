@@ -38,3 +38,19 @@ def resolve_workspace(value: Optional[str]) -> Path:
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return Path(os.path.normpath(str(path)))
+
+
+def resolve_memory_dir(value: Optional[str], workspace: Path) -> Path:
+    """
+    解析 ``memory_dir`` 配置取值:
+
+    - 未设置 / 空白 / ``.`` / ``./`` -> ``<workspace>/memory``(随 workspace 迁移)
+    - 绝对路径(支持 ``~``)             -> 原样使用
+    - 相对路径                        -> 基于项目根解析(与 workspace 配置同一约定)
+    """
+    if value is None or value.strip() in (".", "./", ""):
+        return Path(workspace) / "memory"
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return Path(os.path.normpath(str(path)))

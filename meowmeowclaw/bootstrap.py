@@ -15,8 +15,10 @@ from typing import Optional, Union
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.config import Settings, load_config
+from meowmeowclaw.conversation import ConversationService
 from meowmeowclaw.llm.base import LLMProvider
 from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
+from meowmeowclaw.memory import JsonlSessionStore, SessionKey
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.skills import LoadSkillTool, SkillCatalog
 from meowmeowclaw.tools.registry import ToolRegistry
@@ -37,7 +39,13 @@ class Application:
     registry: ToolRegistry
     catalog: SkillCatalog
     context: ContextBuilder
-    agent: AgentLoop
+    session_store: JsonlSessionStore
+    conversation: ConversationService
+
+    async def close(self) -> None:
+        """释放会话缓存与存储资源(交付层退出时调用)."""
+        await self.conversation.close()
+        await self.session_store.close()
 
 
 def build_registry(config: Settings) -> ToolRegistry:
@@ -104,12 +112,23 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
     context = ContextBuilder(
         config.workspace, IDENTITY_FILE, skills_summary=skills_summary
     )
-    agent = AgentLoop(
-        provider=provider,
-        tools=registry,
-        context=context,
-        model=config.model,
-        max_iterations=config.max_iterations,
+
+    # 每个会话一个 AgentLoop: 工具调用护栏按会话隔离; 共享同一 Provider/Registry/Context
+    def agent_factory(session_key: SessionKey) -> AgentLoop:
+        return AgentLoop(
+            provider=provider,
+            tools=registry,
+            context=context,
+            model=config.model,
+            max_iterations=config.max_iterations,
+        )
+
+    session_store = JsonlSessionStore(config.memory_dir)
+    conversation = ConversationService(
+        session_store,
+        agent_factory,
+        max_turns=config.memory_max_turns,
+        max_chars=config.memory_max_chars,
     )
 
     return Application(
@@ -118,5 +137,6 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         registry=registry,
         catalog=catalog,
         context=context,
-        agent=agent,
+        session_store=session_store,
+        conversation=conversation,
     )

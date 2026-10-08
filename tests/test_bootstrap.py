@@ -17,7 +17,6 @@ import pytest
 
 import meowmeowclaw.bootstrap as bootstrap_module
 from meowmeowclaw.agent.context import ContextBuilder
-from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.bootstrap import Application, ConfigError, build_application
 from meowmeowclaw.config import Settings
 from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
@@ -48,6 +47,10 @@ def make_settings(**overrides) -> Settings:
     }
     params.update(overrides)
     params["workspace"] = Path(params["workspace"])
+    # 默认把记忆目录放到 tmp workspace 下, 避免污染仓库
+    params["memory_dir"] = Path(params.get("memory_dir") or (params["workspace"] / "memory"))
+    params.setdefault("memory_max_turns", 20)
+    params.setdefault("memory_max_chars", 50_000)
     return Settings(**params)
 
 
@@ -155,11 +158,12 @@ class TestBuildApplication:
         assert app.context.workspace == tmp_path.resolve()
         assert app.context.identity_path == IDENTITY_FILE
         assert "- exec (exec/SKILL.md): " in app.context.skills_summary
-        assert isinstance(app.agent, AgentLoop)
-        assert app.agent.model == config.model
-        assert app.agent.max_iterations == config.max_iterations
-        assert app.agent.tools is app.registry
-        assert app.agent.context is app.context
+        # 记忆系统: JSONL store + ConversationService 已装配
+        assert app.session_store.root == config.memory_dir
+        assert app.session_store.sessions_dir.is_dir()
+        assert app.conversation.store is app.session_store
+        assert app.conversation.max_turns == config.memory_max_turns
+        assert app.conversation.max_chars == config.memory_max_chars
 
     def test_load_config_is_called_once(self, monkeypatch):
         loader = MagicMock(return_value=make_settings())
@@ -178,6 +182,7 @@ class TestBuildApplication:
         build_application()
 
         assert target.is_dir()
+        assert (target / "memory" / "sessions").is_dir()
 
     def test_skill_config_error_propagates(self, monkeypatch):
         monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: make_settings())

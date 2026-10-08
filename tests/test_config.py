@@ -18,6 +18,8 @@ import pytest
 from meowmeowclaw.config import (
     DEFAULT_BASE_URL,
     DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MEMORY_MAX_CHARS,
+    DEFAULT_MEMORY_MAX_TURNS,
     DEFAULT_MODEL,
     Settings,
     load_config,
@@ -29,6 +31,7 @@ from meowmeowclaw.paths import (
     ENV_FILE,
     IDENTITY_FILE,
     PROJECT_ROOT,
+    resolve_memory_dir,
     resolve_workspace,
 )
 
@@ -46,6 +49,13 @@ ENV_KEYS = (
     "MAX_ITERATIONS",
     "IDENTITY_FILE",
     "PERSONA_FILE",
+    "MEMORY_DIR",
+    "MEMORY_PATH",
+    "SESSION_DIR",
+    "MEMORY_MAX_TURNS",
+    "HISTORY_MAX_TURNS",
+    "MEMORY_MAX_CHARS",
+    "HISTORY_MAX_CHARS",
 )
 
 
@@ -231,6 +241,60 @@ class TestWorkspaceResolution:
         assert ENV_FILE == PROJECT_ROOT / ".env"
 
 
+# ------------------------------------------------------------ 记忆配置
+
+
+class TestMemorySettings:
+    def test_default_memory_dir_is_workspace_memory(self, tmp_path):
+        env = write_env(tmp_path, f"workspace={tmp_path / 'ws'}\n")
+
+        s = load_settings(env)
+
+        assert s.memory_dir == (tmp_path / "ws" / "memory")
+
+    def test_absolute_memory_dir_is_kept(self, tmp_path):
+        target = tmp_path / "custom-memory"
+        env = write_env(tmp_path, f"memory_dir={target}\n")
+
+        assert load_settings(env).memory_dir == target
+
+    def test_relative_memory_dir_resolves_against_project_root(self, tmp_path):
+        env = write_env(tmp_path, "memory_dir=custom-memory\n")
+
+        assert load_settings(env).memory_dir == PROJECT_ROOT / "custom-memory"
+
+    def test_memory_window_defaults(self, tmp_path):
+        env = write_env(tmp_path, "model=m\n")
+
+        s = load_settings(env)
+
+        assert s.memory_max_turns == DEFAULT_MEMORY_MAX_TURNS
+        assert s.memory_max_chars == DEFAULT_MEMORY_MAX_CHARS
+
+    def test_memory_window_values(self, tmp_path):
+        env = write_env(tmp_path, "memory_max_turns=5\nmemory_max_chars=1234\n")
+
+        s = load_settings(env)
+
+        assert s.memory_max_turns == 5
+        assert s.memory_max_chars == 1234
+
+    @pytest.mark.parametrize("raw", ["abc", "0", "-1", "3.5"])
+    def test_invalid_memory_window_falls_back(self, tmp_path, caplog, raw):
+        env = write_env(tmp_path, f"memory_max_turns={raw}\nmemory_max_chars={raw}\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.memory_max_turns == DEFAULT_MEMORY_MAX_TURNS
+        assert s.memory_max_chars == DEFAULT_MEMORY_MAX_CHARS
+        assert any("memory_max" in record.message for record in caplog.records)
+
+    def test_resolve_memory_dir_helper(self, tmp_path):
+        assert resolve_memory_dir(None, tmp_path) == tmp_path / "memory"
+        assert resolve_memory_dir("~", tmp_path) == Path("~").expanduser()
+
+
 # ------------------------------------------------------------ max_iterations
 
 
@@ -301,6 +365,9 @@ class TestSettingsObject:
         assert s.base_url == DEFAULT_BASE_URL
         assert s.workspace == DEFAULT_WORKSPACE
         assert s.max_iterations == DEFAULT_MAX_ITERATIONS
+        assert s.memory_dir == DEFAULT_WORKSPACE / "memory"
+        assert s.memory_max_turns == DEFAULT_MEMORY_MAX_TURNS
+        assert s.memory_max_chars == DEFAULT_MEMORY_MAX_CHARS
         assert s.has_api_key is False
 
     def test_repr_masks_api_key(self):

@@ -20,7 +20,13 @@ from typing import Optional, Union
 
 from dotenv import dotenv_values
 
-from meowmeowclaw.paths import DEFAULT_WORKSPACE, ENV_FILE, IDENTITY_FILE, resolve_workspace
+from meowmeowclaw.paths import (
+    DEFAULT_WORKSPACE,
+    ENV_FILE,
+    IDENTITY_FILE,
+    resolve_memory_dir,
+    resolve_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +34,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MAX_ITERATIONS = 32
+DEFAULT_MEMORY_MAX_TURNS = 20
+DEFAULT_MEMORY_MAX_CHARS = 50_000
 
 # 键别名映射
 _KEY_ALIASES: dict[str, tuple[str, ...]] = {
@@ -36,6 +44,9 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "base_url": ("base_url", "openai_base_url", "llm_base_url", "api_base"),
     "workspace": ("workspace", "workspace_dir", "work_dir"),
     "max_iterations": ("max_iterations", "agent_max_iterations"),
+    "memory_dir": ("memory_dir", "memory_path", "session_dir"),
+    "memory_max_turns": ("memory_max_turns", "history_max_turns"),
+    "memory_max_chars": ("memory_max_chars", "history_max_chars"),
 }
 
 # 已废弃配置键: 人设已固定为 <项目根>/identity.md, 出现时警告并忽略
@@ -84,6 +95,21 @@ def _resolve_max_iterations(value: Optional[str]) -> int:
         return DEFAULT_MAX_ITERATIONS
 
 
+def _resolve_positive_int(value: Optional[str], default: int, name: str) -> int:
+    """解析正整数值(记忆窗口等), 非法/<=0 回退默认值."""
+    if value is None:
+        return default
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("%s 不是整数(%r), 回退默认值 %d", name, value, default)
+        return default
+    if num <= 0:
+        logger.warning("%s 必须为正整数(%r), 回退默认值 %d", name, value, default)
+        return default
+    return num
+
+
 def _warn_deprecated_identity_keys(raw: dict[str, str]) -> None:
     """检测已废弃的人设配置键: 警告并忽略(人设固定为项目根 identity.md)."""
     present = [key for key in DEPRECATED_IDENTITY_KEYS if key in raw]
@@ -102,6 +128,9 @@ class Settings:
     base_url: str = DEFAULT_BASE_URL
     workspace: Path = DEFAULT_WORKSPACE
     max_iterations: int = DEFAULT_MAX_ITERATIONS
+    memory_dir: Path = DEFAULT_WORKSPACE / "memory"
+    memory_max_turns: int = DEFAULT_MEMORY_MAX_TURNS
+    memory_max_chars: int = DEFAULT_MEMORY_MAX_CHARS
     source: str = str(ENV_FILE)
 
     def __repr__(self) -> str:
@@ -109,6 +138,8 @@ class Settings:
         return (
             f"Settings(model={self.model!r}, base_url={self.base_url!r}, "
             f"workspace={str(self.workspace)!r}, max_iterations={self.max_iterations}, "
+            f"memory_dir={str(self.memory_dir)!r}, memory_max_turns={self.memory_max_turns}, "
+            f"memory_max_chars={self.memory_max_chars}, "
             f"api_key={masked_key}, source={self.source!r})"
         )
 
@@ -123,12 +154,24 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
     raw = _merge_sources(read_env_file(path))
     _warn_deprecated_identity_keys(raw)
 
+    workspace = resolve_workspace(_get(raw, *_KEY_ALIASES["workspace"]))
     settings = Settings(
         model=_get(raw, *_KEY_ALIASES["model"]) or DEFAULT_MODEL,
         api_key=_get(raw, *_KEY_ALIASES["api_key"]) or "",
         base_url=_get(raw, *_KEY_ALIASES["base_url"]) or DEFAULT_BASE_URL,
-        workspace=resolve_workspace(_get(raw, *_KEY_ALIASES["workspace"])),
+        workspace=workspace,
         max_iterations=_resolve_max_iterations(_get(raw, *_KEY_ALIASES["max_iterations"])),
+        memory_dir=resolve_memory_dir(_get(raw, *_KEY_ALIASES["memory_dir"]), workspace),
+        memory_max_turns=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["memory_max_turns"]),
+            DEFAULT_MEMORY_MAX_TURNS,
+            "memory_max_turns",
+        ),
+        memory_max_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["memory_max_chars"]),
+            DEFAULT_MEMORY_MAX_CHARS,
+            "memory_max_chars",
+        ),
         source=str(path),
     )
 

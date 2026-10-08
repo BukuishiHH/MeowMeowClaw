@@ -349,6 +349,59 @@ class TestBuildSystemPrompt:
         assert b.workspace in prompt         # 工作区路径
 
 
+# ------------------------------------------------------ 技能摘要章节(skills_summary)
+
+
+class TestSkillsSummarySection:
+    def test_default_is_empty(self, workspace):
+        assert ContextBuilder(workspace).skills_summary == ""
+
+    def test_no_section_when_summary_empty(self, workspace):
+        prompt = ContextBuilder(workspace).build_system_prompt()
+
+        assert "## 可用技能" not in prompt
+
+    def test_summary_is_appended_at_the_end(self, workspace):
+        summary = (
+            "你有以下技能可用. 请先用 read_file 读取.\n\n"
+            "可用技能:\n- pdf (pdf/SKILL.md): 处理 PDF\n"
+        )
+
+        prompt = ContextBuilder(workspace, skills_summary=summary).build_system_prompt()
+
+        assert prompt.endswith("\n\n## 可用技能\n" + summary)
+        assert prompt.count("## 可用技能") == 1
+
+    def test_skills_section_comes_after_memory(self, workspace):
+        memory_dir = os.path.join(workspace, "memory")
+        os.makedirs(memory_dir, exist_ok=True)
+        with open(os.path.join(memory_dir, "MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("长期记忆内容")
+
+        prompt = ContextBuilder(workspace, skills_summary="技能摘要").build_system_prompt()
+
+        assert prompt.index("## 长期记忆") < prompt.index("## 可用技能")
+        assert "长期记忆内容" in prompt and "技能摘要" in prompt
+
+    def test_explicit_empty_string_adds_nothing(self, workspace):
+        assert "## 可用技能" not in ContextBuilder(workspace, skills_summary="").build_system_prompt()
+
+    def test_positional_argument_compatibility(self, workspace):
+        # 老写法(位置参数)仍然可用: 第三个位置现在放技能摘要
+        builder = ContextBuilder(workspace, "identity.md", "技能摘要")
+
+        assert builder.skills_summary == "技能摘要"
+        assert builder.identity_file == "identity.md"
+
+    def test_build_messages_includes_skills_in_system_prompt(self, workspace):
+        messages = ContextBuilder(workspace, skills_summary="技能摘要").build_messages(
+            current_message="hi"
+        )
+
+        assert messages[0]["role"] == "system"
+        assert "## 可用技能" in messages[0]["content"]
+
+
 # ---------------------------------------------------------------- build_messages
 
 

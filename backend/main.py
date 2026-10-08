@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -23,7 +24,9 @@ if __package__ in (None, ""):  # pragma: no cover - 仅直接运行脚本时进�
 
 from backend.agent.context import ContextBuilder  # noqa: E402
 from backend.agent.loop import AgentLoop  # noqa: E402
+from backend.agent.skills import SkillsLoader  # noqa: E402
 from backend.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool  # noqa: E402
+from backend.agent.tools.load_skill import LoadSkillTool  # noqa: E402
 from backend.agent.tools.shell import ExecTool
 from backend.agent.tools.web_search import WebSearchTool
 from backend.agent.tools.web_fetch import WebFetchTool
@@ -77,7 +80,18 @@ def build_agent() -> AgentLoop:
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
 
-    context = ContextBuilder(config.workspace, config.identity_file)
+    # 技能: 约定放在工作区下的 skills/ 目录, 每个子目录一个 SKILL.md
+    skills_dir = os.path.join(config.workspace, "skills")
+    skills_loader = SkillsLoader(skills_dir)
+    skills_summary = skills_loader.build_skills_summary()
+    if skills_summary:
+        print(f"发现 {len(skills_loader.list_skills())} 个技能: {skills_dir}")
+        # 有技能才注册 load_skill: 没技能时不该给模型一个必然失败的工具
+        tools.register(LoadSkillTool(skills_loader))
+
+    context = ContextBuilder(
+        config.workspace, config.identity_file, skills_summary=skills_summary
+    )
 
     agent = AgentLoop(
         provider=provider,

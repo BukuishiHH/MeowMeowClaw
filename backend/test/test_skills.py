@@ -22,12 +22,12 @@ from backend.agent.skills import (
     SKILLS_SUMMARY_HEADER,
     SkillsLoader,
 )
-from backend.config import PROJECT_ROOT
+from backend.config import PRESET_WORKSPACE, PROJECT_ROOT
 
 # 规格要求的摘要引导语(按项目"统一英文标点"约定落地)
 EXPECTED_HEADER = (
-    "你有以下技能可用. 当你需要使用某项技能时, "
-    "请先用 read_file 工具读取对应的 SKILL.md 文件获取详细指南.\n\n可用技能:\n"
+    "你有以下技能可用. 当某项技能与当前任务相关时, "
+    "请调用 load_skill 工具并传入技能名, 获取该技能的详细指南.\n\n可用技能:\n"
 )
 
 
@@ -392,3 +392,30 @@ class TestSkillsDirResolution:
 
     def test_dot_segments_are_normalized(self):
         assert SkillsLoader("a/../b").skills_dir == str(PROJECT_ROOT / "b")
+
+
+# ------------------------------------------------- 仓库自带技能内容(防误删/防写坏)
+
+
+class TestShippedSkills:
+    """workspace/skills 下自带"工具用法"技能, 这里保证它们始终可被发现且 frontmatter 合法."""
+
+    TOOL_SKILLS = ("exec", "list_dir", "read_file", "web_fetch", "web_search", "write_file")
+
+    def test_tool_skills_exist_and_are_parsable(self):
+        loader = SkillsLoader(os.path.join(str(PRESET_WORKSPACE), "skills"))
+
+        found = {record["name"]: record for record in loader.list_skills()}
+
+        missing = [name for name in self.TOOL_SKILLS if name not in found]
+        assert not missing, f"workspace/skills 缺少工具技能: {missing}"
+        for name in self.TOOL_SKILLS:
+            assert found[name]["description"] != DEFAULT_DESCRIPTION, f"{name} 缺少 description"
+            body = loader.load_skill(name)
+            assert body and body.startswith("# "), f"{name} 正文异常"
+
+    def test_summary_lists_all_tool_skills(self):
+        summary = SkillsLoader(os.path.join(str(PRESET_WORKSPACE), "skills")).build_skills_summary()
+
+        for name in self.TOOL_SKILLS:
+            assert f"- {name} ({name}/SKILL.md): " in summary

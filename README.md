@@ -2,8 +2,8 @@
 
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
-- **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 12 个源码模块 / 约 1900 行; 测试 12 个文件 / **536 个用例**(524 passed + 6 skipped + 6 xfailed)
+- **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
+- **代码规模**: 14 个源码模块 / 约 2200 行; 测试 14 个文件 / **622 个用例**(610 passed + 6 skipped + 6 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -40,7 +40,7 @@ python -m backend.main                   # 或 python backend/main.py
 | `max_iterations` | `32` | 单轮"模型↔工具"往返上限; 非法值回退默认 |
 | `identity_file` | `identity.md` | 人设文件: 优先 `workspace/` 再兜底 `backend/` |
 
-### 内置工具(默认全部注册, 共 6 个)
+### 内置工具(默认注册 6 个; 发现技能时额外注册 `load_skill`)
 
 | 工具 | 能力 | 关键限制 |
 | --- | --- | --- |
@@ -50,8 +50,10 @@ python -m backend.main                   # 或 python backend/main.py
 | `exec` | 在工作区执行 Shell 命令 | 60 秒超时; 危险命令黑名单; 输出 10000 字符截断 |
 | `web_search` | DuckDuckGo 联网搜索 | 默认 5 条(上限 20); 20 秒超时; 输出 8000 字符截断 |
 | `web_fetch` | 抓取 URL 并转纯文本 | 仅 http/https; **拒绝内网/回环地址**; 15 秒超时; 输出 12000 字符截断 |
+| `load_skill` | 按名取回技能指南正文 | **仅发现技能时注册**; 未知名会回列可用技能; 16000 字符截断 |
 
-> 联网工具在受限网络(如国内直连)下需先配代理, 见 [第 5 章](#5-联网能力与代理配置wsl2--clash).
+> - 联网工具在受限网络(如国内直连)下需先配代理, 见 [第 6 章](#6-联网能力与代理配置wsl2--clash);
+> - 技能系统(SKILL.md 目录约定、渐进式披露、`load_skill` 链路)见 [第 4 章](#4-技能系统skills).
 
 ---
 
@@ -60,29 +62,30 @@ python -m backend.main                   # 或 python backend/main.py
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ 入口 / 交互层      main.py                                                 │
-│   build_agent() 装配(6 个工具) - interactive_loop() REPL - main() 启动     │
+│   build_agent() 装配 6 工具(+技能时加 load_skill) · 技能摘要 · REPL        │
 └──────────────────────────────────────┬─────────────────────────────────────┘
                                        │                                      
 ┌──────────────────────────────────────▼─────────────────────────────────────┐
 │ 控制流层           agent/loop.py :: AgentLoop                              │
-│   run(): for 最多 max_iterations 轮"模型 ↔ 工具"                         │  
+│   run(): for 最多 max_iterations 轮「模型 ↔ 工具」                         │
 │     chat → 有 tool_calls ? 执行工具并回填 → continue : 返回最终回答        │
-│   护栏: _check_tool_loop(重复 10 次警告 / 20 次熔断) - clear_history()     │
+│   护栏: _check_tool_loop(重复 10 次警告 / 20 次熔断) · clear_history()     │
 └───────────┬─────────────────────────┬──────────────────────────┬───────────┘
             │                         │                          │            
 ┌───────────────────────┐ ┌───────────────────────┐ ┌────────────────────────┐
-│ 提示词层              │ │ 能力层  tools/ (6)    │ │ 模型接入层             │
+│ 提示词层              │ │ 能力层  tools/ (6+1)  │ │ 模型接入层             │
 │ context.py            │ │ 本地: 读/写/列目录    │ │ providers/             │
-│ ContextBuilder        │ │ 执行: exec 黑名单     │ │ LLMProvider (ABC)      │
+│ ContextBuilder        │ │ 执行: exec(黑名单)    │ │ LLMProvider (ABC)      │
 │ build_system_prompt() │ │ 联网: search / fetch  │ │ OpenAICompatProvider   │
-│ build_messages()      │ │ SSRF + 超时 + 截断    │ │ → AsyncOpenAI          │
-│ 人设+时间+工作区+记忆 │ │ → OpenAI function     │ │ 异常 → error 响应      │
+│ build_messages()      │ │ 技能: load_skill      │ │ → AsyncOpenAI          │
+│ 人设+时间+工作区      │ │ → OpenAI function     │ │ 异常 → error 响应      │
+│ + 记忆 / 技能摘要     │ │ 越界 / SSRF 防护      │ │ 可换任意兼容服务       │
 └───────────────────────┘ └───────────────────────┘ └────────────────────────┘
                                                                  │            
 ┌────────────────────────────────────────────────────────────────▼───────────┐
 │ 配置层             config.py :: Settings + load_config()                   │
 │   .env → 环境变量 > 文件 > 默认值 → 校验/兜底 → 预设 workspace 自动创建    │
-│   统一数据契约: LLMResponse / ToolCallRequest / FINISH_REASON_*            │
+│   技能目录 = <workspace>/skills   ·   统一数据契约: LLMResponse 等         │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,9 +114,11 @@ python -m backend.main                   # 或 python backend/main.py
 | `backend/agent/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
 | `backend/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
 | `backend/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
-| `backend/agent/context.py` | 169 | 组装 System Prompt 与 messages | `ContextBuilder.build_system_prompt()` / `build_messages()` |
+| `backend/agent/tools/load_skill.py` | 83 | 技能加载工具(绕开 read_file 的工作区限制) | `LoadSkillTool` |
+| `backend/agent/context.py` | 181 | 组装 System Prompt 与 messages(可注入技能摘要) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
+| `backend/agent/skills.py` | 216 | 技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
 | `backend/agent/loop.py` | 236 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
-| `backend/main.py` | 193 | 入口: 装配 + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
+| `backend/main.py` | 207 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -148,32 +153,93 @@ python -m backend.main                   # 或 python backend/main.py
 
 ---
 
-## 4. 安全设计
+## 4. 技能系统(Skills)
+
+**技能 = 一段按需加载的"怎么做"指南**(`SKILL.md`)。平时只把「技能名 + 一句话描述」放进 System Prompt,
+模型判断与当前任务相关时, 再用 `load_skill` 工具把指南正文取回来 —— 这就是**渐进式披露
+(progressive disclosure)**: 既让模型知道"有哪些能力", 又不把长篇操作手册一次性塞进上下文.
+
+### 4.1 目录约定
+
+```
+<workspace>/skills/
+├── exec/SKILL.md
+├── read_file/SKILL.md
+└── ...                    # 每个子目录一个技能, 只扫描一层
+```
+
+`SKILL.md` 用 YAML frontmatter 描述元信息, 正文就是给模型看的指南:
+
+```markdown
+---
+name: exec
+description: 在工作区内执行 Shell 命令的用法与安全限制
+---
+# exec 使用指南
+## 何时使用 ...
+## 参数 ...
+## 安全限制 ...
+```
+
+### 4.2 装配与执行链路
+
+| 环节 | 实现 |
+| --- | --- |
+| 扫描 / 解析 | `agent/skills.py :: SkillsLoader`(frontmatter 解析、坏文件跳过、按目录名排序) |
+| 注入提示词 | `main.build_agent()` 把摘要传给 `ContextBuilder(skills_summary=...)`, `build_system_prompt()` 追加 `## 可用技能` 章节 |
+| 按需取回 | `agent/tools/load_skill.py :: LoadSkillTool`(**有技能时才注册**), 模型调用 `load_skill(name="exec")` |
+| 技能不存在 | 返回 `[错误] 未找到技能: xxx. 可用技能: ...`, 把可用名字回给模型便于自纠 |
+| 越界防护 | `load_skill("../xxx")`、绝对路径一律拒绝(`commonpath` 判定, 同前缀兄弟目录也拦得住) |
+
+System Prompt 里最终长这样:
+
+```
+## 可用技能
+你有以下技能可用. 当某项技能与当前任务相关时, 请调用 load_skill 工具并传入技能名, 获取该技能的详细指南.
+
+可用技能:
+- exec (exec/SKILL.md): 在工作区内执行 Shell 命令的用法与安全限制
+- read_file (read_file/SKILL.md): 读取工作区内文本文件的用法与限制
+```
+
+### 4.3 自带技能
+
+仓库在 `workspace/skills/` 下自带 6 个"工具用法"技能(`read_file` / `write_file` / `list_dir` /
+`exec` / `web_search` / `web_fetch`), 把每个工具的参数、限制(截断 / 超时 / 命令黑名单 / SSRF 防护)
+与推荐用法写成指南 —— 相当于让 Agent 随身带一本自己的说明书.
+
+### 4.4 边界
+
+- 技能目前**只是文本**, 不含可执行脚本与随附资源(不同于 Claude Skills 的 `scripts/` 目录);
+- 只扫描 `skills_dir` 的**一层子目录**, 不支持分组嵌套;
+- `load_skill` 返回的正文超过 16000 字符会截断。
+
+## 5. 安全设计
 
 面向"通用型助手"的定位, 把风险点都做了显式处理, **并如实标注了边界**.
 
-### 4.1 路径防护(文件三件套)
+### 5.1 路径防护(文件三件套)
 
 所有文件操作先 `os.path.abspath` 归一化, 再校验是否落在工作区内, 越界返回 `[安全拦截] ...`.
 
-### 4.2 命令执行防护(`exec`)
+### 5.2 命令执行防护(`exec`)
 
 17 条正则黑名单(`re.IGNORECASE`)覆盖递归删除 / 格式化 / 关机重启 / 提权 / 覆盖设备文件 / 下载即执行 / 反弹 shell / Fork 炸弹等; 命中即返回 `安全拦截: 检测到危险命令模式 '...'`, **不创建任何进程**. 超时清理优先杀**整个进程组**(`start_new_session` + `killpg`), 并带**自杀保护**: 若子进程与父进程同组则退化为杀单进程, 避免误杀调用方.
 
-### 4.3 网络访问防护(`web_fetch`)
+### 5.3 网络访问防护(`web_fetch`)
 
 - 仅允许 `http`/`https`;
 - **默认拒绝本机/内网目标**: 字面量 IP、`localhost`/`*.localhost`、以及**域名解析后的地址**都要过 `not ip.is_global` 判据(覆盖回环、私网、链路本地、CGNAT/Tailscale、保留、组播等);
 - 需要抓内网时显式传 `WebFetchTool(allow_private=True)`;
 - 附 `<meta charset>` 嗅探、非 HTML 原样返回、2MB 转换上限.
 
-### 4.4 其它
+### 5.4 其它
 
 - `Settings.__repr__` 与启动信息**掩码 `api_key`**, 有专门用例断言密钥不出现在输出里;
 - 所有工具输出都有长度上限(见第 1 章表格), 避免上下文被单次调用打爆;
 - `.env` 已在 `.gitignore` 中, 模板用 `${ENV_VAR}` 而不是明文密钥.
 
-### 4.5 已知缺口与局限(诚实清单)
+### 5.5 已知缺口与局限(诚实清单)
 
 | 位置 | 问题 | 影响 |
 | --- | --- | --- |
@@ -187,7 +253,7 @@ python -m backend.main                   # 或 python backend/main.py
 
 ---
 
-## 5. 联网能力与代理配置(WSL2 + Clash)
+## 6. 联网能力与代理配置(WSL2 + Clash)
 
 `web_search` / `web_fetch` 需要出网. 若 Linux 侧不能直连(DNS 污染、无路由), 可通过 Windows 上运行的 Clash 代理解决. 以 **WSL2 mirrored 网络模式 + Clash Verge** 为例:
 
@@ -214,7 +280,7 @@ RUN_NETWORK_TESTS=1 pytest backend/test/ -m network -q     # 真实联网用例
 
 ---
 
-## 6. 与"用 DAG / 图编排构建的 Agent"的区别
+## 7. 与"用 DAG / 图编排构建的 Agent"的区别
 
 以 LangGraph 这类"节点 + 边"的图编排框架为对照:
 
@@ -240,7 +306,7 @@ RUN_NETWORK_TESTS=1 pytest backend/test/ -m network -q     # 真实联网用例
 
 ---
 
-## 7. 扩展指南
+## 8. 扩展指南
 
 **加一个工具**(3 步)
 
@@ -264,10 +330,10 @@ registry.register(HttpGetTool())     # 注册后模型即可见
 
 ---
 
-## 8. 测试
+## 9. 测试
 
 ```bash
-pytest                                        # 全量: 524 passed, 6 skipped, 6 xfailed
+pytest                                        # 全量: 610 passed, 6 skipped, 6 xfailed
 pytest backend/test/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ```
@@ -282,22 +348,25 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 | `test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
 | `test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
 | `test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
-| `test_context.py` | 40 | 人设查找链(工作区→backend 兜底)、时间实时取值、记忆注入 |
+| `test_skills.py` | 53 | frontmatter 12 类边界、摘要排序与回退、越界拦截、自带技能内容 |
+| `test_skills_tool.py` | 21 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
+| `test_context.py` | 47 | 人设查找链(工作区→backend 兜底)、时间实时取值、记忆/技能章节 |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
 | `test_loop.py` | 35 | 消息格式、防爆阈值、历史写入策略、配置驱动默认值 |
-| `test_main.py` | 22 | 装配、命令分支、Ctrl+C 优雅退出 |
+| `test_main.py` | 27 | 装配(工具/技能)、命令分支、Ctrl+C 优雅退出 |
 | `test_config.py` | 43 | 取值优先级、路径解析、非法值兜底、密钥掩码 |
 
 ---
 
-## 9. 目录结构
+## 10. 目录结构
 
 ```
 MeowMeowClaw/
 ├── .env / .env.example          # 配置与模板(密钥不入库)
 ├── pytest.ini                   # pythonpath=., 注册 network 标记
 ├── workspace/                   # 运行时工作区: 与 backend/ 同级, 自动创建
+│   └── skills/                # 技能目录: 每子目录一个 SKILL.md (自带 6 个工具用法)
 └── backend/
     ├── config.py                # 配置加载
     ├── identity.md              # 人设(可被 workspace/identity.md 覆盖)
@@ -305,17 +374,21 @@ MeowMeowClaw/
     ├── agent/
     │   ├── context.py           # System Prompt / messages
     │   ├── loop.py              # AgentLoop 控制流
-    │   └── tools/               # BaseTool - registry - filesystem - shell - web_search - web_fetch
+    │   ├── skills.py            # SkillsLoader 技能扫描/解析
+    │   └── tools/               # BaseTool · registry · filesystem · shell ·
+    │                            #   web_search · web_fetch · load_skill
     ├── providers/               # LLMProvider - OpenAICompatProvider
-    └── test/                    # 12 个测试文件 / 536 用例
+    └── test/                    # 14 个测试文件 / 622 用例
 ```
 
 ---
 
-## 10. 已知限制与 Roadmap
+## 11. 已知限制与 Roadmap
 
 - 会话历史仅存内存, **无持久化 / 断点续跑**; 未实现流式输出与多 Agent 编排
 - 长期记忆(`workspace/memory/MEMORY.md`)**已预留读取接口**, 尚无写入与检索
-- 安全侧的已知缺口见 [4.5](#45-已知缺口与局限诚实清单)(路径前缀绕过、命令黑名单绕过、抓取重定向/重绑定)
+- 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
+- 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(路径前缀绕过、命令黑名单绕过、抓取重定向/重绑定)
 - 单实例 `AgentLoop` 不建议并发 `run()`(内部状态未加锁)
 - 无 `requirements.txt`(依赖见"快速开始"); 无 CI 配置
+

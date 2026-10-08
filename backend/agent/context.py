@@ -42,15 +42,24 @@ class ContextBuilder:
     Args:
         workspace: 工作区根目录, 也是文件工具的操作范围(会归一化为绝对路径)
         identity_file: 人设文件名; 绝对路径直接使用, 相对路径先查 workspace/ 再兜底 backend/
+        skills_summary: 技能摘要文本(来自 SkillsLoader.build_skills_summary());
+            非空时在 System Prompt 末尾追加 "## 可用技能" 章节
 
     注意:
         - 每次 build_system_prompt() 都重新读盘, 因此运行中修改人设/记忆会立即生效;
         - 人设文件缺失/不可读/空白时依次尝试下一个候选, 全部失败才用默认人设, 不阻断 Agent 启动
     """
 
-    def __init__(self, workspace: str, identity_file: str = "identity.md") -> None:
+    def __init__(
+        self,
+        workspace: str,
+        identity_file: str = "identity.md",
+        skills_summary: str = "",
+    ) -> None:
         self.workspace = os.path.abspath(workspace)
         self.identity_file = identity_file
+        # 技能摘要由调用方(如 main.build_agent)注入, ContextBuilder 不关心技能从哪来
+        self.skills_summary = skills_summary
         # 候选路径按优先级排列: [工作区, backend/]
         self.identity_candidates = self._resolve_identity_candidates(identity_file)
         self.identity_path = self.identity_candidates[0]            # 首选: 工作区
@@ -130,7 +139,7 @@ class ContextBuilder:
     # ------------------------------------------------------------------ 对外方法
 
     def build_system_prompt(self) -> str:
-        """拼接完整 System Prompt: 人设 + 当前时间 + 工作区 + 长期记忆(非空才拼)."""
+        """拼接完整 System Prompt: 人设 + 当前时间 + 工作区 + 长期记忆 + 可用技能(后两者非空才拼)."""
         sections = [
             self._load_identity(),
             f"## 当前时间\n{self._format_now()}",
@@ -140,6 +149,9 @@ class ContextBuilder:
         memory = self._load_memory()
         if memory:  # 预留能力: 无记忆时不输出空章节
             sections.append(f"## 长期记忆\n{memory}")
+
+        if self.skills_summary:  # 无技能时不输出空章节
+            sections.append(f"## 可用技能\n{self.skills_summary}")
 
         return "\n\n".join(sections)
 

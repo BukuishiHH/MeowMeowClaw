@@ -15,8 +15,8 @@ SKILL.md 约定(参考 Claude Skills / OpenClaw 的 frontmatter 写法)::
     summary = loader.build_skills_summary() # 拼进 System Prompt
     guide = loader.load_skill("pdf")        # 按需加载正文
 
-注意: 摘要里给的是**相对 skills_dir 的路径**(如 `pdf/SKILL.md`)。若希望模型能用
-`read_file` 工具直接按该路径读到文件, `skills_dir` 需要位于工作区(workspace)之内。
+模型通过 ``load_skill`` 工具按技能名取回正文(见 tools/load_skill.py), 因此不受
+read_file 的工作区路径限制; 摘要里给出的相对路径仅供人排查时定位文件。
 """
 
 import logging
@@ -41,8 +41,8 @@ _CLOSING_FENCE_RE = re.compile(r"^---[ \t]*$", re.MULTILINE)
 
 # 拼进 System Prompt 的引导语
 SKILLS_SUMMARY_HEADER = (
-    "你有以下技能可用. 当你需要使用某项技能时, "
-    "请先用 read_file 工具读取对应的 SKILL.md 文件获取详细指南.\n\n可用技能:\n"
+    "你有以下技能可用. 当某项技能与当前任务相关时, "
+    "请调用 load_skill 工具并传入技能名, 获取该技能的详细指南.\n\n可用技能:\n"
 )
 
 

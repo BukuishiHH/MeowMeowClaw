@@ -1,4 +1,4 @@
-"""meowmeowclaw/agent/tools/web_search.py 的 Mock 单元测试.
+"""meowmeowclaw/tools/web_search.py 的 Mock 单元测试.
 
 测试策略:
 - 全部离线: 用替身 ``DDGS`` 顶掉真实搜索, 断言"传给搜索库的参数"与"结果格式化",
@@ -20,10 +20,11 @@ from typing import Any, Optional
 
 import pytest
 
-import meowmeowclaw.agent.tools.web_search as web_module
-from meowmeowclaw.agent.tools import BaseTool, WebSearchTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
-from meowmeowclaw.agent.tools.web_search import (
+import meowmeowclaw.tools.web_search as web_module
+from meowmeowclaw.tools import BaseTool
+from meowmeowclaw.tools.web_search import WebSearchTool
+from meowmeowclaw.tools.registry import ToolRegistry
+from meowmeowclaw.tools.web_search import (
     DEFAULT_MAX_RESULTS,
     MAX_OUTPUT_CHARS,
     MAX_RESULTS_LIMIT,
@@ -256,7 +257,7 @@ class TestParameters:
         fake, calls = make_fake_ddgs()
         monkeypatch.setattr(web_module, "DDGS", fake)
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.tools.web_search"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.tools.web_search"):
             await tool.execute(query="q", max_results="很多条")
 
         assert calls[0]["max_results"] == DEFAULT_MAX_RESULTS
@@ -317,7 +318,7 @@ class TestEmptyAndErrors:
         fake, _ = make_fake_ddgs(error=RuntimeError("网络不可达"))
         monkeypatch.setattr(web_module, "DDGS", fake)
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.tools.web_search"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.tools.web_search"):
             result = await tool.execute(query="q")
 
         assert result == "搜索出错: 网络不可达"
@@ -340,7 +341,7 @@ class TestEmptyAndErrors:
         monkeypatch.setattr(web_module, "SEARCH_TIMEOUT_SECONDS", 0.05)
         started = time.monotonic()
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.tools.web_search"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.tools.web_search"):
             result = await tool.execute(query="q")
 
         elapsed = time.monotonic() - started

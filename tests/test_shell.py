@@ -1,4 +1,4 @@
-"""meowmeowclaw/agent/tools/shell.py 的 Mock 单元测试.
+"""meowmeowclaw/tools/shell.py 的 Mock 单元测试.
 
 测试策略:
 - Mock 为主: 用 ``monkeypatch`` 顶掉 ``asyncio.create_subprocess_shell`` 换成受控的假进程,
@@ -20,10 +20,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import meowmeowclaw.agent.tools.shell as shell_module
-from meowmeowclaw.agent.tools import BaseTool, ExecTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
-from meowmeowclaw.agent.tools.shell import (
+import meowmeowclaw.tools.shell as shell_module
+from meowmeowclaw.tools import BaseTool
+from meowmeowclaw.tools.shell import ExecTool
+from meowmeowclaw.tools.registry import ToolRegistry
+from meowmeowclaw.tools.shell import (
     DENY_PATTERNS,
     MAX_OUTPUT_CHARS,
     TRUNCATE_NOTICE,
@@ -430,7 +431,7 @@ class TestTimeout:
         monkeypatch.setattr(shell_module.os, "killpg", MagicMock())
         monkeypatch.setattr(shell_module.os, "getpgid", lambda pid: pid)
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.tools.shell"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.tools.shell"):
             await tool.execute(command="sleep 999")
 
         assert any("超时" in r.message for r in caplog.records)

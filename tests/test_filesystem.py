@@ -1,4 +1,4 @@
-"""meowmeowclaw/agent/tools/filesystem.py 的 Mock 单元测试.
+"""meowmeowclaw/tools/filesystem.py 的 Mock 单元测试.
 
 被测对象: ReadFileTool(read_file) / WriteFileTool(write_file) / ListDirTool(list_dir).
 
@@ -11,20 +11,27 @@
 - 真实文件系统为辅: 关键路径用 tmp_path 再跑一遍, 校验 Mock 的假设与 OS 真实语义一致,
   防止 Mock 与真实契约脱节;
 - 契约校验: name / description / parameters(OpenAI JSON Schema) 与 BaseTool 抽象契约.
-  说明: 路径校验用的是 ``str.startswith``, 存在同前缀兄弟目录绕过缺口, 见 TestKnownGaps.
+  路径防护由 resolve_in_workspace() 统一实现(os.path.commonpath 判定), 回归用例见 TestPathHardening.
 
 运行: pytest tests/test_filesystem.py -v
 """
 
 import inspect
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from meowmeowclaw.agent.tools import BaseTool
-from meowmeowclaw.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.tools import BaseTool
+from meowmeowclaw.tools.filesystem import (
+    ListDirTool,
+    PathOutsideWorkspaceError,
+    ReadFileTool,
+    WriteFileTool,
+    resolve_in_workspace,
+)
+from meowmeowclaw.tools.registry import ToolRegistry
 
 # 与实现对齐的常量: 截断阈值与截断提示(用于边界断言)
 TRUNCATE_LIMIT = 16000
@@ -508,20 +515,67 @@ class TestRegistryIntegration:
         )
 
 
-# ------------------------------------------------------------- 已知缺口(xfail 跟踪)
+# ------------------------------------------------- 路径防护函数与安全回归
 
 
-class TestKnownGaps:
-    """以 xfail 记录当前实现的已知缺口: 修复后自动转 XPASS, 便于回归跟踪."""
+class TestResolveInWorkspace:
+    """直接单测唯一路径校验函数: 合法解析 + 越界拒绝 + 非字符串抛 TypeError."""
+
+    def test_normalizes_relative_path(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        (workspace / "docs").mkdir()
+
+        assert resolve_in_workspace(str(workspace), "docs/a.txt") == str(
+            workspace / "docs" / "a.txt"
+        )
+
+    def test_empty_path_means_workspace_root(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        assert resolve_in_workspace(str(workspace), "") == str(workspace)
+
+    def test_accepts_pathlike_workspace_and_user_path(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        assert resolve_in_workspace(workspace, Path("a.txt")) == str(workspace / "a.txt")
+
+    @pytest.mark.parametrize(
+        "bad_path", ["../outside.txt", "../../outside.txt", "/etc/passwd", "..", "a/../../b"]
+    )
+    def test_outside_paths_are_rejected(self, tmp_path, bad_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with pytest.raises(PathOutsideWorkspaceError):
+            resolve_in_workspace(str(workspace), bad_path)
+
+    def test_sibling_dir_with_same_prefix_is_rejected(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        sibling = tmp_path / "ws_evil"
+        sibling.mkdir()
+
+        with pytest.raises(PathOutsideWorkspaceError):
+            resolve_in_workspace(str(workspace), "../ws_evil/secret.txt")
+
+    @pytest.mark.parametrize("bad_path", [None, 0, 3.14, object()])
+    def test_non_string_path_raises_type_error(self, tmp_path, bad_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with pytest.raises(TypeError):
+            resolve_in_workspace(str(workspace), bad_path)
+
+
+class TestPathHardening:
+    """回归: 同前缀兄弟目录必须被拦截, 非字符串路径必须变成可读文本而不是向上抛."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("action", ["read", "write", "list"])
-    @pytest.mark.xfail(
-        reason="路径校验用 str.startswith, 同前缀兄弟目录 ws_evil 被误判为工作区内 "
-        "(应改用 os.path.commonpath 或 Path.relative_to)",
-        strict=False,
-    )
-    async def test_sibling_dir_sharing_workspace_prefix_should_be_blocked(self, tmp_path, action):
+    async def test_sibling_dir_sharing_workspace_prefix_is_blocked(self, tmp_path, action):
         workspace_dir = tmp_path / "ws"
         workspace_dir.mkdir()
         sibling = tmp_path / "ws_evil"
@@ -539,14 +593,20 @@ class TestKnownGaps:
             result = await ListDirTool(workspace).execute(dir_path="../ws_evil")
 
         assert "[安全拦截]" in result
+        assert not (sibling / "pwned.txt").exists()
+        assert (sibling / "secret.txt").read_text(encoding="utf-8") == "top-secret"
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="路径拼接在 try 之外, 非字符串路径(如 LLM 传 null)会向上抛 TypeError, "
-        "违背 BaseTool '异常在内部捕获' 的建议",
-        strict=False,
+    @pytest.mark.parametrize(
+        ("action", "prefix"),
+        [("read", "[读取文件异常]"), ("write", "[写入文件异常]"), ("list", "[列举目录异常]")],
     )
-    async def test_non_string_path_should_return_text_instead_of_raising(self, workspace):
-        result = await ReadFileTool(workspace).execute(file_path=None)
+    async def test_non_string_path_returns_text_instead_of_raising(self, workspace, action, prefix):
+        if action == "read":
+            result = await ReadFileTool(workspace).execute(file_path=None)
+        elif action == "write":
+            result = await WriteFileTool(workspace).execute(file_path=None, content="x")
+        else:
+            result = await ListDirTool(workspace).execute(dir_path=None)
 
-        assert "[读取文件异常]" in result
+        assert result.startswith(prefix)

@@ -8,7 +8,7 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from meowmeowclaw.agent.tools import BaseTool
+from .base import BaseTool
 
 try:  # 主用新包名 ddgs
     from ddgs import DDGS

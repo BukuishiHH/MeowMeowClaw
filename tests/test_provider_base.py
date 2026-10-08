@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
-from meowmeowclaw.agent.tools import BaseTool
+from meowmeowclaw.tools import BaseTool
 from meowmeowclaw.providers.base import (
     FINISH_REASON_CONTENT_FILTER,
     FINISH_REASON_ERROR,

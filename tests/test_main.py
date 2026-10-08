@@ -21,7 +21,8 @@ import pytest
 import meowmeowclaw.main as main_module
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.tools.filesystem import ReadFileTool
+from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.config import Settings
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.base import FINISH_REASON_STOP, LLMProvider, LLMResponse
@@ -71,7 +72,7 @@ class StubProvider(LLMProvider):
 def make_stub_agent(answer: str = "模型回答", error: Optional[BaseException] = None) -> AgentLoop:
     """真实 AgentLoop(含真实 ToolRegistry) + 替身 Provider / Context(离线可跑)."""
     registry = ToolRegistry()
-    registry.register(main_module.ReadFileTool("/tmp"))
+    registry.register(ReadFileTool("/tmp"))
 
     # 忠实模仿真实 ContextBuilder 的拼装规则(system + 历史 + 当前消息)
     context = MagicMock(spec=ContextBuilder)

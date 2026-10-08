@@ -22,8 +22,8 @@ import openai
 import pytest
 from openai.types.chat import ChatCompletion
 
-from meowmeowclaw.agent.tools import ReadFileTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.tools.filesystem import ReadFileTool
+from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.providers.base import (
     FINISH_REASON_ERROR,
     FINISH_REASON_STOP,

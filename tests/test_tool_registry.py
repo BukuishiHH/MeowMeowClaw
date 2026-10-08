@@ -9,13 +9,16 @@
 运行: pytest tests/test_tool_registry.py -v
 """
 
+import subprocess
+import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from meowmeowclaw.agent.tools import BaseTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.paths import PROJECT_ROOT
+from meowmeowclaw.tools import BaseTool
+from meowmeowclaw.tools.registry import ToolRegistry
 
 # ---------------------------------------------------------------- 测试替身(hooks)
 
@@ -288,3 +291,41 @@ class TestRepr:
         registry.register(make_tool_mock("beta"))
 
         assert repr(registry) == "<ToolRegistry registered_tools=['alpha', 'beta']>"
+
+
+# ------------------------------------------------- 包导入边界(无副作用)
+
+
+class TestToolsPackageImportBoundary:
+    """``import meowmeowclaw.tools`` 只应拉起框架, 不应拉起具体工具/配置/上层模块."""
+
+    def test_import_tools_does_not_load_concrete_tools_or_config(self):
+        code = (
+            "import sys\n"
+            "import meowmeowclaw.tools\n"
+            "loaded = [name for name in (\n"
+            "    'meowmeowclaw.config',\n"
+            "    'meowmeowclaw.agent',\n"
+            "    'meowmeowclaw.skills',\n"
+            "    'meowmeowclaw.tools.filesystem',\n"
+            "    'meowmeowclaw.tools.shell',\n"
+            "    'meowmeowclaw.tools.web_search',\n"
+            "    'meowmeowclaw.tools.web_fetch',\n"
+            ") if name in sys.modules]\n"
+            "print(','.join(loaded))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == ""
+
+    def test_exports_only_framework_symbols(self):
+        import meowmeowclaw.tools as tools
+
+        assert set(tools.__all__) == {"BaseTool", "ToolRegistry"}

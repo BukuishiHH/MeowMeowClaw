@@ -11,7 +11,7 @@
 import logging
 from typing import Any
 
-from meowmeowclaw.agent.tools.base import BaseTool
+from meowmeowclaw.tools.base import BaseTool
 from meowmeowclaw.skills.loader import SkillCatalog
 
 logger = logging.getLogger(__name__)

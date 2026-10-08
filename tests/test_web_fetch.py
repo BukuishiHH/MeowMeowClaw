@@ -1,4 +1,4 @@
-"""meowmeowclaw/agent/tools/web_fetch.py 的 Mock 单元测试.
+"""meowmeowclaw/tools/web_fetch.py 的 Mock 单元测试.
 
 测试策略:
 - 用 **真实 httpx.AsyncClient + MockTransport** 替换网络层: 走的是 httpx 真正的
@@ -19,10 +19,11 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-import meowmeowclaw.agent.tools.web_fetch as fetch_module
-from meowmeowclaw.agent.tools import BaseTool, WebFetchTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
-from meowmeowclaw.agent.tools.web_fetch import (
+import meowmeowclaw.tools.web_fetch as fetch_module
+from meowmeowclaw.tools import BaseTool
+from meowmeowclaw.tools.web_fetch import WebFetchTool
+from meowmeowclaw.tools.registry import ToolRegistry
+from meowmeowclaw.tools.web_fetch import (
     EMPTY_NOTICE,
     MAX_OUTPUT_CHARS,
     TRUNCATE_NOTICE,

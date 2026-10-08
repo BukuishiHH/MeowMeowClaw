@@ -12,7 +12,7 @@ import re
 import signal
 from typing import Any, Optional
 
-from meowmeowclaw.agent.tools import BaseTool
+from .base import BaseTool
 
 logger = logging.getLogger(__name__)
 

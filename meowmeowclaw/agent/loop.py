@@ -19,7 +19,7 @@ import logging
 from typing import Any, Optional
 
 from meowmeowclaw.agent.context import ContextBuilder
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.providers.base import FINISH_REASON_ERROR, LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)

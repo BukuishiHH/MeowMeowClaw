@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from meowmeowclaw.agent.tools import BaseTool
+from .base import BaseTool
 
 try:  # html2text 属于可选依赖: 缺失时不影响其它工具导入, 只在执行时给提示
     import html2text

@@ -17,15 +17,11 @@ from pathlib import Path
 
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
-from meowmeowclaw.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
-from meowmeowclaw.agent.tools.shell import ExecTool
-from meowmeowclaw.agent.tools.web_fetch import WebFetchTool
-from meowmeowclaw.agent.tools.web_search import WebSearchTool
 from meowmeowclaw.config import Settings, load_config
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
 from meowmeowclaw.skills import LoadSkillTool, SkillCatalog, SkillConfigError
+from meowmeowclaw.tools.registry import ToolRegistry
 
 # 应用显示名(项目名见 README 与人设文件)
 APP_NAME = "MeowMeowClaw"
@@ -43,6 +39,27 @@ BANNER = r"""
 
 
 # ------------------------------------------------------------------ 组装
+
+
+def _build_registry(config: Settings) -> ToolRegistry:
+    """集中注册清单: 唯一知道"有哪些具体工具"的装配处.
+
+    具体工具只在函数内 import, 因此 ``import meowmeowclaw.main`` 不会拉起全部工具实现;
+    阶段 6 会把本函数原样迁到 bootstrap.py。
+    """
+    from meowmeowclaw.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
+    from meowmeowclaw.tools.shell import ExecTool
+    from meowmeowclaw.tools.web_fetch import WebFetchTool
+    from meowmeowclaw.tools.web_search import WebSearchTool
+
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(config.workspace))
+    registry.register(WriteFileTool(config.workspace))
+    registry.register(ListDirTool(config.workspace))
+    registry.register(ExecTool(config.workspace))
+    registry.register(WebSearchTool())
+    registry.register(WebFetchTool())
+    return registry
 
 
 def build_agent() -> AgentLoop:
@@ -72,13 +89,7 @@ def build_agent() -> AgentLoop:
         model=config.model,
     )
 
-    tools = ToolRegistry()
-    tools.register(ReadFileTool(config.workspace))
-    tools.register(WriteFileTool(config.workspace))
-    tools.register(ListDirTool(config.workspace))
-    tools.register(ExecTool(config.workspace))
-    tools.register(WebSearchTool())
-    tools.register(WebFetchTool())
+    tools = _build_registry(config)
 
     # 技能: 内置在 <包>/skills/builtin/ 下, 启动扫描一次并建立索引
     try:

@@ -13,7 +13,7 @@ from typing import Optional
 
 import pytest
 
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.skills import (
     DEFAULT_DESCRIPTION,
     SKILL_FILE_NAME,
@@ -57,7 +57,7 @@ def tool(catalog) -> LoadSkillTool:
 
 class TestToolContract:
     def test_is_base_tool_subclass(self, tool):
-        from meowmeowclaw.agent.tools.base import BaseTool
+        from meowmeowclaw.tools.base import BaseTool
 
         assert isinstance(tool, BaseTool)
 

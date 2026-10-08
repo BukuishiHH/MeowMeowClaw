@@ -3,7 +3,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 17 个源码模块 / 约 2400 行; 测试 14 个文件 / **613 个用例**(601 passed + 6 skipped + 6 xfailed)
+- **代码规模**: 17 个源码模块 / 约 2450 行; 测试 14 个文件 / **630 个用例**(622 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -110,18 +110,18 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/paths.py` | 40 | 项目根 / `.env` / workspace / 人设路径的唯一来源 | `PROJECT_ROOT` / `resolve_workspace()` / `IDENTITY_FILE` |
 | `meowmeowclaw/providers/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
 | `meowmeowclaw/providers/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
-| `meowmeowclaw/agent/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
-| `meowmeowclaw/agent/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
-| `meowmeowclaw/agent/tools/filesystem.py` | 163 | 本地文件读写/列目录 | `ReadFileTool` / `WriteFileTool` / `ListDirTool` |
-| `meowmeowclaw/agent/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
-| `meowmeowclaw/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
-| `meowmeowclaw/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
+| `meowmeowclaw/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
+| `meowmeowclaw/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
+| `meowmeowclaw/tools/filesystem.py` | 217 | 本地文件读写/列目录; 路径防护统一实现(commonpath) | `ReadFileTool` / `WriteFileTool` / `ListDirTool` / `resolve_in_workspace` |
+| `meowmeowclaw/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
+| `meowmeowclaw/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
+| `meowmeowclaw/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
 | `meowmeowclaw/skills/loader.py` | 237 | 技能扫描/索引/摘要(importlib.resources + 启动扫描一次) | `SkillCatalog` |
 | `meowmeowclaw/skills/models.py` | 33 | 技能数据模型与配置错误 | `Skill` / `SkillConfigError` |
 | `meowmeowclaw/skills/tool.py` | 85 | `load_skill` 工具(技能子系统对 Agent 的唯一出口) | `LoadSkillTool` |
 | `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 241 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
-| `meowmeowclaw/main.py` | 215 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
+| `meowmeowclaw/main.py` | 232 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `_build_registry()` / `interactive_loop()` / `main()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -226,7 +226,9 @@ SSRF 防护)与推荐用法写成指南 —— 技能随代码入库、随包分
 
 ### 5.1 路径防护(文件三件套)
 
-所有文件操作先 `os.path.abspath` 归一化, 再校验是否落在工作区内, 越界返回 `[安全拦截] ...`.
+三件套共用唯一的 `resolve_in_workspace()`: 先把 `workspace + 用户路径` 归一化为绝对路径,
+再用 `os.path.commonpath` 判定是否落在工作区内, 越界返回 `[安全拦截] ...`;
+同前缀兄弟目录(`/ws_evil` vs `/ws`)不会再被误放行, 非字符串路径也会被包装成可读文本.
 
 ### 5.2 命令执行防护(`exec`)
 
@@ -249,13 +251,13 @@ SSRF 防护)与推荐用法写成指南 —— 技能随代码入库、随包分
 
 | 位置 | 问题 | 影响 |
 | --- | --- | --- |
-| `filesystem.py` | 越界校验用 `str.startswith` | 同前缀兄弟目录(`/ws_evil`)可绕过, 应改 `os.path.commonpath` |
-| `filesystem.py` | 路径拼接在 `try` 之外 | 传 `null` 之类的非字符串会抛 `TypeError`(registry 会兜住) |
 | `shell.py` | 黑名单是**护栏不是沙箱** | `rm --recursive -f`、`find -delete`、`python -c`、`base64\|sh` 等可绕过; 也会误报(`git commit -m "fix rm -rf bug"`) |
 | `web_fetch.py` | 只做**发起前**检查 | `follow_redirects=True` 时远端 302 跳内网仍会发出请求; 存在 DNS 重绑定窗口 |
 | `providers/base.py` | `has_tool_calls` 直接 `len()` | `tool_calls=None` 时抛 `TypeError`; `usage` 类型标注缺 `Optional` |
 
-以上前 5 条都以 `xfail` 形式记录在测试里, 修复后会转为 XPASS. **生产建议**: `exec` 默认不注册或加开关、放进容器/受限用户运行; 把工作区当不可信输入.
+> `filesystem.py` 的两条旧缺口(同前缀兄弟目录绕过、非字符串路径抛异常)已修复,
+> 由 `TestPathHardening` 与 `TestResolveInWorkspace` 覆盖; 上表剩余项中 `providers/base.py` 仍以 `xfail` 跟踪。
+> **生产建议**: `exec` 默认不注册或加开关、放进容器/受限用户运行; 把工作区当不可信输入.
 
 ---
 
@@ -339,7 +341,7 @@ registry.register(HttpGetTool())     # 注册后模型即可见
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 601 passed, 6 skipped, 6 xfailed
+pytest                                        # 全量: 622 passed, 6 skipped, 2 xfailed
 pytest tests/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ```
@@ -349,8 +351,8 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 | 测试文件 | 用例 | 重点 |
 | --- | ---: | --- |
 | `test_base_tool.py` | 3 | 工具基类抽象约束 |
-| `test_tool_registry.py` | 19 | 注册/查重/路由/异常包装 |
-| `test_filesystem.py` | 76 | 三个文件工具的读写、截断、路径穿越、异常分支 |
+| `test_tool_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
+| `test_filesystem.py` | 91 | 三件套读写/截断/异常分支、resolve_in_workspace、同前缀绕过回归 |
 | `test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
 | `test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
 | `test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
@@ -381,9 +383,14 @@ MeowMeowClaw/
     ├── __main__.py              # python -m meowmeowclaw
     ├── agent/
     │   ├── context.py           # System Prompt / messages
-    │   ├── loop.py              # AgentLoop 控制流
-    │   └── tools/               # BaseTool · registry · filesystem · shell ·
-    │                            #   web_search · web_fetch
+    │   └── loop.py              # AgentLoop 控制流
+    ├── tools/                   # 工具框架 + 内置工具
+    │   ├── base.py              # BaseTool 契约
+    │   ├── registry.py          # ToolRegistry 注册/路由
+    │   ├── filesystem.py        # 三件套 + resolve_in_workspace()
+    │   ├── shell.py             # ExecTool
+    │   ├── web_search.py        # WebSearchTool
+    │   └── web_fetch.py         # WebFetchTool
     ├── skills/
     │   ├── loader.py            # SkillCatalog 扫描/索引/摘要
     │   ├── models.py            # Skill / SkillConfigError

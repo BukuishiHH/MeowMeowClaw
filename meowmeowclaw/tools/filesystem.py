@@ -1,6 +1,45 @@
+"""工作区文件工具: read_file / write_file / list_dir.
+
+路径防护集中在本模块顶部的 ``resolve_in_workspace()``:
+先归一化绝对路径, 再用 ``os.path.commonpath`` 判定是否落在工作区内,
+因此同前缀兄弟目录(如 ``/tmp/ws_evil`` vs ``/tmp/ws``)不会被误放行;
+非法路径在触达任何文件系统调用之前就被拦截。
+"""
+
 import os
 from typing import Any
-from meowmeowclaw.agent.tools import BaseTool
+
+from .base import BaseTool
+
+
+class PathOutsideWorkspaceError(ValueError):
+    """请求路径越出工作区(由 ``resolve_in_workspace`` 抛出)."""
+
+
+def resolve_in_workspace(workspace: str, user_path: Any) -> str:
+    """
+    把用户提供的相对/绝对路径解析为工作区内的绝对路径.
+
+    :param workspace: 工作区根目录(应已存在或即将创建)
+    :param user_path: 从模型参数取得的路径; 非 str/PathLike 会抛 TypeError
+    :return: 归一化后的绝对路径
+    :raises PathOutsideWorkspaceError: 目标落在工作区之外
+    :raises TypeError: user_path 不是 str/bytes/os.PathLike
+    """
+    base = os.path.abspath(os.fspath(workspace))
+    raw = os.fspath(user_path)  # None/int 等在这里抛 TypeError, 由调用方包装成可读文本
+    if isinstance(raw, bytes):
+        raw = os.fsdecode(raw)
+    candidate = os.path.abspath(os.path.join(base, raw))
+
+    try:
+        common = os.path.commonpath([candidate, base])
+    except ValueError as exc:  # Windows 跨盘符等
+        raise PathOutsideWorkspaceError(f"无法判定路径归属: {candidate}") from exc
+
+    if common != base:
+        raise PathOutsideWorkspaceError(f"路径越出工作区: {candidate}")
+    return candidate
 
 
 class ReadFileTool(BaseTool):
@@ -9,6 +48,7 @@ class ReadFileTool(BaseTool):
     Args:
         workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
     """
+
     def __init__(self, workspace: str):
         self.workspace = os.path.abspath(workspace)
 
@@ -36,10 +76,13 @@ class ReadFileTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> str:
         file_rel_path = kwargs.get("file_path", "")
-        absolute_path = os.path.abspath(os.path.join(self.workspace, file_rel_path))
-        # 路径安全校验
-        if not absolute_path.startswith(self.workspace):
+        try:
+            absolute_path = resolve_in_workspace(self.workspace, file_rel_path)
+        except PathOutsideWorkspaceError:
             return f"[安全拦截] 禁止访问工作区外路径, 请求路径: {file_rel_path}"
+        except Exception as exc:  # 非字符串路径等: 包装成可读文本而不是向上抛
+            return f"[读取文件异常] {repr(exc)}"
+
         try:
             with open(absolute_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -61,6 +104,7 @@ class WriteFileTool(BaseTool):
     Args:
         workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
     """
+
     def __init__(self, workspace: str):
         self.workspace = os.path.abspath(workspace)
 
@@ -93,9 +137,13 @@ class WriteFileTool(BaseTool):
     async def execute(self, **kwargs: Any) -> str:
         file_rel_path = kwargs.get("file_path", "")
         content = kwargs.get("content", "")
-        absolute_path = os.path.abspath(os.path.join(self.workspace, file_rel_path))
-        if not absolute_path.startswith(self.workspace):
+        try:
+            absolute_path = resolve_in_workspace(self.workspace, file_rel_path)
+        except PathOutsideWorkspaceError:
             return f"[安全拦截] 禁止写入工作区外路径, 请求路径: {file_rel_path}"
+        except Exception as exc:
+            return f"[写入文件异常] {repr(exc)}"
+
         try:
             parent_dir = os.path.dirname(absolute_path)
             os.makedirs(parent_dir, exist_ok=True)
@@ -114,6 +162,7 @@ class ListDirTool(BaseTool):
     Args:
         workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
     """
+
     def __init__(self, workspace: str):
         self.workspace = os.path.abspath(workspace)
 
@@ -139,11 +188,15 @@ class ListDirTool(BaseTool):
             "additionalProperties": False
         }
 
-    async def execute(self,** kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> str:
         dir_rel_path = kwargs.get("dir_path", "")
-        absolute_path = os.path.abspath(os.path.join(self.workspace, dir_rel_path))
-        if not absolute_path.startswith(self.workspace):
+        try:
+            absolute_path = resolve_in_workspace(self.workspace, dir_rel_path)
+        except PathOutsideWorkspaceError:
             return f"[安全拦截] 禁止列出工作区外目录, 请求路径: {dir_rel_path}"
+        except Exception as exc:
+            return f"[列举目录异常] {repr(exc)}"
+
         if not os.path.isdir(absolute_path):
             return f"[错误] 路径不是有效目录: {absolute_path}"
         try:

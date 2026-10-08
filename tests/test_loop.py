@@ -31,8 +31,8 @@ from meowmeowclaw.agent.loop import (
     TOOL_CALL_WINDOW_SIZE,
     AgentLoop,
 )
-from meowmeowclaw.agent.tools import ReadFileTool
-from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.tools.filesystem import ReadFileTool
+from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.base import (
     FINISH_REASON_ERROR,

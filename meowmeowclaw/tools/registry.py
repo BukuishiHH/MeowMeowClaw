@@ -1,5 +1,5 @@
 from typing import Dict, List
-from meowmeowclaw.agent.tools import BaseTool
+from .base import BaseTool
 
 class ToolRegistry:
     """

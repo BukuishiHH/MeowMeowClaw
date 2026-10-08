@@ -1,5 +1,5 @@
 import pytest
-from meowmeowclaw.agent.tools import BaseTool
+from meowmeowclaw.tools import BaseTool
 from typing import Any
 
 class MinimalTool(BaseTool):

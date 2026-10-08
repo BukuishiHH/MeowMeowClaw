@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -264,3 +265,117 @@ class SessionSummary:
     @property
     def scope(self) -> str:
         return self.session_key.scope
+
+
+@dataclass(frozen=True)
+class MemoryRecord:
+    """结构化长期记忆记录(为未来 LongTermStore 预留).
+
+    与 ``MEMORY.md`` 的关系: v1 的长期记忆由 ``MEMORY.md`` 承担, 本模型仅定义契约;
+    未来 JSONL/SQLite/MySQL 后端实现 ``LongTermStore`` 时按此结构存取。
+    """
+
+    id: str
+    namespace: str
+    kind: str
+    content: str
+    tags: tuple[str, ...] = ()
+    confidence: float = 1.0
+    source_session: Optional[str] = None
+    source_message_id: Optional[str] = None
+    created_at_ms: int = 0
+    updated_at_ms: int = 0
+    expires_at_ms: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("id", self.id),
+            ("namespace", self.namespace),
+            ("kind", self.kind),
+            ("content", self.content),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} 不能为空")
+        if not isinstance(self.confidence, (int, float)) or not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("confidence 必须在 [0, 1] 区间")
+        if self.created_at_ms < 0 or self.updated_at_ms < 0:
+            raise ValueError("时间戳不能为负数")
+        if self.updated_at_ms < self.created_at_ms:
+            raise ValueError("updated_at_ms 不能早于 created_at_ms")
+        if self.expires_at_ms is not None and self.expires_at_ms < self.created_at_ms:
+            raise ValueError("expires_at_ms 不能早于 created_at_ms")
+
+        clean_tags = tuple(
+            str(tag).strip() for tag in self.tags if str(tag).strip()
+        )
+        object.__setattr__(self, "tags", clean_tags)
+
+    @property
+    def created_at_iso(self) -> str:
+        return ms_to_iso(self.created_at_ms)
+
+    @property
+    def updated_at_iso(self) -> str:
+        return ms_to_iso(self.updated_at_ms)
+
+    def to_dict(self) -> dict[str, Any]:
+        """可 JSON 序列化的 dict(tags 转 list)."""
+        return {
+            "id": self.id,
+            "namespace": self.namespace,
+            "kind": self.kind,
+            "content": self.content,
+            "tags": list(self.tags),
+            "confidence": self.confidence,
+            "source_session": self.source_session,
+            "source_message_id": self.source_message_id,
+            "created_at_ms": self.created_at_ms,
+            "updated_at_ms": self.updated_at_ms,
+            "expires_at_ms": self.expires_at_ms,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
+        """从 dict 恢复; 未知字段忽略, 缺省字段使用默认值."""
+        if not isinstance(data, dict):
+            raise ValueError("MemoryRecord 记录必须是 dict")
+        return cls(
+            id=str(data.get("id") or ""),
+            namespace=str(data.get("namespace") or ""),
+            kind=str(data.get("kind") or ""),
+            content=str(data.get("content") or ""),
+            tags=tuple(data.get("tags") or ()),
+            confidence=float(data.get("confidence", 1.0)),
+            source_session=data.get("source_session"),
+            source_message_id=data.get("source_message_id"),
+            created_at_ms=int(data.get("created_at_ms") or 0),
+            updated_at_ms=int(data.get("updated_at_ms") or 0),
+            expires_at_ms=data.get("expires_at_ms"),
+        )
+
+
+def new_memory_record(
+    namespace: str,
+    content: str,
+    *,
+    kind: str = "fact",
+    tags: tuple[str, ...] = (),
+    confidence: float = 1.0,
+    source_session: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+    now_ms: Optional[int] = None,
+) -> MemoryRecord:
+    """构造一条带 UUID 与当前时间戳的长期记忆记录."""
+    timestamp = utc_now_ms() if now_ms is None else int(now_ms)
+    return MemoryRecord(
+        id=uuid.uuid4().hex,
+        namespace=namespace,
+        kind=kind,
+        content=content,
+        tags=tuple(tags),
+        confidence=confidence,
+        source_session=source_session,
+        source_message_id=source_message_id,
+        created_at_ms=timestamp,
+        updated_at_ms=timestamp,
+    )

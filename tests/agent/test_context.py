@@ -452,3 +452,57 @@ class TestRealFilesystem:
         prompt = builder.build_system_prompt()
 
         assert "## 长期记忆\n" not in prompt
+
+
+# --------------------------------------------- 结构化长期记忆注入点(M6)
+
+class TestLongTermInjection:
+    def test_default_has_no_recall_section(self, builder):
+        prompt = builder.build_system_prompt()
+
+        assert "## 长期记忆召回" not in prompt
+
+    def test_provider_text_is_appended(self, workspace, identity):
+        b = ContextBuilder(
+            workspace,
+            identity,
+            long_term_provider=lambda: "用户偏好 Python; 不要用 exec",
+        )
+
+        prompt = b.build_system_prompt()
+
+        assert "## 长期记忆召回" in prompt
+        assert "用户偏好 Python; 不要用 exec" in prompt
+
+    def test_empty_provider_adds_nothing(self, workspace, identity):
+        b = ContextBuilder(workspace, identity, long_term_provider=lambda: "   ")
+
+        assert "## 长期记忆召回" not in b.build_system_prompt()
+
+    def test_provider_failure_is_fail_soft(self, workspace, identity, caplog):
+        def boom() -> str:
+            raise RuntimeError("recall failed")
+
+        b = ContextBuilder(workspace, identity, long_term_provider=boom)
+
+        with caplog.at_level(logging.WARNING, logger=MODULE):
+            prompt = b.build_system_prompt()
+
+        assert "## 长期记忆召回" not in prompt
+        assert "长期记忆召回失败" in caplog.text
+
+    def test_recall_sits_between_memory_and_skills(self, workspace, identity):
+        memory_dir = workspace / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("手工长期记忆", encoding="utf-8")
+        b = ContextBuilder(
+            workspace,
+            identity,
+            skills_summary="- exec (exec/SKILL.md): 执行命令\n",
+            long_term_provider=lambda: "结构化召回",
+        )
+
+        prompt = b.build_system_prompt()
+
+        assert prompt.index("手工长期记忆") < prompt.index("结构化召回")
+        assert prompt.index("结构化召回") < prompt.index("## 可用技能")

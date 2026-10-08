@@ -10,14 +10,17 @@ from .models import (
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     MIN_SHORT_ID_LENGTH,
     TOOL_RESULT_TRUNCATE_NOTICE,
+    MemoryRecord,
     SessionKey,
     SessionMessage,
     SessionMeta,
     SessionSummary,
     ms_to_iso,
+    new_memory_record,
     utc_now_ms,
 )
-from .store import SessionStore
+from .noop import NoopLongTermStore
+from .store import LongTermStore, SessionStore
 
 __all__ = [
     "DEFAULT_MAX_TOOL_RESULT_CHARS",
@@ -25,7 +28,10 @@ __all__ = [
     "TOOL_RESULT_TRUNCATE_NOTICE",
     "InvalidSessionKeyError",
     "JsonlSessionStore",
+    "LongTermStore",
+    "MemoryRecord",
     "MemoryStoreError",
+    "NoopLongTermStore",
     "SessionKey",
     "SessionMessage",
     "SessionMeta",
@@ -33,5 +39,6 @@ __all__ = [
     "SessionStoreError",
     "SessionSummary",
     "ms_to_iso",
+    "new_memory_record",
     "utc_now_ms",
 ]

@@ -19,7 +19,7 @@
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,10 @@ class ContextBuilder:
             非空时在 System Prompt 末尾追加 "## 可用技能" 章节
         memory_path: 长期记忆文件路径(默认 ``<workspace>/memory/MEMORY.md``);
             由装配层传入 ``<memory_dir>/MEMORY.md``, 读取后注入 System Prompt
+        long_term_provider: 结构化长期记忆召回注入点(M6 预留): 无参可调用对象,
+            返回要拼进 System Prompt 的召回文本; None 或返回空字符串时不输出章节。
+            由于 ``build_system_prompt`` 是同步方法, provider 必须是同步可调用对象;
+            真实后端可在装配层预先异步 recall 后再注入。
 
     注意:
         - 每次 build_system_prompt() 都重新读盘, 因此运行中修改人设/记忆会立即生效;
@@ -67,6 +71,7 @@ class ContextBuilder:
         identity_path: Union[str, Path],
         skills_summary: str = "",
         memory_path: Optional[Union[str, Path]] = None,
+        long_term_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.identity_path = Path(identity_path).expanduser().resolve()
@@ -78,6 +83,8 @@ class ContextBuilder:
             if memory_path is not None
             else self.workspace / MEMORY_RELATIVE_PATH
         )
+        # 结构化长期记忆的同步注入点(v1 默认 None: Prompt 行为不变)
+        self.long_term_provider = long_term_provider
 
     def __repr__(self) -> str:
         return (
@@ -115,6 +122,17 @@ class ContextBuilder:
             return DEFAULT_IDENTITY
         return content
 
+    def _load_long_term(self) -> str:
+        """调用注入的结构化长期记忆 provider; 失败/为空返回空字符串(fail-soft)."""
+        if self.long_term_provider is None:
+            return ""
+        try:
+            recalled = self.long_term_provider()
+        except Exception as exc:  # noqa: BLE001 provider 由外部注入, 不能让它炸掉 Prompt 构建
+            logger.warning("长期记忆召回失败, 本次忽略: %r", exc)
+            return ""
+        return recalled.strip() if isinstance(recalled, str) else ""
+
     def _load_memory(self) -> str:
         """读取工作区长期记忆; 不存在或不可读时返回空字符串."""
         try:
@@ -140,6 +158,10 @@ class ContextBuilder:
         memory = self._load_memory()
         if memory:  # 无记忆内容时不输出空的长期记忆章节
             sections.append(f"## 长期记忆\n{memory}")
+
+        recalled = self._load_long_term()
+        if recalled:  # M6 注入点: 结构化长期记忆召回(默认空, Prompt 行为不变)
+            sections.append(f"## 长期记忆召回\n{recalled}")
 
         if self.skills_summary:  # 无技能时不输出空章节
             sections.append(f"## 可用技能\n{self.skills_summary}")

@@ -6,7 +6,13 @@ v1 只提供 JSONL 实现(``JsonlSessionStore``); 未来 SQLite/MySQL 后端实�
 
 from typing import Optional, Protocol, Sequence, runtime_checkable
 
-from .models import SessionKey, SessionMessage, SessionMeta, SessionSummary
+from .models import (
+    MemoryRecord,
+    SessionKey,
+    SessionMessage,
+    SessionMeta,
+    SessionSummary,
+)
 
 
 @runtime_checkable
@@ -52,4 +58,39 @@ class SessionStore(Protocol):
 
     async def close(self) -> None:
         """释放资源; 关闭后调用其他方法应报错."""
+        ...
+
+
+@runtime_checkable
+class LongTermStore(Protocol):
+    """结构化长期记忆仓储(未来后端: JSONL/SQLite/MySQL...).
+
+    v1 由 ``NoopLongTermStore`` 占位; 命名空间约定:
+    ``user:default``(当前唯一用户) -> 未来 ``user:<id>`` / ``group:<id>``。
+    """
+
+    async def recall(
+        self,
+        namespace: str,
+        *,
+        query: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[MemoryRecord]:
+        """按命名空间召回记忆; query 为空时返回最近的若干条."""
+        ...
+
+    async def remember(self, namespace: str, record: MemoryRecord) -> MemoryRecord:
+        """写入/更新一条记忆, 返回最终记录(包含 store 可能补全的字段)."""
+        ...
+
+    async def forget(self, namespace: str, record_id: str) -> None:
+        """按 id 删除一条记忆(幂等)."""
+        ...
+
+    async def list_namespaces(self) -> list[str]:
+        """列出已有命名空间(调试/管理用)."""
+        ...
+
+    async def close(self) -> None:
+        """释放资源."""
         ...

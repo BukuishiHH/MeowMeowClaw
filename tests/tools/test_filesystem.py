@@ -610,3 +610,107 @@ class TestPathHardening:
             result = await ListDirTool(workspace).execute(dir_path=None)
 
         assert result.startswith(prefix)
+
+
+# ----------------------------------------------------- 记忆目录策略与备份(M5)
+
+
+class TestMemoryProtection:
+    @pytest.fixture
+    def memory_workspace(self, tmp_path) -> str:
+        workspace = tmp_path / "ws"
+        memory = workspace / "memory"
+        for name in ("sessions", "active", "archive"):
+            (memory / name).mkdir(parents=True)
+        (memory / "sessions" / "s.jsonl").write_text("secret", encoding="utf-8")
+        (memory / "MEMORY.md").write_text("v1 笔记", encoding="utf-8")
+        return str(workspace)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "relative_path", ["memory/sessions/s.jsonl", "memory/active/x.jsonl", "memory/archive/y.jsonl"]
+    )
+    async def test_runtime_memory_paths_are_denied(self, memory_workspace, relative_path):
+        read_result = await ReadFileTool(memory_workspace).execute(file_path=relative_path)
+        write_result = await WriteFileTool(memory_workspace).execute(
+            file_path=relative_path, content="pwned"
+        )
+        list_result = await ListDirTool(memory_workspace).execute(
+            dir_path=os.path.dirname(relative_path)
+        )
+
+        assert "[安全拦截] 禁止读取记忆运行时目录" in read_result
+        assert "[安全拦截] 禁止写入记忆运行时目录" in write_result
+        assert "[安全拦截] 禁止列举记忆运行时目录" in list_result
+
+    @pytest.mark.asyncio
+    async def test_memory_root_listing_is_denied(self, memory_workspace):
+        result = await ListDirTool(memory_workspace).execute(dir_path="memory")
+
+        assert "[安全拦截] 禁止列举记忆运行时目录" in result
+
+    @pytest.mark.asyncio
+    async def test_memory_file_is_readable_and_writable_with_backup(self, memory_workspace):
+        read_result = await ReadFileTool(memory_workspace).execute(file_path="memory/MEMORY.md")
+        assert read_result == "v1 笔记"
+
+        write_result = await WriteFileTool(memory_workspace).execute(
+            file_path="memory/MEMORY.md", content="v2 笔记"
+        )
+
+        assert "长期记忆已写入" in write_result
+        assert (Path(memory_workspace) / "memory" / "MEMORY.md").read_text(
+            encoding="utf-8"
+        ) == "v2 笔记"
+        assert (Path(memory_workspace) / "memory" / "MEMORY.md.bak").read_text(
+            encoding="utf-8"
+        ) == "v1 笔记"
+
+    @pytest.mark.asyncio
+    async def test_backup_is_single_rolling(self, memory_workspace):
+        await WriteFileTool(memory_workspace).execute(
+            file_path="memory/MEMORY.md", content="v2"
+        )
+        await WriteFileTool(memory_workspace).execute(
+            file_path="memory/MEMORY.md", content="v3"
+        )
+
+        backup = Path(memory_workspace) / "memory" / "MEMORY.md.bak"
+        assert backup.read_text(encoding="utf-8") == "v2"
+
+    @pytest.mark.asyncio
+    async def test_first_write_creates_no_backup(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        result = await WriteFileTool(str(workspace)).execute(
+            file_path="memory/MEMORY.md", content="首次写入"
+        )
+
+        assert "长期记忆已写入" in result
+        assert not (workspace / "memory" / "MEMORY.md.bak").exists()
+
+    @pytest.mark.asyncio
+    async def test_backup_failure_blocks_write(self, memory_workspace, monkeypatch):
+        def boom(*args, **kwargs):
+            raise OSError(13, "Permission denied")
+
+        monkeypatch.setattr("meowmeowclaw.tools.filesystem.shutil.copyfile", boom)
+
+        result = await WriteFileTool(memory_workspace).execute(
+            file_path="memory/MEMORY.md", content="v9"
+        )
+
+        assert "[写入文件异常]" in result
+        assert (Path(memory_workspace) / "memory" / "MEMORY.md").read_text(
+            encoding="utf-8"
+        ) == "v1 笔记"
+
+    @pytest.mark.asyncio
+    async def test_other_memory_files_are_not_backed_up(self, memory_workspace):
+        result = await WriteFileTool(memory_workspace).execute(
+            file_path="memory/notes.md", content="普通笔记"
+        )
+
+        assert result == "[成功] 文件已写入: memory/notes.md"
+        assert not (Path(memory_workspace) / "memory" / "notes.md.bak").exists()

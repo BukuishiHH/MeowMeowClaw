@@ -1,15 +1,21 @@
 """工作区文件工具: read_file / write_file / list_dir.
 
-路径防护集中在本模块顶部的 ``resolve_in_workspace()``:
-先归一化绝对路径, 再用 ``os.path.commonpath`` 判定是否落在工作区内,
-因此同前缀兄弟目录(如 ``/tmp/ws_evil`` vs ``/tmp/ws``)不会被误放行;
-非法路径在触达任何文件系统调用之前就被拦截。
+防护分两层:
+- 工作区路径校验: 先归一化绝对路径, 再用 ``os.path.commonpath`` 判定 (见 ``resolve_in_workspace``);
+- 记忆目录策略(D27): ``<memory_dir>/sessions|active|archive`` 对三件套全禁;
+  ``memory/MEMORY.md`` 可读可写, 且 ``write_file`` 覆盖前会把上一版滚动备份为
+  ``MEMORY.md.bak``(D32), 避免模型一次覆盖清空长期记忆。
 """
 
 import os
-from typing import Any
+import shutil
+from typing import Any, Optional, Union
 
 from .base import BaseTool
+
+MEMORY_FILE_NAME = "MEMORY.md"
+MEMORY_BACKUP_NAME = "MEMORY.md.bak"
+RUNTIME_MEMORY_DIRS = ("sessions", "active", "archive")
 
 
 class PathOutsideWorkspaceError(ValueError):
@@ -42,15 +48,84 @@ def resolve_in_workspace(workspace: str, user_path: Any) -> str:
     return candidate
 
 
-class ReadFileTool(BaseTool):
-    """
-    读取本地文件工具, 带工作区路径防护, 超长内容自动截断
-    Args:
-        workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
-    """
+def is_within(path: str, base: str) -> bool:
+    """path 是否落在 base 内(commonpath 判定, 防同前缀兄弟目录绕过)."""
+    try:
+        return os.path.commonpath(
+            [os.path.abspath(path), os.path.abspath(base)]
+        ) == os.path.abspath(base)
+    except ValueError:  # Windows 跨盘符
+        return False
 
-    def __init__(self, workspace: str):
-        self.workspace = os.path.abspath(workspace)
+
+def is_memory_denied(absolute_path: str, memory_dir: str, *, listing: bool = False) -> bool:
+    """
+    判断路径是否命中记忆运行时目录禁令.
+
+    - ``memory/sessions|active|archive`` 及其子路径: 读写列举全禁;
+    - ``memory`` 根目录: 仅列举时拒绝(读写本身会因"IsADirectory"失败);
+    - 其他路径(含 ``memory/MEMORY.md``): 放行。
+    """
+    if not is_within(absolute_path, memory_dir):
+        return False
+    relative = os.path.relpath(absolute_path, memory_dir)
+    if relative in (os.curdir, ""):
+        return listing
+    top = relative.split(os.sep, 1)[0]
+    return top in RUNTIME_MEMORY_DIRS
+
+
+def memory_file_path(memory_dir: str) -> str:
+    """长期记忆文件路径 ``<memory_dir>/MEMORY.md``."""
+    return os.path.join(memory_dir, MEMORY_FILE_NAME)
+
+
+def backup_existing_memory(memory_path: str, backup_path: Optional[str] = None) -> None:
+    """
+    把现有长期记忆滚动备份为 ``MEMORY.md.bak``(单份覆盖).
+
+    文件不存在则什么都不做; 备份失败会向上抛 OSError, 由调用方决定是否阻止写入。
+    """
+    if not os.path.isfile(memory_path):
+        return
+    target = backup_path or os.path.join(
+        os.path.dirname(memory_path), MEMORY_BACKUP_NAME
+    )
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copyfile(memory_path, target)
+
+
+class _MemoryAwareTool(BaseTool):
+    """带工作区 + 记忆目录策略的工具基类(仅内部复用)."""
+
+    def __init__(
+        self,
+        workspace: Union[str, os.PathLike],
+        memory_dir: Optional[Union[str, os.PathLike]] = None,
+    ) -> None:
+        self.workspace = os.path.abspath(os.fspath(workspace))
+        if memory_dir is None:
+            self.memory_dir = os.path.join(self.workspace, "memory")
+        else:
+            self.memory_dir = os.path.abspath(os.fspath(memory_dir))
+
+    def _denied(self, absolute_path: str, *, listing: bool = False) -> bool:
+        return is_memory_denied(absolute_path, self.memory_dir, listing=listing)
+
+    def _is_memory_file(self, absolute_path: str) -> bool:
+        return os.path.normcase(absolute_path) == os.path.normcase(
+            memory_file_path(self.memory_dir)
+        )
+
+
+class ReadFileTool(_MemoryAwareTool):
+    """
+    读取本地文件工具, 带工作区路径防护与记忆目录策略, 超长内容自动截断
+
+    Args:
+        workspace: 工作区根目录, 所有文件均限制于该目录下
+        memory_dir: 记忆目录(默认 ``<workspace>/memory``); 其运行时子目录禁止读取
+    """
 
     @property
     def name(self) -> str:
@@ -58,7 +133,7 @@ class ReadFileTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "读取工作区内指定文件的文本内容. 只能读取工作目录内文件, 路径穿越会被拦截. 文件内容超过16000字符将被截断. 当需要查看源代码、配置文件、文档内容时调用."
+        return "读取工作区内指定文件的文本内容. 只能读取工作目录内文件, 路径穿越会被拦截. 记忆运行时目录禁止读取, 长期记忆 MEMORY.md 可读. 文件内容超过16000字符将被截断. 当需要查看源代码、配置文件、文档内容时调用."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -83,6 +158,9 @@ class ReadFileTool(BaseTool):
         except Exception as exc:  # 非字符串路径等: 包装成可读文本而不是向上抛
             return f"[读取文件异常] {repr(exc)}"
 
+        if self._denied(absolute_path):
+            return f"[安全拦截] 禁止读取记忆运行时目录, 请求路径: {file_rel_path}"
+
         try:
             with open(absolute_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -98,15 +176,16 @@ class ReadFileTool(BaseTool):
             return f"[读取文件异常] {repr(e)}"
 
 
-class WriteFileTool(BaseTool):
+class WriteFileTool(_MemoryAwareTool):
     """
-    写入文件工具, 自动创建父目录, 带工作区路径防护
-    Args:
-        workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
-    """
+    写入文件工具, 自动创建父目录, 带工作区路径防护与记忆目录策略
 
-    def __init__(self, workspace: str):
-        self.workspace = os.path.abspath(workspace)
+    写 ``memory/MEMORY.md`` 时, 会先把现有内容滚动备份为 ``MEMORY.md.bak``(D32)。
+
+    Args:
+        workspace: 工作区根目录, 所有文件均限制于该目录下
+        memory_dir: 记忆目录(默认 ``<workspace>/memory``)
+    """
 
     @property
     def name(self) -> str:
@@ -114,7 +193,7 @@ class WriteFileTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "向工作区内写入文本文件, 会覆盖原有内容. 自动创建不存在的父文件夹. 路径穿越会被拦截. 用于新建、修改代码、保存配置和文档."
+        return "向工作区内写入文本文件, 会覆盖原有内容. 自动创建不存在的父文件夹. 路径穿越会被拦截. 记忆运行时目录禁止写入; 覆盖长期记忆 MEMORY.md 前会自动备份上一版. 用于新建、修改代码、保存配置和文档."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -144,11 +223,19 @@ class WriteFileTool(BaseTool):
         except Exception as exc:
             return f"[写入文件异常] {repr(exc)}"
 
+        if self._denied(absolute_path):
+            return f"[安全拦截] 禁止写入记忆运行时目录, 请求路径: {file_rel_path}"
+
         try:
+            if self._is_memory_file(absolute_path):
+                # 备份失败则不写入, 避免无保护地清空长期记忆
+                backup_existing_memory(absolute_path)
             parent_dir = os.path.dirname(absolute_path)
             os.makedirs(parent_dir, exist_ok=True)
             with open(absolute_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            if self._is_memory_file(absolute_path):
+                return f"[成功] 长期记忆已写入(上一版备份为 {MEMORY_BACKUP_NAME}): {file_rel_path}"
             return f"[成功] 文件已写入: {file_rel_path}"
         except IsADirectoryError:
             return f"[错误] 目标路径是目录, 不能作为文件: {absolute_path}"
@@ -156,15 +243,14 @@ class WriteFileTool(BaseTool):
             return f"[写入文件异常] {repr(e)}"
 
 
-class ListDirTool(BaseTool):
+class ListDirTool(_MemoryAwareTool):
     """
-    列出目录内容, 带工作区防护, 目录末尾加/, 附带文件大小, 名称排序
-    Args:
-        workspace: 工作区根目录的绝对路径, 所有文件均限制于该目录下
-    """
+    列出目录内容, 带工作区防护与记忆目录策略, 目录末尾加/, 附带文件大小, 名称排序
 
-    def __init__(self, workspace: str):
-        self.workspace = os.path.abspath(workspace)
+    Args:
+        workspace: 工作区根目录, 所有文件均限制于该目录下
+        memory_dir: 记忆目录(默认 ``<workspace>/memory``); 根目录与运行时子目录禁止列举
+    """
 
     @property
     def name(self) -> str:
@@ -172,7 +258,7 @@ class ListDirTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "列出工作区内指定目录下的文件和子目录. 目录名称末尾会附加/, 并附带文件字节大小, 结果按名称升序排序. 路径穿越会被拦截. 浏览项目结构、查找文件时调用."
+        return "列出工作区内指定目录下的文件和子目录. 目录名称末尾会附加/, 并附带文件字节大小, 结果按名称升序排序. 路径穿越会被拦截. 记忆运行时目录禁止列举. 浏览项目结构、查找文件时调用."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -196,6 +282,9 @@ class ListDirTool(BaseTool):
             return f"[安全拦截] 禁止列出工作区外目录, 请求路径: {dir_rel_path}"
         except Exception as exc:
             return f"[列举目录异常] {repr(exc)}"
+
+        if self._denied(absolute_path, listing=True):
+            return f"[安全拦截] 禁止列举记忆运行时目录, 请求路径: {dir_rel_path}"
 
         if not os.path.isdir(absolute_path):
             return f"[错误] 路径不是有效目录: {absolute_path}"

@@ -8,6 +8,7 @@
     builder = ContextBuilder(
         workspace=Path("/path/to/workspace"),
         identity_path=Path("/path/to/identity.md"),
+        memory_path=Path("/path/to/workspace/memory/MEMORY.md"),  # 可选
     )
     messages = builder.build_messages(history=history, current_message="帮我改个 bug")
 
@@ -25,8 +26,18 @@ logger = logging.getLogger(__name__)
 # 人设文件不可用时的兜底人设
 DEFAULT_IDENTITY = "你是 MeowMeowClaw, 一个善解人意的 AI 助手, 可以调用工具帮用户读写文件、分析代码."
 
-# 长期记忆文件相对工作区的位置(预留能力: 放入该文件后会自动进入 System Prompt)
+# 未显式传 memory_path 时的默认位置(与默认 memory_dir 一致)
 MEMORY_RELATIVE_PATH = Path("memory") / "MEMORY.md"
+
+# 长期记忆维护约定: 注入 System Prompt, 让模型以"先读后写、保留旧内容"的方式维护 MEMORY.md
+LONG_TERM_MEMORY_GUIDE = (
+    "## 长期记忆维护约定\n"
+    "- 长期记忆文件: {memory_path}(跨渠道共享, 通过 write_file 维护)\n"
+    "- 修改前必须先 read_file 读取当前内容, 合并/追加后整体写回, 不得清空已有笔记\n"
+    "- 只记录稳定、可复用的事实/偏好, 不记录临时对话细节\n"
+    "- 不要写入密钥、密码等敏感信息\n"
+    "- 覆盖写入时系统会自动把上一版备份为 MEMORY.md.bak"
+)
 
 # 当前时间格式: 2025-03-05 09:08 (Wednesday)
 TIME_FORMAT = "%Y-%m-%d %H:%M (%A)"
@@ -42,6 +53,8 @@ class ContextBuilder:
                        相对路径按进程当前工作目录解析
         skills_summary: 技能摘要文本(来自 SkillCatalog.summary());
             非空时在 System Prompt 末尾追加 "## 可用技能" 章节
+        memory_path: 长期记忆文件路径(默认 ``<workspace>/memory/MEMORY.md``);
+            由装配层传入 ``<memory_dir>/MEMORY.md``, 读取后注入 System Prompt
 
     注意:
         - 每次 build_system_prompt() 都重新读盘, 因此运行中修改人设/记忆会立即生效;
@@ -53,22 +66,30 @@ class ContextBuilder:
         workspace: Union[str, Path],
         identity_path: Union[str, Path],
         skills_summary: str = "",
+        memory_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.identity_path = Path(identity_path).expanduser().resolve()
         # 技能摘要由调用方(如 bootstrap.build_application)注入, ContextBuilder 不关心技能从哪来
         self.skills_summary = skills_summary
+        # 长期记忆路径同样由装配层传入; 未传时回退默认 workspace/memory/MEMORY.md
+        self._memory_path = (
+            Path(memory_path).expanduser().resolve()
+            if memory_path is not None
+            else self.workspace / MEMORY_RELATIVE_PATH
+        )
 
     def __repr__(self) -> str:
         return (
             f"<ContextBuilder workspace={str(self.workspace)!r} "
-            f"identity_path={str(self.identity_path)!r}>"
+            f"identity_path={str(self.identity_path)!r} "
+            f"memory_path={str(self.memory_path)!r}>"
         )
 
     @property
     def memory_path(self) -> Path:
-        """长期记忆文件路径: workspace/memory/MEMORY.md"""
-        return self.workspace / MEMORY_RELATIVE_PATH
+        """长期记忆文件路径(由装配层传入, 默认 workspace/memory/MEMORY.md)."""
+        return self._memory_path
 
     # ------------------------------------------------------------------ 私有加载
 
@@ -108,15 +129,16 @@ class ContextBuilder:
     # ------------------------------------------------------------------ 对外方法
 
     def build_system_prompt(self) -> str:
-        """拼接完整 System Prompt: 人设 + 当前时间 + 工作区 + 长期记忆 + 可用技能(后两者非空才拼)."""
+        """拼接完整 System Prompt: 人设 + 时间 + 工作区 + 记忆约定 + 长期记忆 + 技能."""
         sections = [
             self._load_identity(),
             f"## 当前时间\n{self._format_now()}",
             f"## 工作区\n所有文件操作都限制在工作区目录内, 根目录: {self.workspace}",
+            LONG_TERM_MEMORY_GUIDE.format(memory_path=self.memory_path),
         ]
 
         memory = self._load_memory()
-        if memory:  # 预留能力: 无记忆时不输出空章节
+        if memory:  # 无记忆内容时不输出空的长期记忆章节
             sections.append(f"## 长期记忆\n{memory}")
 
         if self.skills_summary:  # 无技能时不输出空章节

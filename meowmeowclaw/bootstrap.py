@@ -59,9 +59,9 @@ def build_registry(config: Settings) -> ToolRegistry:
     from meowmeowclaw.tools.web_search import WebSearchTool
 
     registry = ToolRegistry()
-    registry.register(ReadFileTool(config.workspace))
-    registry.register(WriteFileTool(config.workspace))
-    registry.register(ListDirTool(config.workspace))
+    registry.register(ReadFileTool(config.workspace, config.memory_dir))
+    registry.register(WriteFileTool(config.workspace, config.memory_dir))
+    registry.register(ListDirTool(config.workspace, config.memory_dir))
     registry.register(ExecTool(config.workspace))
     registry.register(WebSearchTool())
     registry.register(WebFetchTool())
@@ -110,7 +110,10 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         logger.warning("未发现内置技能, load_skill 不会注册")
 
     context = ContextBuilder(
-        config.workspace, IDENTITY_FILE, skills_summary=skills_summary
+        config.workspace,
+        IDENTITY_FILE,
+        skills_summary=skills_summary,
+        memory_path=config.memory_dir / "MEMORY.md",
     )
 
     # 每个会话一个 AgentLoop: 工具调用护栏按会话隔离; 共享同一 Provider/Registry/Context

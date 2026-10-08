@@ -162,6 +162,10 @@ class TestBuildApplication:
         assert app.session_store.root == config.memory_dir
         assert app.session_store.sessions_dir.is_dir()
         assert app.conversation.store is app.session_store
+        # 文件工具与 ContextBuilder 都拿到了配置的记忆目录
+        assert app.registry._tools["read_file"].memory_dir == str(config.memory_dir)  # noqa: SLF001
+        assert app.registry._tools["write_file"].memory_dir == str(config.memory_dir)  # noqa: SLF001
+        assert app.context.memory_path == config.memory_dir / "MEMORY.md"
         assert app.conversation.max_turns == config.memory_max_turns
         assert app.conversation.max_chars == config.memory_max_chars
 

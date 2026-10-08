@@ -268,14 +268,37 @@ class TestBuildSystemPrompt:
         with patch(f"{MODULE}.datetime", freeze_time(FROZEN)):
             prompt = builder.build_system_prompt()
 
-        assert "## 长期记忆" in prompt
+        assert "## 长期记忆\n" in prompt
         assert "记住: 用户喜欢猫" in prompt
 
     def test_no_empty_memory_section_when_memory_absent(self, builder):
         with patch(f"{MODULE}.datetime", freeze_time(FROZEN)):
             prompt = builder.build_system_prompt()
 
-        assert "## 长期记忆" not in prompt
+        assert "## 长期记忆\n" not in prompt
+
+    def test_long_term_memory_guide_is_always_present(self, builder):
+        prompt = builder.build_system_prompt()
+
+        assert "## 长期记忆维护约定" in prompt
+        assert str(builder.memory_path) in prompt
+        assert "先 read_file" in prompt
+        assert "MEMORY.md.bak" in prompt
+
+    def test_custom_memory_path_is_used(self, workspace, identity, tmp_path):
+        custom_memory = tmp_path / "custom-memory" / "MEMORY.md"
+        custom_memory.parent.mkdir(parents=True)
+        custom_memory.write_text("自定义长期记忆", encoding="utf-8")
+        default_memory_dir = workspace / "memory"
+        default_memory_dir.mkdir()
+        (default_memory_dir / "MEMORY.md").write_text("默认位置记忆", encoding="utf-8")
+
+        b = ContextBuilder(workspace, identity, memory_path=custom_memory)
+        prompt = b.build_system_prompt()
+
+        assert b.memory_path == custom_memory.resolve()
+        assert "自定义长期记忆" in prompt
+        assert "默认位置记忆" not in prompt
 
     def test_acceptance_contains_identity_content_and_current_datetime(self, builder, identity):
         """验收标准: build_system_prompt() 同时含真实人设内容与当前日期时间."""
@@ -428,4 +451,4 @@ class TestRealFilesystem:
 
         prompt = builder.build_system_prompt()
 
-        assert "## 长期记忆" not in prompt
+        assert "## 长期记忆\n" not in prompt

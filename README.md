@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 25 个源码模块 / 约 4300 行; 测试 19 个文件 / **737 个用例**(729 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 25 个源码模块 / 约 4400 行; 测试 19 个文件 / **748 个用例**(740 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -56,9 +56,9 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 
 | 工具 | 能力 | 关键限制 |
 | --- | --- | --- |
-| `read_file` | 读工作区内文本文件 | 越界拦截; 超过 16000 字符截断 |
-| `write_file` | 写文件(自动建父目录) | 越界拦截 |
-| `list_dir` | 列目录(目录加 `/`、文件带字节大小、按名排序) | 越界拦截 |
+| `read_file` | 读工作区内文本文件 | 越界/记忆运行时目录拦截; 长期记忆 `MEMORY.md` 可读; 超过 16000 字符截断 |
+| `write_file` | 写文件(自动建父目录) | 越界/记忆运行时目录拦截; 覆盖 `MEMORY.md` 前自动备份上一版 |
+| `list_dir` | 列目录(目录加 `/`、文件带字节大小、按名排序) | 越界/记忆运行时目录拦截 |
 | `exec` | 在工作区执行 Shell 命令 | 60 秒超时; 危险命令黑名单; 输出 10000 字符截断 |
 | `web_search` | DuckDuckGo 联网搜索 | 默认 5 条(上限 20); 20 秒超时; 输出 8000 字符截断 |
 | `web_fetch` | 抓取 URL 并转纯文本 | 仅 http/https; **拒绝内网/回环地址**; 15 秒超时; 输出 12000 字符截断 |
@@ -123,7 +123,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/llm/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
 | `meowmeowclaw/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
 | `meowmeowclaw/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
-| `meowmeowclaw/tools/filesystem.py` | 217 | 本地文件读写/列目录; 路径防护统一实现(commonpath) | `ReadFileTool` / `WriteFileTool` / `ListDirTool` / `resolve_in_workspace` |
+| `meowmeowclaw/tools/filesystem.py` | 306 | 文件三件套; 工作区路径防护 + 记忆目录策略 + MEMORY.md 备份 | `ReadFileTool` / `WriteFileTool` / `ListDirTool` / `resolve_in_workspace` |
 | `meowmeowclaw/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
 | `meowmeowclaw/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
 | `meowmeowclaw/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
@@ -133,7 +133,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/memory/models.py` | 266 | 会话数据模型: canonical key / storage_id / 消息投影 | `SessionKey` / `SessionMessage` / `SessionMeta` / `SessionSummary` |
 | `meowmeowclaw/memory/store.py` | 55 | 短期记忆仓储抽象接口(async Protocol) | `SessionStore` |
 | `meowmeowclaw/memory/jsonl.py` | 510 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID | `JsonlSessionStore` |
-| `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
+| `meowmeowclaw/agent/context.py` | 172 | System Prompt: 人设/时间/工作区/记忆约定/长期记忆/技能 | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
 | `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
@@ -248,6 +248,10 @@ SSRF 防护)与推荐用法写成指南 —— 技能随代码入库、随包分
 再用 `os.path.commonpath` 判定是否落在工作区内, 越界返回 `[安全拦截] ...`;
 同前缀兄弟目录(`/ws_evil` vs `/ws`)不会再被误放行, 非字符串路径也会被包装成可读文本.
 
+记忆目录策略(M5): `<memory_dir>/sessions|active|archive` 对读/写/列举全部拦截;
+`memory/MEMORY.md` 允许读写, 且 `write_file` 覆盖前会先把上一版滚动备份为 `MEMORY.md.bak`;
+System Prompt 同时注入"先 read 后 write、保留旧内容、不写敏感信息"的长期记忆维护约定。
+
 ### 5.2 命令执行防护(`exec`)
 
 17 条正则黑名单(`re.IGNORECASE`)覆盖递归删除 / 格式化 / 关机重启 / 提权 / 覆盖设备文件 / 下载即执行 / 反弹 shell / Fork 炸弹等; 命中即返回 `安全拦截: 检测到危险命令模式 '...'`, **不创建任何进程**. 超时清理优先杀**整个进程组**(`start_new_session` + `killpg`), 并带**自杀保护**: 若子进程与父进程同组则退化为杀单进程, 避免误杀调用方.
@@ -360,7 +364,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 729 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 740 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -374,7 +378,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | --- | ---: | --- |
 | `test_bootstrap.py` | 12 | 装配(工具/技能/Context/Loop)、ConfigError/SkillConfigError、导入边界 |
 | `test_cli.py` | 25 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码 |
-| `agent/test_context.py` | 40 | 人设单路径读取与回退、时间实时取值、记忆/技能章节 |
+| `agent/test_context.py` | 42 | 人设读取、时间、记忆约定/自定义 memory_path、技能章节 |
 | `agent/test_loop.py` | 41 | 消息格式、防爆阈值、run_turn 历史快照/完成态、max_iterations 注入 |
 | `skills/test_catalog.py` | 36 | frontmatter 边界、索引/摘要、坏 YAML 跳过、重名报错、内置资源可发现 |
 | `skills/test_tool.py` | 30 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
@@ -384,7 +388,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `channels/test_qq_private.py` | 15 | QQ active 指针/6h 轮换/重启恢复/命令/跨渠道删除 |
 | `tools/test_base.py` | 3 | 工具基类抽象约束 |
 | `tools/test_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
-| `tools/test_filesystem.py` | 91 | 三件套读写/截断/异常分支、resolve_in_workspace、同前缀绕过回归 |
+| `tools/test_filesystem.py` | 100 | 三件套读写/截断、路径防护、记忆目录策略与 MEMORY.md 备份 |
 | `tools/test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
 | `tools/test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
 | `tools/test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
@@ -410,12 +414,12 @@ MeowMeowClaw/
     ├── cli.py                   # 交付层: banner / REPL / 会话命令 / 退出码
     ├── __main__.py              # python -m meowmeowclaw -> cli.main()
     ├── agent/
-    │   ├── context.py           # System Prompt / messages
+    │   ├── context.py           # System Prompt(含长期记忆维护约定)
     │   └── loop.py              # AgentLoop 控制流
     ├── tools/                   # 工具框架 + 内置工具
     │   ├── base.py              # BaseTool 契约
     │   ├── registry.py          # ToolRegistry 注册/路由
-    │   ├── filesystem.py        # 三件套 + resolve_in_workspace()
+    │   ├── filesystem.py        # 三件套 + 路径防护 + 记忆目录策略/备份
     │   ├── shell.py             # ExecTool
     │   ├── web_search.py        # WebSearchTool
     │   └── web_fetch.py         # WebFetchTool
@@ -440,7 +444,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- 记忆系统已完成 M1-M4(存储层 + 编排 + CLI + QQ 私聊服务层), QQ 的 **OneBot/NapCat 传输适配器**尚未接入; 无流式输出与多 Agent 编排
+- 记忆系统已完成 M1-M5(存储层 + 编排 + CLI + QQ 私聊服务层 + MEMORY.md 长期记忆约定/备份), QQ 的 **OneBot/NapCat 传输适配器**尚未接入; 无流式输出与多 Agent 编排
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入), 结构化 `LongTermStore` 待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
 - 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(命令黑名单绕过、抓取重定向/重绑定、provider 契约边界)

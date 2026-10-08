@@ -19,8 +19,8 @@ import logging
 from typing import Any, Optional
 
 from meowmeowclaw.agent.context import ContextBuilder
+from meowmeowclaw.llm.base import FINISH_REASON_ERROR, LLMProvider, LLMResponse
 from meowmeowclaw.tools.registry import ToolRegistry
-from meowmeowclaw.providers.base import FINISH_REASON_ERROR, LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class AgentLoop:
     工具调用型 Agent 主循环
 
     Args:
-        provider: LLM Provider(providers.base.LLMProvider 的实现)
+        provider: LLM Provider(llm.base.LLMProvider 的实现)
         tools: 工具注册表
         context: System Prompt / messages 构建器
         model: 按次覆盖 provider 的默认模型; None 表示用 provider 自己的默认模型

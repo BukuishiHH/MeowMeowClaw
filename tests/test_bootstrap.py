@@ -20,8 +20,8 @@ from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.bootstrap import Application, ConfigError, build_application
 from meowmeowclaw.config import Settings
+from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
 from meowmeowclaw.paths import IDENTITY_FILE, PROJECT_ROOT
-from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
 from meowmeowclaw.skills import SkillConfigError
 from meowmeowclaw.tools.registry import ToolRegistry
 

@@ -19,10 +19,11 @@ OpenAI、DeepSeek、通义千问(DashScope 兼容模式)、vLLM、Ollama、One-A
 
 import json
 import logging
-from openai import AsyncOpenAI
 from typing import Any, Optional
 
-from meowmeowclaw.providers.base import (
+from openai import AsyncOpenAI
+
+from meowmeowclaw.llm.base import (
     FINISH_REASON_ERROR,
     FINISH_REASON_STOP,
     LLMProvider,

@@ -10,24 +10,21 @@
 运行: pytest tests/test_web_fetch.py -v
 """
 
-import asyncio
 import os
-import re
-from typing import Any, Optional
-from unittest.mock import MagicMock
+from typing import Any
 
 import httpx
 import pytest
 
 import meowmeowclaw.tools.web_fetch as fetch_module
 from meowmeowclaw.tools import BaseTool
-from meowmeowclaw.tools.web_fetch import WebFetchTool
 from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.tools.web_fetch import (
     EMPTY_NOTICE,
     MAX_OUTPUT_CHARS,
     TRUNCATE_NOTICE,
     USER_AGENT,
+    WebFetchTool,
 )
 
 PUBLIC_IP = "93.184.216.34"  # 任意公网地址, 仅用于打桩解析结果

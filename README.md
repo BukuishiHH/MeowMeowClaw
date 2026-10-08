@@ -1,5 +1,7 @@
 # MeowMeowClaw
 
+[![CI](https://github.com/BukuishiHH/MeowMeowClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/BukuishiHH/MeowMeowClaw/actions/workflows/ci.yml)
+
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
@@ -76,7 +78,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
             │                         │                          │            
 ┌───────────────────────┐ ┌───────────────────────┐ ┌────────────────────────┐
 │ 提示词层              │ │ 能力层  tools/ (6+1)  │ │ 模型接入层             │
-│ context.py            │ │ 本地: 读/写/列目录    │ │ providers/             │
+│ context.py            │ │ 本地: 读/写/列目录    │ │ llm/                  │
 │ ContextBuilder        │ │ 执行: exec(黑名单)    │ │ LLMProvider (ABC)      │
 │ build_system_prompt() │ │ 联网: search / fetch  │ │ OpenAICompatProvider   │
 │ build_messages()      │ │ 技能: load_skill      │ │ → AsyncOpenAI          │
@@ -99,7 +101,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 4. 若无工具调用: 追加最终 assistant 消息 → 整轮写入 `_session_history` → 返回文本
 5. 超过 `max_iterations` 返回超时提示; `finish_reason=="error"` 返回错误文本
 
-**依赖方向单向**: `main → loop → context / tools / providers → config`, 无循环依赖.
+**依赖方向单向**: `cli → bootstrap → agent / skills / tools / llm`; `config` / `paths` 只被装配层与技能扫描使用, 契约层(`tools/base.py`、`llm/base.py`)零上游依赖, 无循环依赖.
 
 ---
 
@@ -109,8 +111,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | --- | ---: | --- | --- |
 | `meowmeowclaw/config.py` | 141 | 读 `.env`、校验兜底, 纯解析不产生副作用 | `load_config()` / `Settings` |
 | `meowmeowclaw/paths.py` | 40 | 项目根 / `.env` / workspace / 人设路径的唯一来源 | `PROJECT_ROOT` / `resolve_workspace()` / `IDENTITY_FILE` |
-| `meowmeowclaw/providers/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
-| `meowmeowclaw/providers/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
+| `meowmeowclaw/llm/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
+| `meowmeowclaw/llm/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
 | `meowmeowclaw/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
 | `meowmeowclaw/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
 | `meowmeowclaw/tools/filesystem.py` | 217 | 本地文件读写/列目录; 路径防护统一实现(commonpath) | `ReadFileTool` / `WriteFileTool` / `ListDirTool` / `resolve_in_workspace` |
@@ -255,10 +257,10 @@ SSRF 防护)与推荐用法写成指南 —— 技能随代码入库、随包分
 | --- | --- | --- |
 | `shell.py` | 黑名单是**护栏不是沙箱** | `rm --recursive -f`、`find -delete`、`python -c`、`base64\|sh` 等可绕过; 也会误报(`git commit -m "fix rm -rf bug"`) |
 | `web_fetch.py` | 只做**发起前**检查 | `follow_redirects=True` 时远端 302 跳内网仍会发出请求; 存在 DNS 重绑定窗口 |
-| `providers/base.py` | `has_tool_calls` 直接 `len()` | `tool_calls=None` 时抛 `TypeError`; `usage` 类型标注缺 `Optional` |
+| `llm/base.py` | `has_tool_calls` 直接 `len()` | `tool_calls=None` 时抛 `TypeError`; `usage` 类型标注缺 `Optional` |
 
 > `filesystem.py` 的两条旧缺口(同前缀兄弟目录绕过、非字符串路径抛异常)已修复,
-> 由 `TestPathHardening` 与 `TestResolveInWorkspace` 覆盖; 上表剩余项中 `providers/base.py` 仍以 `xfail` 跟踪。
+> 由 `TestPathHardening` 与 `TestResolveInWorkspace` 覆盖; 上表剩余项中 `llm/base.py` 仍以 `xfail` 跟踪。
 > **生产建议**: `exec` 默认不注册或加开关、放进容器/受限用户运行; 把工作区当不可信输入.
 
 ---
@@ -306,7 +308,7 @@ RUN_NETWORK_TESTS=1 pytest tests/ -m network -q     # 真实联网用例
 | **持久化 / 断点续跑** | 无内建(`_session_history` 在内存里) | 内建 checkpointer, 可从任意节点恢复 |
 | **人工审批(HITL)** | 需自行在循环里加确认步骤 | 一等公民: 中断/恢复 API |
 | **多 Agent 编排** | 需自己写调度(子 Agent 即另一个 `AgentLoop`) | 天然支持 supervisor / swarm 等拓扑 |
-| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 536 用例) | 通常要驱动图运行时, 或按节点分别测 |
+| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 633 用例) | 通常要驱动图运行时, 或按节点分别测 |
 | **调试体验** | 断点就在 `run()` 里, 栈短、易读易改 | 需要在框架抽象层之间跳转 |
 | **适合场景** | 单 Agent + 工具调用的主线业务; 想快速看懂/改控制流 | 复杂分支编排、长流程、需要暂停恢复与人工介入 |
 
@@ -332,7 +334,8 @@ class HttpGetTool(BaseTool):
                 "required": ["url"], "additionalProperties": False}
     async def execute(self, **kwargs) -> str: ...
 
-registry.register(HttpGetTool())     # 注册后模型即可见
+# 在 meowmeowclaw/bootstrap.py::build_registry() 中 import 并注册, 模型即可见:
+registry.register(HttpGetTool())
 ```
 
 **换模型 / 换服务**: 只改 `.env` 的 `model` + `base_url`; 非 OpenAI 协议则实现一个 `LLMProvider` 子类.
@@ -346,7 +349,10 @@ registry.register(HttpGetTool())     # 注册后模型即可见
 pytest                                        # 全量: 625 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
+ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
 ```
+
+CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 / 3.11 / 3.12 上执行 `ruff check` 与 `pytest`.
 
 策略: **Mock 为主、真实实现对照为辅**, 并用**变异测试**验证用例有效性(每轮改动都跑过 10~20 个变异体, 确认全被捕获).
 
@@ -400,7 +406,7 @@ MeowMeowClaw/
     │   ├── models.py            # Skill / SkillConfigError
     │   ├── tool.py              # load_skill 工具(子系统唯一出口)
     │   └── builtin/             # 6 个内置技能(每子目录一个 SKILL.md, 随包发布)
-    └── providers/               # LLMProvider - OpenAICompatProvider
+    └── llm/                     # LLMProvider - OpenAICompatProvider
 ```
 
 ---
@@ -410,7 +416,8 @@ MeowMeowClaw/
 - 会话历史仅存内存, **无持久化 / 断点续跑**; 未实现流式输出与多 Agent 编排
 - 长期记忆(`workspace/memory/MEMORY.md`)**已预留读取接口**, 尚无写入与检索
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
-- 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(路径前缀绕过、命令黑名单绕过、抓取重定向/重绑定)
+- 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(命令黑名单绕过、抓取重定向/重绑定、provider 契约边界)
 - 单实例 `AgentLoop` 不建议并发 `run()`(内部状态未加锁)
-- 工程配置见 `pyproject.toml`(依赖 / 控制台入口 / pytest); 暂无 CI 配置
+- 工程配置见 `pyproject.toml`(依赖 / 控制台入口 / pytest / ruff); CI 见 `.github/workflows/ci.yml`
+- **安装形态**: 当前以源码 / editable 安装为主; 纯 wheel 安装时 `identity.md` 不随包分发, CLI 会警告并回退内置默认人设, 默认 workspace 也位于 site-packages 旁 —— 请在 `.env` 显式配置绝对 `workspace`, 或使用 `pip install -e .`
 

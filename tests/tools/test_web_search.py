@@ -22,13 +22,13 @@ import pytest
 
 import meowmeowclaw.tools.web_search as web_module
 from meowmeowclaw.tools import BaseTool
-from meowmeowclaw.tools.web_search import WebSearchTool
 from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.tools.web_search import (
     DEFAULT_MAX_RESULTS,
     MAX_OUTPUT_CHARS,
     MAX_RESULTS_LIMIT,
     TRUNCATE_NOTICE,
+    WebSearchTool,
 )
 
 # ---------------------------------------------------------------- 联网测试开关

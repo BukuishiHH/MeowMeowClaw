@@ -1,4 +1,4 @@
-"""meowmeowclaw/providers/openai_compat.py 的 Mock 单元测试.
+"""meowmeowclaw/llm/openai_compat.py 的 Mock 单元测试.
 
 测试策略:
 - 用 ``MagicMock`` 顶替 ``AsyncOpenAI`` 客户端(``client.chat.completions.create`` 为 ``AsyncMock``),
@@ -22,9 +22,7 @@ import openai
 import pytest
 from openai.types.chat import ChatCompletion
 
-from meowmeowclaw.tools.filesystem import ReadFileTool
-from meowmeowclaw.tools.registry import ToolRegistry
-from meowmeowclaw.providers.base import (
+from meowmeowclaw.llm.base import (
     FINISH_REASON_ERROR,
     FINISH_REASON_STOP,
     FINISH_REASON_TOOL_CALLS,
@@ -32,9 +30,11 @@ from meowmeowclaw.providers.base import (
     LLMResponse,
     ToolCallRequest,
 )
-from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
+from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
+from meowmeowclaw.tools.filesystem import ReadFileTool
+from meowmeowclaw.tools.registry import ToolRegistry
 
-MODULE = "meowmeowclaw.providers.openai_compat"
+MODULE = "meowmeowclaw.llm.openai_compat"
 API_BASE = "http://localhost:8000/v1"
 MESSAGES = [{"role": "user", "content": "帮我读一下 a.py"}]
 TOOL_DEFS = [

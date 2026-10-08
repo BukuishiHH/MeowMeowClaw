@@ -13,7 +13,6 @@ from typing import Optional
 
 import pytest
 
-from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.skills import (
     DEFAULT_DESCRIPTION,
     SKILL_FILE_NAME,
@@ -22,6 +21,7 @@ from meowmeowclaw.skills import (
     SkillCatalog,
 )
 from meowmeowclaw.skills.tool import MAX_SKILL_CHARS, TRUNCATE_NOTICE
+from meowmeowclaw.tools.registry import ToolRegistry
 
 
 def write_skill(

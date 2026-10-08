@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -39,3 +40,12 @@ testpaths = ["tests"]
 markers = [
     "network: 真实联网用例(默认跳过, 需 RUN_NETWORK_TESTS=1 才运行)",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# 只开"硬错误": 语法错误 + 未定义名/未使用导入/未使用变量等 pyflakes 规则.
+# 不做格式与风格强制(项目中文注释较多, 风格规则噪音大).
+select = ["E9", "F"]

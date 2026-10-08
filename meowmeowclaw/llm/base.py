@@ -1,6 +1,6 @@
-from typing import Any, Optional
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 # finish_reason 取值约定: 前四个与 OpenAI Chat Completions 协议保持字面一致,
 # Provider 层因此可以原样透传上游返回值, 上层统一引用下列常量而不是硬编码字符串

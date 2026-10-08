@@ -15,9 +15,9 @@ from typing import Optional, Union
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.config import Settings, load_config
+from meowmeowclaw.llm.base import LLMProvider
+from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
 from meowmeowclaw.paths import IDENTITY_FILE
-from meowmeowclaw.providers.base import LLMProvider
-from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
 from meowmeowclaw.skills import LoadSkillTool, SkillCatalog
 from meowmeowclaw.tools.registry import ToolRegistry
 

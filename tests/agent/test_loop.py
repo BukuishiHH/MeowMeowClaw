@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import meowmeowclaw.agent.loop as loop_module
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import (
     CIRCUIT_BREAK_PREFIX,
@@ -31,10 +30,7 @@ from meowmeowclaw.agent.loop import (
     TOOL_CALL_WINDOW_SIZE,
     AgentLoop,
 )
-from meowmeowclaw.tools.filesystem import ReadFileTool
-from meowmeowclaw.tools.registry import ToolRegistry
-from meowmeowclaw.paths import IDENTITY_FILE
-from meowmeowclaw.providers.base import (
+from meowmeowclaw.llm.base import (
     FINISH_REASON_ERROR,
     FINISH_REASON_STOP,
     FINISH_REASON_TOOL_CALLS,
@@ -42,6 +38,9 @@ from meowmeowclaw.providers.base import (
     LLMResponse,
     ToolCallRequest,
 )
+from meowmeowclaw.paths import IDENTITY_FILE
+from meowmeowclaw.tools.filesystem import ReadFileTool
+from meowmeowclaw.tools.registry import ToolRegistry
 
 TOOL_DEFS = [
     {

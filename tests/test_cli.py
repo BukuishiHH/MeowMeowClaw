@@ -19,11 +19,10 @@ from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.bootstrap import Application, ConfigError
 from meowmeowclaw.config import Settings
-from meowmeowclaw.providers.base import FINISH_REASON_STOP, LLMProvider, LLMResponse
+from meowmeowclaw.llm.base import FINISH_REASON_STOP, LLMProvider, LLMResponse
 from meowmeowclaw.skills import Skill, SkillConfigError
 from meowmeowclaw.tools.filesystem import ReadFileTool
 from meowmeowclaw.tools.registry import ToolRegistry
-
 
 # --------------------------------------------------------------------- 测试替身
 

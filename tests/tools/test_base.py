@@ -1,6 +1,9 @@
-import pytest
-from meowmeowclaw.tools import BaseTool
 from typing import Any
+
+import pytest
+
+from meowmeowclaw.tools import BaseTool
+
 
 class MinimalTool(BaseTool):
     @property

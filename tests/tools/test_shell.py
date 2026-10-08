@@ -15,19 +15,19 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import meowmeowclaw.tools.shell as shell_module
 from meowmeowclaw.tools import BaseTool
-from meowmeowclaw.tools.shell import ExecTool
 from meowmeowclaw.tools.registry import ToolRegistry
 from meowmeowclaw.tools.shell import (
     DENY_PATTERNS,
     MAX_OUTPUT_CHARS,
     TRUNCATE_NOTICE,
+    ExecTool,
 )
 
 # 规格要求必须覆盖的危险模式(逐条核对, 防止后续维护时被误删)

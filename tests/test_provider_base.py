@@ -1,4 +1,4 @@
-"""meowmeowclaw/providers/base.py 的 Mock 单元测试.
+"""meowmeowclaw/llm/base.py 的 Mock 单元测试.
 
 被测对象:
 - ``ToolCallRequest`` / ``LLMResponse`` 两个 dataclass 的数据契约;
@@ -26,8 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 
-from meowmeowclaw.tools import BaseTool
-from meowmeowclaw.providers.base import (
+from meowmeowclaw.llm.base import (
     FINISH_REASON_CONTENT_FILTER,
     FINISH_REASON_ERROR,
     FINISH_REASON_LENGTH,
@@ -37,6 +36,7 @@ from meowmeowclaw.providers.base import (
     LLMResponse,
     ToolCallRequest,
 )
+from meowmeowclaw.tools import BaseTool
 
 # --------------------------------------------------------------- 测试替身与消费者
 
@@ -451,10 +451,10 @@ class TestFinishReasonContract:
         assert LLMResponse.__dataclass_fields__["finish_reason"].default == FINISH_REASON_STOP
 
     def test_constants_are_exported_from_package(self):
-        import meowmeowclaw.providers as providers
+        import meowmeowclaw.llm as llm_pkg
 
-        assert providers.FINISH_REASON_TOOL_CALLS == "tool_calls"
-        assert providers.FINISH_REASON_ERROR == "error"
+        assert llm_pkg.FINISH_REASON_TOOL_CALLS == "tool_calls"
+        assert llm_pkg.FINISH_REASON_ERROR == "error"
 
 
 # ---------------------------------------------------------------- 抽象基类约束

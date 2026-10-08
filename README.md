@@ -36,7 +36,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `model` | `deepseek-chat` | 模型名 |
 | `api_key` | 空(启动即提示并退出码 1) | 支持 `${ENV_VAR}` 引用系统环境变量 |
 | `base_url` | `https://api.deepseek.com` | OpenAI 兼容服务地址 |
-| `workspace` | `<项目根>/workspace` | 留空或写 `.` 均表示该预设; 可写绝对路径覆盖; 加载时自动创建 |
+| `workspace` | `<项目根>/workspace` | 留空或写 `.` 均表示该预设; 可写绝对路径覆盖; 启动装配时自动创建 |
 | `max_iterations` | `32` | 单轮"模型↔工具"往返上限; 非法值回退默认 |
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
@@ -85,8 +85,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
                                                                  │            
 ┌────────────────────────────────────────────────────────────────▼───────────┐
 │ 配置层             config.py :: Settings + load_config()                   │
-│   .env → 环境变量 > 文件 > 默认值 → 校验/兜底 → 预设 workspace 自动创建    │
-│   技能目录 = <包>/skills/builtin  ·   统一数据契约: LLMResponse 等         │
+│   paths.py 唯一定位项目根/workspace/人设; .env 解析无副作用               │
+│   workspace 由 main.build_agent() 创建; 技能目录 = <包>/skills/builtin    │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -106,7 +106,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 
 | 模块 | 行数 | 职责 | 关键 API |
 | --- | ---: | --- | --- |
-| `meowmeowclaw/config.py` | 149 | 读 `.env`、校验兜底、解析并创建工作目录 | `load_config()` / `settings` / `Settings` |
+| `meowmeowclaw/config.py` | 141 | 读 `.env`、校验兜底, 纯解析不产生副作用 | `load_config()` / `Settings` |
+| `meowmeowclaw/paths.py` | 40 | 项目根 / `.env` / workspace / 人设路径的唯一来源 | `PROJECT_ROOT` / `resolve_workspace()` / `IDENTITY_FILE` |
 | `meowmeowclaw/providers/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
 | `meowmeowclaw/providers/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
 | `meowmeowclaw/agent/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
@@ -116,10 +117,10 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
 | `meowmeowclaw/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
 | `meowmeowclaw/agent/tools/load_skill.py` | 82 | 技能加载工具(内置技能按需取回正文的入口) | `LoadSkillTool` |
-| `meowmeowclaw/agent/context.py` | 181 | 组装 System Prompt 与 messages(可注入技能摘要) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
+| `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/skills/loader.py` | 221 | 内置技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
-| `meowmeowclaw/agent/loop.py` | 236 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
-| `meowmeowclaw/main.py` | 198 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
+| `meowmeowclaw/agent/loop.py` | 241 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
+| `meowmeowclaw/main.py` | 215 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -373,7 +374,8 @@ MeowMeowClaw/
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
 ├── tests/                       # 14 个测试文件 / 622 用例
 └── meowmeowclaw/
-    ├── config.py                # 配置加载
+    ├── config.py                # 配置加载(纯解析, 无副作用)
+    ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
     ├── main.py                  # 入口(装配 + 交互)
     ├── __main__.py              # python -m meowmeowclaw
     ├── agent/

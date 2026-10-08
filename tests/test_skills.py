@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import pytest
 
-from meowmeowclaw.config import PROJECT_ROOT
+from meowmeowclaw.paths import PROJECT_ROOT
 from meowmeowclaw.skills import (
     BUILTIN_SKILLS_DIR,
     DEFAULT_DESCRIPTION,

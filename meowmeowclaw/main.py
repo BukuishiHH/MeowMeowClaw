@@ -13,6 +13,7 @@
 
 import asyncio
 import sys
+from pathlib import Path
 
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
@@ -23,6 +24,7 @@ from meowmeowclaw.agent.tools.shell import ExecTool
 from meowmeowclaw.agent.tools.web_fetch import WebFetchTool
 from meowmeowclaw.agent.tools.web_search import WebSearchTool
 from meowmeowclaw.config import Settings, load_config
+from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
 from meowmeowclaw.skills import SkillsLoader
 
@@ -58,6 +60,13 @@ def build_agent() -> AgentLoop:
         print("  2) 或直接导出系统环境变量: export DEEPSEEK_API_KEY=sk-xxx")
         sys.exit(1)
 
+    # 工作目录创建放在装配层(而不是 config), 保证 import config 无副作用
+    _ensure_workspace(config.workspace)
+
+    # 人设缺失不阻断启动, 但必须让人看得见(实际内容回退见 ContextBuilder)
+    if not IDENTITY_FILE.is_file():
+        print(f"[启动警告] 未找到人设文件 {IDENTITY_FILE}, 将使用内置默认人设")
+
     provider = OpenAICompatProvider(
         api_key=config.api_key,
         base_url=config.base_url,
@@ -81,7 +90,7 @@ def build_agent() -> AgentLoop:
         tools.register(LoadSkillTool(skills_loader))
 
     context = ContextBuilder(
-        config.workspace, config.identity_file, skills_summary=skills_summary
+        config.workspace, IDENTITY_FILE, skills_summary=skills_summary
     )
 
     agent = AgentLoop(
@@ -97,12 +106,20 @@ def build_agent() -> AgentLoop:
     return agent
 
 
+def _ensure_workspace(workspace: Path) -> None:
+    """创建工作目录; 失败只警告不阻断(文件工具写入时会再做自己的防护)."""
+    try:
+        Path(workspace).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[启动警告] 创建工作目录失败: {workspace} ({exc!r})")
+
+
 def _print_startup_info(config: Settings) -> None:
     """打印一行式启动信息(api_key 已由 Settings.__repr__ 掩码, 这里不打印密钥)."""
     print(f"  模型      : {config.model}")
     print(f"  接口地址  : {config.base_url}")
     print(f"  工作目录  : {config.workspace}")
-    print(f"  人设文件  : {config.identity_file}")
+    print(f"  人设文件  : {IDENTITY_FILE}")
     print(f"  最大迭代  : {config.max_iterations}")
     print(f"  配置文件  : {config.source}")
 

@@ -4,29 +4,31 @@
 - 全部用例都在**临时 .env 文件 + 清理过的进程环境变量**下运行, 与开发者本地的 .env 完全隔离,
   保证结果可复现;
 - 用 ``monkeypatch`` 伪造环境变量/当前工作目录, 覆盖"环境变量覆盖 .env""相对路径不随 cwd 漂移"等分支;
-- 用 ``mock`` 注入解析失败、目录创建失败等异常路径;
-- 验收: 配置文件默认工作目录必须是**与 meowmeowclaw/ 同级的 workspace/**, 且真实存在.
+- 用 ``mock`` 注入解析失败等异常路径;
+- 验收: 配置解析是纯函数 —— 不创建目录、没有全局单例、import 不产生副作用.
 
 运行: pytest tests/test_config.py -v
 """
 
 import logging
-import os
 from pathlib import Path
 
 import pytest
 
 from meowmeowclaw.config import (
     DEFAULT_BASE_URL,
-    DEFAULT_IDENTITY_FILE,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MODEL,
-    ENV_FILE,
-    PRESET_WORKSPACE,
-    PROJECT_ROOT,
     Settings,
+    load_config,
     load_settings,
     read_env_file,
+)
+from meowmeowclaw.paths import (
+    DEFAULT_WORKSPACE,
+    ENV_FILE,
+    IDENTITY_FILE,
+    PROJECT_ROOT,
     resolve_workspace,
 )
 
@@ -43,6 +45,7 @@ ENV_KEYS = (
     "WORK_DIR",
     "MAX_ITERATIONS",
     "IDENTITY_FILE",
+    "PERSONA_FILE",
 )
 
 
@@ -67,7 +70,7 @@ class TestEnvFileLoading:
         env = write_env(
             tmp_path,
             "model=deepseek-flash\napi_key=sk-abc\nbase_url=https://api.deepseek.com\n"
-            "max_iterations=7\nidentity_file=meow.md\nworkspace=my_ws\n",
+            "max_iterations=7\nworkspace=my_ws\n",
         )
 
         s = load_settings(env)
@@ -76,8 +79,7 @@ class TestEnvFileLoading:
         assert s.api_key == "sk-abc"
         assert s.base_url == "https://api.deepseek.com"
         assert s.max_iterations == 7
-        assert s.identity_file == "meow.md"
-        assert s.workspace == str(PROJECT_ROOT / "my_ws")
+        assert s.workspace == PROJECT_ROOT / "my_ws"
         assert s.source == str(env)
 
     def test_comments_and_blank_lines_are_ignored(self, tmp_path):
@@ -103,8 +105,7 @@ class TestEnvFileLoading:
         assert s.api_key == ""
         assert s.base_url == DEFAULT_BASE_URL
         assert s.max_iterations == DEFAULT_MAX_ITERATIONS
-        assert s.identity_file == DEFAULT_IDENTITY_FILE
-        assert s.workspace == str(PRESET_WORKSPACE)
+        assert s.workspace == DEFAULT_WORKSPACE
 
     def test_uppercase_keys_are_accepted(self, tmp_path):
         # .env 里混用 BASE_URL / base_url 都能认
@@ -153,26 +154,50 @@ class TestEnvFileLoading:
         assert read_env_file(tmp_path / "nope.env") == {}
 
 
-# --------------------------------------------- 工作目录预设(本次验收重点)
+# --------------------------------------------- 已废弃的人设配置键(警告并忽略)
 
 
-class TestWorkspacePreset:
-    def test_preset_is_sibling_of_package(self):
-        # 预设工作目录 = <项目根>/workspace, 与 meowmeowclaw/ 同级
+class TestDeprecatedIdentityKeys:
+    @pytest.mark.parametrize("key", ["identity_file", "persona_file"])
+    def test_deprecated_key_warns_and_is_ignored(self, tmp_path, caplog, key):
+        env = write_env(tmp_path, f"{key}=meow.md\nmodel=m\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert any("已废弃" in record.message for record in caplog.records)
+        assert not hasattr(s, "identity_file")
+        # 人设路径固定由装配层使用 paths.IDENTITY_FILE
+        assert IDENTITY_FILE == PROJECT_ROOT / "identity.md"
+
+    def test_no_warning_when_keys_absent(self, tmp_path, caplog):
+        env = write_env(tmp_path, "model=m\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            load_settings(env)
+
+        assert not any("已废弃" in record.message for record in caplog.records)
+
+
+# --------------------------------------------- 工作目录预设(路径解析)
+
+
+class TestWorkspaceResolution:
+    def test_preset_is_package_sibling(self):
         assert (PROJECT_ROOT / "meowmeowclaw").parent == PROJECT_ROOT
-        assert PRESET_WORKSPACE.parent == PROJECT_ROOT
-        assert PRESET_WORKSPACE.name == "workspace"
-        assert PRESET_WORKSPACE == PROJECT_ROOT / "workspace"
+        assert DEFAULT_WORKSPACE.parent == PROJECT_ROOT
+        assert DEFAULT_WORKSPACE.name == "workspace"
+        assert DEFAULT_WORKSPACE == PROJECT_ROOT / "workspace"
 
     @pytest.mark.parametrize("raw", [None, "", ".", "./", "   "])
     def test_default_and_dot_mean_preset(self, raw):
-        assert resolve_workspace(raw) == PRESET_WORKSPACE
+        assert resolve_workspace(raw) == DEFAULT_WORKSPACE
 
     def test_relative_path_resolves_against_project_root_not_cwd(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)  # 故意切走当前工作目录
 
         assert resolve_workspace("sub/dir") == PROJECT_ROOT / "sub" / "dir"
-        assert resolve_workspace(".") == PRESET_WORKSPACE  # 不会变成 tmp_path
+        assert resolve_workspace(".") == DEFAULT_WORKSPACE  # 不会变成 tmp_path
 
     def test_absolute_path_is_kept(self, tmp_path):
         assert resolve_workspace(str(tmp_path)) == tmp_path
@@ -183,33 +208,24 @@ class TestWorkspacePreset:
     def test_normalizes_dot_segments(self):
         assert resolve_workspace("a/../b") == PROJECT_ROOT / "b"
 
-    def test_workspace_dir_is_created_on_load(self, tmp_path):
-        env = write_env(tmp_path, f"workspace={tmp_path / 'auto' / 'created'}\n")
+    def test_load_config_does_not_create_workspace(self, tmp_path):
+        """配置层是纯解析: 创建目录属于装配层职责, 这里必须没有副作用."""
+        target = tmp_path / "auto" / "created"
+        env = write_env(tmp_path, f"workspace={target}\n")
 
         s = load_settings(env)
 
-        assert Path(s.workspace).is_dir()
-
-    def test_mkdir_failure_is_not_fatal(self, tmp_path, monkeypatch):
-        env = write_env(tmp_path, f"workspace={tmp_path / 'blocked'}\n")
-
-        def boom(self, *args, **kwargs):
-            raise OSError(13, "Permission denied")
-
-        monkeypatch.setattr("pathlib.Path.mkdir", boom)
-
-        s = load_settings(env)  # 只是告警, 不抛异常
-
-        assert s.workspace == str(tmp_path / "blocked")
+        assert s.workspace == target
+        assert not target.exists()
 
     def test_shipped_env_resolves_to_preset_workspace(self):
         """验收: 仓库自带 .env 解析出来的工作目录, 必须是与 meowmeowclaw 同级的 workspace/."""
         s = load_settings()
 
-        assert s.workspace == str(PRESET_WORKSPACE), (
-            f"配置文件里的工作目录应预设为与 meowmeowclaw 同级的 {PRESET_WORKSPACE}, 实际为 {s.workspace}"
+        assert s.workspace == DEFAULT_WORKSPACE, (
+            f"配置文件里的工作目录应预设为与 meowmeowclaw 同级的 {DEFAULT_WORKSPACE}, "
+            f"实际为 {s.workspace}"
         )
-        assert Path(s.workspace).is_dir()
 
     def test_default_env_file_points_to_project_root(self):
         assert ENV_FILE == PROJECT_ROOT / ".env"
@@ -283,9 +299,8 @@ class TestSettingsObject:
 
         assert s.model == DEFAULT_MODEL
         assert s.base_url == DEFAULT_BASE_URL
-        assert s.workspace == str(PRESET_WORKSPACE)
+        assert s.workspace == DEFAULT_WORKSPACE
         assert s.max_iterations == DEFAULT_MAX_ITERATIONS
-        assert s.identity_file == DEFAULT_IDENTITY_FILE
         assert s.has_api_key is False
 
     def test_repr_masks_api_key(self):
@@ -305,3 +320,16 @@ class TestSettingsObject:
         env = write_env(tmp_path, "model=m\n")
 
         assert load_settings(env).source == str(env)
+
+
+# ------------------------------------------------- 模块级副作用护栏
+
+
+class TestNoImportSideEffects:
+    def test_module_has_no_global_settings_singleton(self):
+        import meowmeowclaw.config as config_module
+
+        assert not hasattr(config_module, "settings")
+
+    def test_load_config_is_same_as_load_settings(self):
+        assert load_config is load_settings

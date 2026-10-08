@@ -23,6 +23,7 @@ import meowmeowclaw.agent.loop as loop_module
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import (
     CIRCUIT_BREAK_PREFIX,
+    DEFAULT_MAX_ITERATIONS,
     LOOP_CIRCUIT_BREAK_THRESHOLD,
     LOOP_WARNING_PREFIX,
     LOOP_WARNING_THRESHOLD,
@@ -32,7 +33,7 @@ from meowmeowclaw.agent.loop import (
 )
 from meowmeowclaw.agent.tools import ReadFileTool
 from meowmeowclaw.agent.tools.registry import ToolRegistry
-from meowmeowclaw.config import Settings
+from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.base import (
     FINISH_REASON_ERROR,
     FINISH_REASON_STOP,
@@ -80,12 +81,6 @@ class ScriptedProvider(LLMProvider):
         if self._default is not None:
             return self._default
         raise AssertionError("脚本已用尽, 但主循环仍在调用 provider")
-
-
-@pytest.fixture(autouse=True)
-def isolate_config(monkeypatch):
-    """max_iterations 的默认值来自 config.settings, 这里固定住, 免受开发者本地 .env 影响."""
-    monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=32))
 
 
 def text_response(content: str) -> LLMResponse:
@@ -154,30 +149,29 @@ def find_message(messages: list[dict[str, Any]], role: str) -> dict[str, Any]:
     return next(m for m in messages if m["role"] == role)
 
 
-# ------------------------------------------------- 默认参数来自配置文件(config)
+# ------------------------------------------------- 迭代上限由装配层显式注入
 
 
-class TestConfigDrivenDefaults:
+class TestInjectedMaxIterations:
     @pytest.mark.asyncio
-    async def test_default_max_iterations_comes_from_config(self, monkeypatch):
-        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=7))
+    async def test_injected_value_is_used(self):
+        # 生产路径: main.build_agent 把 config.max_iterations 传进来
         provider = ScriptedProvider(default=tool_response(make_call()))
-        loop = make_loop(provider)
+        loop = make_loop(provider, max_iterations=7)
 
         assert loop.max_iterations == 7
         assert "最大迭代次数 7" in await loop.run("hi")
         assert len(provider.calls) == 7
 
-    def test_explicit_argument_overrides_config(self, monkeypatch):
-        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=7))
+    def test_default_fallback_when_not_injected(self):
+        # 直接构造(如单测)未注入时使用模块兜底值, 不再读取任何全局配置
+        loop = make_loop(ScriptedProvider(text_response("x")))
 
-        assert make_loop(ScriptedProvider(text_response("x")), max_iterations=3).max_iterations == 3
+        assert loop.max_iterations == DEFAULT_MAX_ITERATIONS
 
-    def test_no_argument_reads_config_at_construction_time(self, monkeypatch):
-        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=5))
-        first = make_loop(ScriptedProvider(text_response("x")))
-        monkeypatch.setattr(loop_module, "settings", Settings(max_iterations=9))
-        second = make_loop(ScriptedProvider(text_response("x")))
+    def test_each_instance_keeps_its_own_value(self):
+        first = make_loop(ScriptedProvider(text_response("x")), max_iterations=5)
+        second = make_loop(ScriptedProvider(text_response("x")), max_iterations=9)
 
         assert (first.max_iterations, second.max_iterations) == (5, 9)
 
@@ -593,7 +587,7 @@ class TestEndToEndWithRealComponents:
 
         registry = ToolRegistry()
         registry.register(ReadFileTool(str(tmp_path)))
-        context = ContextBuilder(str(tmp_path))
+        context = ContextBuilder(tmp_path, IDENTITY_FILE)
         provider = ScriptedProvider(
             tool_response(make_call(name="read_file", arguments={"file_path": "note.txt"})),
             text_response("文件里写着: 磁盘上的真实内容"),
@@ -622,7 +616,7 @@ class TestEndToEndWithRealComponents:
         provider = ScriptedProvider(
             tool_response(make_call(name="不存在的工具")), text_response("那我换个办法")
         )
-        loop = AgentLoop(provider=provider, tools=registry, context=ContextBuilder(str(tmp_path)))
+        loop = AgentLoop(provider=provider, tools=registry, context=ContextBuilder(tmp_path, IDENTITY_FILE))
 
         assert await loop.run("hi") == "那我换个办法"
 

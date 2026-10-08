@@ -20,10 +20,12 @@ from typing import Any, Optional
 
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.tools.registry import ToolRegistry
-from meowmeowclaw.config import settings
 from meowmeowclaw.providers.base import FINISH_REASON_ERROR, LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)
+
+# 未显式注入时的兜底迭代上限(生产路径由装配层传入 config.max_iterations)
+DEFAULT_MAX_ITERATIONS = 32
 
 # _check_tool_loop 的两种裁决前缀: 调用方据此区分"熔断"(结束本轮)与"警告"(跳过本次执行)
 CIRCUIT_BREAK_PREFIX = "[工具熔断]"
@@ -47,7 +49,8 @@ class AgentLoop:
         context: System Prompt / messages 构建器
         model: 按次覆盖 provider 的默认模型; None 表示用 provider 自己的默认模型
         max_iterations: 单轮对话内 "模型<->工具" 往返次数上限, 防止死循环;
-            None 表示读取配置文件(meowmeowclaw/config.py -> .env 的 max_iterations, 默认 32)
+            生产路径由装配层传入 ``.env`` 的 max_iterations; None 表示使用模块兜底值
+            DEFAULT_MAX_ITERATIONS(32), 便于直接构造与单测
 
     注意:
         - 只有完整跑完的一轮(模型给出最终回答)才写入 _session_history,
@@ -69,8 +72,10 @@ class AgentLoop:
         self.tools = tools
         self.context = context
         self.model = model
-        # 未显式指定时, 取配置文件里的值(.env 的 max_iterations)
-        self.max_iterations = settings.max_iterations if max_iterations is None else max_iterations
+        # 未显式注入时使用模块兜底值; 生产路径由 main.build_agent 传入配置值
+        self.max_iterations = (
+            DEFAULT_MAX_ITERATIONS if max_iterations is None else max_iterations
+        )
         # 工具调用签名滑动窗口, 用于防爆(同一调用反复重试)
         self._tool_call_history: list[str] = []
         # 跨轮次的会话历史(不含 system, system 每轮由 ContextBuilder 重建)

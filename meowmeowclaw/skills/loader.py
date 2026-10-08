@@ -27,7 +27,7 @@ from typing import Any, Iterator, Optional
 
 import yaml
 
-from meowmeowclaw.config import PROJECT_ROOT
+from meowmeowclaw.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class SkillsLoader:
 
     @staticmethod
     def _resolve_skills_dir(skills_dir: str) -> str:
-        """显式传入的目录: 相对路径按项目根解析, 绝对路径原样(与 config.resolve_workspace 同一约定)."""
+        """显式传入的目录: 相对路径按项目根解析, 绝对路径原样(与 paths.resolve_workspace 同一约定)."""
         path = Path(skills_dir).expanduser()
         if not path.is_absolute():
             path = PROJECT_ROOT / path

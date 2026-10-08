@@ -12,6 +12,7 @@
 
 import asyncio
 import copy
+from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -22,6 +23,7 @@ from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.agent.tools.registry import ToolRegistry
 from meowmeowclaw.config import Settings
+from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.base import FINISH_REASON_STOP, LLMProvider, LLMResponse
 from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
 
@@ -41,12 +43,12 @@ def make_settings(**overrides) -> Settings:
         "model": "test-model",
         "api_key": "sk-test-key",
         "base_url": "http://localhost:8000/v1",
-        "workspace": WORKSPACE,
+        "workspace": Path(WORKSPACE),
         "max_iterations": 7,
-        "identity_file": "identity.md",
         "source": "/tmp/fake.env",
     }
     params.update(overrides)
+    params["workspace"] = Path(params["workspace"])  # 允许用例继续传 str
     return Settings(**params)
 
 
@@ -135,7 +137,7 @@ class TestBuildAgent:
         # Context 与 Loop 的配置
         assert isinstance(agent.context, ContextBuilder)
         assert agent.context.workspace == config.workspace
-        assert agent.context.identity_file == config.identity_file
+        assert agent.context.identity_path == IDENTITY_FILE
         assert agent.model == config.model
         assert agent.max_iterations == config.max_iterations
 
@@ -146,6 +148,28 @@ class TestBuildAgent:
         main_module.build_agent()
 
         loader.assert_called_once_with()
+
+    def test_creates_workspace_directory(self, monkeypatch, tmp_path):
+        # 目录创建属于装配层职责: config 只解析, build_agent 负责真正建目录
+        target = tmp_path / "auto" / "created"
+        monkeypatch.setattr(
+            main_module, "load_config", lambda *a, **k: make_settings(workspace=target)
+        )
+
+        main_module.build_agent()
+
+        assert target.is_dir()
+
+    def test_warns_when_identity_missing(self, monkeypatch, capsys, tmp_path):
+        missing = tmp_path / "missing-identity.md"
+        monkeypatch.setattr(main_module, "IDENTITY_FILE", missing)
+        monkeypatch.setattr(main_module, "load_config", lambda *a, **k: make_settings())
+
+        main_module.build_agent()
+
+        out = capsys.readouterr().out
+        assert "[启动警告] 未找到人设文件" in out
+        assert str(missing) in out
 
     def test_prints_registered_tools(self, monkeypatch, capsys):
         monkeypatch.setattr(main_module, "load_config", lambda *a, **k: make_settings())

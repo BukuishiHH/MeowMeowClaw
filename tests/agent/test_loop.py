@@ -23,6 +23,8 @@ from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import (
     CIRCUIT_BREAK_PREFIX,
     DEFAULT_MAX_ITERATIONS,
+    FINISH_REASON_CIRCUIT_BREAK,
+    FINISH_REASON_MAX_ITERATIONS,
     LOOP_CIRCUIT_BREAK_THRESHOLD,
     LOOP_WARNING_PREFIX,
     LOOP_WARNING_THRESHOLD,
@@ -621,3 +623,106 @@ class TestEndToEndWithRealComponents:
 
         tool_message = find_message(provider.calls[1]["messages"], "tool")
         assert "不存在的工具" in tool_message["content"]  # registry 的错误文本被回填给模型
+
+
+# --------------------------------------------- run_turn: 外部历史快照(供记忆系统)
+
+class TestRunTurnHistorySnapshot:
+    @pytest.mark.asyncio
+    async def test_external_history_is_used_and_new_messages_returned(self):
+        provider = ScriptedProvider(text_response("新回答"))
+        loop = make_loop(provider)
+        history = [
+            {"role": "user", "content": "旧问"},
+            {"role": "assistant", "content": "旧答"},
+        ]
+
+        turn = await loop.run_turn("新问", history=history)
+
+        assert turn.completed is True
+        assert turn.finish_reason == FINISH_REASON_STOP
+        assert turn.iterations == 1
+        assert turn.answer == "新回答"
+        assert turn.messages == [
+            {"role": "user", "content": "新问"},
+            {"role": "assistant", "content": "新回答"},
+        ]
+        sent = provider.calls[0]["messages"]
+        assert [message["role"] for message in sent] == ["system", "user", "assistant", "user"]
+        assert sent[1]["content"] == "旧问"
+        assert sent[3]["content"] == "新问"
+
+        # 外部历史模式: 不写实例历史, 也不修改入参
+        assert loop._session_history == []
+        assert history == [
+            {"role": "user", "content": "旧问"},
+            {"role": "assistant", "content": "旧答"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_turn_messages_are_returned(self):
+        provider = ScriptedProvider(
+            tool_response(make_call()),
+            text_response("最终回答"),
+        )
+        loop = make_loop(provider)
+
+        turn = await loop.run_turn("用工具", history=[])
+
+        assert turn.completed is True
+        assert [message["role"] for message in turn.messages] == [
+            "user", "assistant", "tool", "assistant",
+        ]
+        assistant_call = turn.messages[1]
+        assert assistant_call["tool_calls"][0]["function"]["name"] == "read_file"
+        assert turn.messages[2]["content"] == "工具结果:read_file"
+        assert turn.answer == "最终回答"
+
+    @pytest.mark.asyncio
+    async def test_error_turn_is_not_completed(self):
+        provider = ScriptedProvider(
+            LLMResponse(content="[LLM调用失败] boom", finish_reason=FINISH_REASON_ERROR)
+        )
+        loop = make_loop(provider)
+
+        turn = await loop.run_turn("hi")
+
+        assert turn.completed is False
+        assert turn.finish_reason == FINISH_REASON_ERROR
+        assert turn.answer == "[LLM调用失败] boom"
+
+    @pytest.mark.asyncio
+    async def test_timeout_turn_is_not_completed(self):
+        provider = ScriptedProvider(default=tool_response(make_call()))
+        loop = make_loop(provider, max_iterations=2)
+
+        turn = await loop.run_turn("hi")
+
+        assert turn.completed is False
+        assert turn.finish_reason == FINISH_REASON_MAX_ITERATIONS
+        assert turn.iterations == 2
+        assert len(provider.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_circuit_break_turn_is_not_completed(self):
+        provider = ScriptedProvider(default=tool_response(make_call()))
+        loop = make_loop(provider, max_iterations=25)
+
+        turn = await loop.run_turn("hi")
+
+        assert turn.completed is False
+        assert turn.finish_reason == FINISH_REASON_CIRCUIT_BREAK
+        assert turn.answer.startswith(CIRCUIT_BREAK_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_run_keeps_internal_history_behavior(self):
+        provider = ScriptedProvider(text_response("a1"), text_response("a2"))
+        loop = make_loop(provider)
+
+        assert await loop.run("q1") == "a1"
+        assert await loop.run("q2") == "a2"
+
+        second_call = provider.calls[1]["messages"]
+        assert [message["content"] for message in second_call if message["role"] != "system"] == [
+            "q1", "a1", "q2",
+        ]

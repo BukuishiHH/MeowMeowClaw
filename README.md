@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 22 个源码模块 / 约 3400 行; 测试 17 个文件 / **688 个用例**(680 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 23 个源码模块 / 约 3700 行; 测试 18 个文件 / **707 个用例**(699 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -126,7 +126,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/memory/store.py` | 55 | 短期记忆仓储抽象接口(async Protocol) | `SessionStore` |
 | `meowmeowclaw/memory/jsonl.py` | 510 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID | `JsonlSessionStore` |
 | `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
-| `meowmeowclaw/agent/loop.py` | 241 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
+| `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
+| `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/bootstrap.py` | 122 | **组合根**: 配置 -> Provider -> 工具 -> 技能 -> Context/Loop | `build_application()` / `Application` / `ConfigError` |
 | `meowmeowclaw/cli.py` | 169 | **交付层**: banner / 启动信息 / REPL / 命令 / 退出码 | `main()` / `interactive_loop()` / `_handle_command()` |
 
@@ -349,7 +350,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 680 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 699 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -364,11 +365,12 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `test_bootstrap.py` | 12 | 装配(工具/技能/Context/Loop)、ConfigError/SkillConfigError、导入边界 |
 | `test_cli.py` | 20 | REPL 命令分支、启动输出、退出码、Ctrl+C/EOF 优雅退出 |
 | `agent/test_context.py` | 40 | 人设单路径读取与回退、时间实时取值、记忆/技能章节 |
-| `agent/test_loop.py` | 35 | 消息格式、防爆阈值、历史写入策略、max_iterations 显式注入 |
+| `agent/test_loop.py` | 41 | 消息格式、防爆阈值、run_turn 历史快照/完成态、max_iterations 注入 |
 | `skills/test_catalog.py` | 36 | frontmatter 边界、索引/摘要、坏 YAML 跳过、重名报错、内置资源可发现 |
 | `skills/test_tool.py` | 30 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
 | `memory/test_models.py` | 28 | 会话键 canonical/storage_id、消息投影、元数据/摘要 |
 | `memory/test_jsonl_store.py` | 27 | SessionStore 契约 + JSONL 布局/损坏行/归档/短 ID |
+| `test_conversation.py` | 13 | ConversationService 编排、窗口、fail-soft、同会话串行、agent 缓存 |
 | `tools/test_base.py` | 3 | 工具基类抽象约束 |
 | `tools/test_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
 | `tools/test_filesystem.py` | 91 | 三件套读写/截断/异常分支、resolve_in_workspace、同前缀绕过回归 |
@@ -389,7 +391,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 17 个测试文件 / 688 用例(agent/skills/tools/memory 分层)
+├── tests/                       # 18 个测试文件 / 707 用例(agent/skills/tools/memory 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -416,6 +418,7 @@ MeowMeowClaw/
     │   ├── store.py             # SessionStore 抽象接口
     │   ├── jsonl.py             # JsonlSessionStore 实现
     │   └── errors.py            # 记忆层错误类型
+    ├── conversation.py          # ConversationService: 记忆 <-> AgentLoop 编排
     └── llm/                     # LLMProvider - OpenAICompatProvider
 ```
 
@@ -423,7 +426,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- 记忆系统仅完成 M1(类型 / `SessionStore` 接口 / JSONL 实现), **尚未接入 AgentLoop 与 CLI/QQ**(见 `docs/MEMORY_DESIGN.md` M2+); 无流式输出与多 Agent 编排
+- 记忆系统已完成 M1(存储层)与 M2(`ConversationService` 编排 + `AgentLoop.run_turn` 历史快照), **尚未接入 CLI/QQ**(见 `docs/MEMORY_DESIGN.md` M3+); 无流式输出与多 Agent 编排
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入), 结构化 `LongTermStore` 待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
 - 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(命令黑名单绕过、抓取重定向/重绑定、provider 契约边界)

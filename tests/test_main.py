@@ -26,6 +26,7 @@ from meowmeowclaw.config import Settings
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.base import FINISH_REASON_STOP, LLMProvider, LLMResponse
 from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
+from meowmeowclaw.skills import SkillConfigError
 
 WORKSPACE = "/tmp/fake-workspace"
 
@@ -217,19 +218,22 @@ class TestBuildAgentSkills:
     """build_agent 固定加载包内置技能; workspace/skills 不再参与技能发现."""
 
     @staticmethod
-    def make_empty_loader(*args, **kwargs):
-        """返回一个"没有任何技能"的假 loader, 用于覆盖无技能分支."""
+    def make_empty_catalog(*args, **kwargs):
+        """返回一个"没有任何技能"的假 catalog, 用于覆盖无技能分支."""
 
-        class _EmptyLoader:
-            skills_dir = "/nonexistent/skills"
+        class _EmptyCatalog:
+            root = "/nonexistent/skills"
 
-            def build_skills_summary(self) -> str:
+            def summary(self) -> str:
                 return ""
 
-            def list_skills(self) -> list:
+            def __len__(self) -> int:
+                return 0
+
+            def names(self) -> list:
                 return []
 
-        return _EmptyLoader()
+        return _EmptyCatalog()
 
     def test_builtin_skills_are_loaded_and_count_is_printed(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setattr(
@@ -267,19 +271,36 @@ class TestBuildAgentSkills:
 
     def test_empty_skills_are_silent_and_tool_not_registered(self, monkeypatch, capsys, tmp_path):
         # 内置资源缺失/为空时: 不打印发现信息, 不注入技能章节, 不注册 load_skill
-        monkeypatch.setattr(main_module, "SkillsLoader", self.make_empty_loader)
+        monkeypatch.setattr(main_module, "SkillCatalog", self.make_empty_catalog)
         monkeypatch.setattr(
             main_module, "load_config", lambda *a, **k: make_settings(workspace=str(tmp_path))
         )
 
         agent = main_module.build_agent()
 
-        assert "发现" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "发现 6 个技能" not in out
+        assert "[启动警告] 未发现内置技能" in out
         assert "## 可用技能" not in agent.context.build_system_prompt()
         assert "load_skill" not in agent.tools.list_tools()
 
+    def test_skill_config_error_exits_with_message(self, monkeypatch, capsys):
+        def boom(*args, **kwargs):
+            raise SkillConfigError("技能名重复: pdf <- pdf-a/pdf-b")
+
+        monkeypatch.setattr(main_module, "SkillCatalog", boom)
+        monkeypatch.setattr(main_module, "load_config", lambda *a, **k: make_settings())
+
+        with pytest.raises(SystemExit) as excinfo:
+            main_module.build_agent()
+
+        assert excinfo.value.code == 1
+        out = capsys.readouterr().out
+        assert "[启动失败] 技能配置错误" in out
+        assert "技能名重复" in out
+
     def test_empty_summary_passed_when_no_skills(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(main_module, "SkillsLoader", self.make_empty_loader)
+        monkeypatch.setattr(main_module, "SkillCatalog", self.make_empty_catalog)
         monkeypatch.setattr(
             main_module, "load_config", lambda *a, **k: make_settings(workspace=str(tmp_path))
         )

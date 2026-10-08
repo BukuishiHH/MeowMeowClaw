@@ -1,44 +1,48 @@
-"""技能加载器: 扫描技能目录下的 SKILL.md, 生成技能摘要 / 按名加载技能正文.
+"""技能目录扫描器: 启动时扫描一次, 建立 ``{name: Skill}`` 索引.
 
-SKILL.md 约定(参考 Claude Skills / OpenClaw 的 frontmatter 写法)::
-
-    ---
-    name: pdf
-    description: 处理 PDF 文件, 提取文本与表格
-    ---
-    # 使用说明
-    这里是给模型看的详细指南...
+内置技能放在 ``<包>/skills/builtin/<目录>/SKILL.md``, 通过 ``importlib.resources``
+读取: 源码运行、editable 安装与 wheel/zipimport 场景行为一致, 不依赖 workspace,
+也不依赖进程当前工作目录。
 
 用法::
 
-    loader = SkillsLoader()                 # 默认内置技能目录 <包>/skills/builtin
-    summary = loader.build_skills_summary() # 拼进 System Prompt
-    guide = loader.load_skill("pdf")        # 按需加载正文
+    catalog = SkillCatalog()
+    summary = catalog.summary()        # 拼进 System Prompt
+    skill = catalog.get("exec")        # 按名精确查索引
+    body = catalog.load("exec")        # 取去掉 frontmatter 的正文
 
-模型通过 ``load_skill`` 工具按技能名取回正文(见 tools/load_skill.py), 因此不受
-read_file 的工作区路径限制; 摘要里给出的相对路径仅供人排查时定位文件。
+``load_skill`` 的越界防护不再依赖路径拼接校验: 先按名字从索引里精确查找,
+查不到直接返回 None, 根本不会接触文件系统。
 """
 
 import logging
 import os
 import re
+from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Union
 
 import yaml
 
 from meowmeowclaw.paths import PROJECT_ROOT
+from meowmeowclaw.skills.models import Skill, SkillConfigError
 
 logger = logging.getLogger(__name__)
 
 SKILL_FILE_NAME = "SKILL.md"
-# 内置技能资源目录: <包>/skills/builtin, 随代码入库与分发, 不依赖 workspace 与当前工作目录
-BUILTIN_SKILLS_DIR = os.path.normpath(str(Path(__file__).resolve().parent / "builtin"))
+# 内置技能资源: 包名 + 目录名(用 importlib.resources 定位, 兼容 wheel/zipimport)
+BUILTIN_PACKAGE = "meowmeowclaw.skills"
+BUILTIN_DIR_NAME = "builtin"
 DEFAULT_DESCRIPTION = "无描述"
 
 # frontmatter: 首行必须是独占一行的 ---, 结束符也是独占一行的 ---
 _OPENING_FENCE_RE = re.compile(r"^---[ \t]*\n")
 _CLOSING_FENCE_RE = re.compile(r"^---[ \t]*$", re.MULTILINE)
+
+class _InvalidFrontmatterError(Exception):
+    """SKILL.md 写了 frontmatter 但 YAML 语法错误; 该技能应被跳过而不是原样进上下文."""
+
 
 # 拼进 System Prompt 的引导语
 SKILLS_SUMMARY_HEADER = (
@@ -47,45 +51,57 @@ SKILLS_SUMMARY_HEADER = (
 )
 
 
-class SkillsLoader:
+def default_builtin_root() -> Traversable:
+    """包内内置技能根目录(``<包>/skills/builtin``).
+
+    返回 ``Traversable`` 而非真实路径: wheel/zipimport 下同样可用。
     """
-    技能目录扫描器
+    return resources.files(BUILTIN_PACKAGE) / BUILTIN_DIR_NAME
+
+
+class SkillCatalog:
+    """技能索引: 扫描一次后, 所有查询都走内存索引.
 
     Args:
-        skills_dir: 技能目录; 不传时默认使用内置技能目录 ``BUILTIN_SKILLS_DIR``;
-                    显式传入的相对路径按**项目根**解析(不随当前工作目录漂移),
-                    绝对路径原样使用。
+        root: 技能根目录(只扫描一层子目录); ``None`` 时用内置资源目录。
+              传入 ``str``/``Path`` 时按目录处理: 相对路径基于项目根解析,
+              便于测试与本地自定义目录; 也可直接传入 ``Traversable``。
 
     容错约定:
-        - 目录不存在 / 没有任何技能 -> 摘要返回空字符串;
-        - 单个 SKILL.md 读不了或 YAML 坏了 -> 跳过该技能并打 warning, 不影响其余技能。
+        - 目录不存在 / 没有任何技能 -> 空索引, ``summary()`` 返回空字符串;
+        - 单个 SKILL.md 读不了 / YAML 坏了 -> 跳过该技能并打 warning;
+        - 多个技能重名 -> 抛 ``SkillConfigError``(内置资源重名属于仓库错误)。
     """
 
-    def __init__(self, skills_dir: Optional[str] = None) -> None:
-        if skills_dir is None:
-            self.skills_dir = BUILTIN_SKILLS_DIR
-        else:
-            self.skills_dir = self._resolve_skills_dir(skills_dir)
+    def __init__(self, root: Optional[Union[str, os.PathLike, Traversable]] = None) -> None:
+        self.root: Traversable = self._resolve_root(root)
+        self._skills: dict[str, Skill] = {}
+        self._scan()
 
     def __repr__(self) -> str:
-        return f"<SkillsLoader skills_dir={self.skills_dir!r} skills={len(self.list_skills())}>"
+        return f"<SkillCatalog root={str(self.root)!r} skills={len(self._skills)}>"
+
+    def __len__(self) -> int:
+        return len(self._skills)
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and name in self._skills
 
     # ------------------------------------------------------------------ 路径
 
     @staticmethod
-    def _resolve_skills_dir(skills_dir: str) -> str:
-        """显式传入的目录: 相对路径按项目根解析, 绝对路径原样(与 paths.resolve_workspace 同一约定)."""
-        path = Path(skills_dir).expanduser()
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        return os.path.normpath(path)
-
-    def _is_inside_skills_dir(self, path: str) -> bool:
-        """防越界: 目标必须落在 skills_dir 内(比 startswith 更严谨, 不会被同前缀兄弟目录绕过)."""
-        try:
-            return os.path.commonpath([os.path.abspath(path), self.skills_dir]) == self.skills_dir
-        except ValueError:  # Windows 跨盘符
-            return False
+    def _resolve_root(
+        root: Optional[Union[str, os.PathLike, Traversable]]
+    ) -> Traversable:
+        """None -> 内置资源目录; str/Path -> 归一化路径; 其余视为 Traversable 原样使用."""
+        if root is None:
+            return default_builtin_root()
+        if isinstance(root, (str, os.PathLike)):
+            path = Path(root).expanduser()
+            if not path.is_absolute():
+                path = PROJECT_ROOT / path
+            return Path(os.path.normpath(str(path)))
+        return root
 
     # ------------------------------------------------------------------ 解析
 
@@ -95,7 +111,8 @@ class SkillsLoader:
         拆出 frontmatter 与正文
 
         :param content: SKILL.md 的完整内容
-        :return: (metadata, body); 没有 frontmatter / YAML 非法时返回 ({{}}, 原文)
+        :return: (metadata, body); 没有 frontmatter / 缺少结束符时返回 ({}, 原文)
+        :raises _InvalidFrontmatterError: 写了 frontmatter 但 YAML 语法错误
         """
         # 统一换行与 BOM: Windows 上编辑的 SKILL.md 也要能解析
         text = content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
@@ -116,8 +133,7 @@ class SkillsLoader:
         try:
             metadata = yaml.safe_load(raw_yaml)
         except yaml.YAMLError as exc:
-            logger.warning("frontmatter YAML 解析失败(%r), 按无 frontmatter 处理", exc)
-            return {}, text
+            raise _InvalidFrontmatterError(f"frontmatter YAML 解析失败: {exc}") from exc
 
         if not isinstance(metadata, dict):  # 空 frontmatter / 写成了列表等
             metadata = {}
@@ -125,97 +141,97 @@ class SkillsLoader:
 
     # ------------------------------------------------------------------ 扫描
 
-    def _iter_skill_files(self) -> Iterator[tuple[str, str]]:
-        """产出 (子目录名, SKILL.md 绝对路径); 按目录名排序, 只认一层子目录."""
-        if not os.path.isdir(self.skills_dir):
+    def _iter_skill_dirs(self) -> Iterator[Traversable]:
+        """产出第一层子目录, 按名字排序, 保证索引顺序稳定."""
+        try:
+            entries = sorted(self.root.iterdir(), key=lambda entry: entry.name)
+        except FileNotFoundError:
             return
-        for entry in sorted(os.listdir(self.skills_dir)):
-            skill_dir = os.path.join(self.skills_dir, entry)
-            if not os.path.isdir(skill_dir):
-                continue
-            skill_file = os.path.join(skill_dir, SKILL_FILE_NAME)
-            if not os.path.isfile(skill_file):
-                continue
-            yield entry, skill_file
+        except (NotADirectoryError, OSError) as exc:
+            logger.warning("读取技能目录失败, 本次忽略: %s (%r)", self.root, exc)
+            return
 
-    def _scan(self) -> list[dict[str, Any]]:
-        """扫描全部技能; 单个技能出错只跳过它自己."""
-        records: list[dict[str, Any]] = []
-        for dir_name, skill_file in self._iter_skill_files():
+        for entry in entries:
             try:
-                content = Path(skill_file).read_text(encoding="utf-8")
+                if entry.is_dir():
+                    yield entry
+            except OSError:  # 单个条目异常不影响其余技能
+                logger.warning("检查技能子目录失败, 已跳过: %s", entry)
+                continue
+
+    def _scan(self) -> None:
+        """扫描并建立索引; 单个技能出错只跳过它自己, 重名则整体报错."""
+        skills: dict[str, Skill] = {}
+        duplicates: dict[str, list[str]] = {}
+
+        for skill_dir in self._iter_skill_dirs():
+            dir_name = skill_dir.name
+            skill_file = skill_dir / SKILL_FILE_NAME
+            try:
+                if not skill_file.is_file():
+                    continue
+                content = skill_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
             except (OSError, UnicodeDecodeError) as exc:
                 logger.warning("读取技能文件失败, 已跳过: %s (%r)", skill_file, exc)
                 continue
 
-            metadata, body = self._parse_frontmatter(content)
-            records.append(
-                {
-                    "dir": dir_name,  # 摘要里用的相对路径
-                    "name": str(metadata.get("name") or "").strip() or dir_name,
-                    "description": str(metadata.get("description") or "").strip()
-                    or DEFAULT_DESCRIPTION,
-                    "path": skill_file,  # SKILL.md 的绝对路径
-                    "body": body,
-                }
+            try:
+                metadata, body = self._parse_frontmatter(content)
+            except _InvalidFrontmatterError as exc:
+                logger.warning("SKILL.md frontmatter 解析失败, 已跳过: %s (%r)", skill_file, exc)
+                continue
+
+            name = str(metadata.get("name") or "").strip() or dir_name
+            if name != dir_name:
+                logger.warning(
+                    "技能目录 %r 的 frontmatter name=%r 与目录名不一致, 以 frontmatter 为准",
+                    dir_name,
+                    name,
+                )
+            skill = Skill(
+                name=name,
+                description=str(metadata.get("description") or "").strip()
+                or DEFAULT_DESCRIPTION,
+                body=body,
+                dir_name=dir_name,
+                source=str(skill_file),
             )
-        return records
+
+            if name in skills:
+                duplicates.setdefault(name, [skills[name].dir_name]).append(dir_name)
+                continue
+            skills[name] = skill
+
+        if duplicates:
+            detail = "; ".join(f"{name} <- {dirs}" for name, dirs in duplicates.items())
+            raise SkillConfigError(f"技能名重复: {detail}")
+
+        self._skills = skills
 
     # ------------------------------------------------------------------ 对外
 
-    def build_skills_summary(self) -> str:
-        """
-        生成技能摘要(用于拼进 System Prompt)
+    def names(self) -> list[str]:
+        """已索引的技能名(按字典序)."""
+        return sorted(self._skills)
 
-        :return: 引导语 + 每行 ``- name (子目录/SKILL.md): description``;
-                 目录不存在或没有任何技能时返回空字符串
-        """
-        if not os.path.isdir(self.skills_dir):
+    def skills(self) -> list[Skill]:
+        """已索引的技能(按目录扫描顺序)."""
+        return list(self._skills.values())
+
+    def get(self, name: str) -> Optional[Skill]:
+        """按名精确查索引; 未知名返回 None(不触碰文件系统)."""
+        return self._skills.get(str(name).strip())
+
+    def load(self, name: str) -> Optional[str]:
+        """按名取技能正文(已去掉 frontmatter); 未知名返回 None."""
+        skill = self.get(name)
+        return None if skill is None else skill.body
+
+    def summary(self) -> str:
+        """生成技能摘要(用于拼进 System Prompt); 无技能时返回空字符串."""
+        if not self._skills:
             return ""
-
-        records = self._scan()
-        if not records:
-            return ""
-
-        lines = [
-            f"- {record['name']} ({record['dir']}/{SKILL_FILE_NAME}): {record['description']}"
-            for record in records
-        ]
+        lines = [skill.summary_line() for skill in self._skills.values()]
         return SKILLS_SUMMARY_HEADER + "\n".join(lines) + "\n"
-
-    def load_skill(self, name: str) -> Optional[str]:
-        """
-        按技能名加载正文(已去掉 frontmatter)
-
-        :param name: 技能子目录名
-        :return: 正文; 找不到或读取失败返回 None
-        """
-        skill_dir = os.path.join(self.skills_dir, name)
-        if not self._is_inside_skills_dir(skill_dir):
-            logger.warning("拒绝越界访问技能: %r", name)
-            return None
-
-        skill_file = os.path.join(skill_dir, SKILL_FILE_NAME)
-        try:
-            content = Path(skill_file).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            logger.warning("加载技能失败: %s (%r)", skill_file, exc)
-            return None
-
-        _, body = self._parse_frontmatter(content)
-        return body
-
-    def list_skills(self) -> list[dict[str, Any]]:
-        """
-        列出已发现的技能(调试/管理用)
-
-        :return: ``[{{"name": ..., "description": ..., "path": SKILL.md 绝对路径}}, ...]``
-        """
-        return [
-            {
-                "name": record["name"],
-                "description": record["description"],
-                "path": record["path"],
-            }
-            for record in self._scan()
-        ]

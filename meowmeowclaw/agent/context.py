@@ -40,7 +40,7 @@ class ContextBuilder:
         workspace: 工作区根目录, 也是文件工具的操作范围(会归一化为绝对路径)
         identity_path: 人设文件路径; 由装配层传入绝对路径(通常为 ``<项目根>/identity.md``),
                        相对路径按进程当前工作目录解析
-        skills_summary: 技能摘要文本(来自 SkillsLoader.build_skills_summary());
+        skills_summary: 技能摘要文本(来自 SkillCatalog.summary());
             非空时在 System Prompt 末尾追加 "## 可用技能" 章节
 
     注意:

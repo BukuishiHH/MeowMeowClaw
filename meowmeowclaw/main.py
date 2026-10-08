@@ -18,7 +18,6 @@ from pathlib import Path
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
-from meowmeowclaw.agent.tools.load_skill import LoadSkillTool
 from meowmeowclaw.agent.tools.registry import ToolRegistry
 from meowmeowclaw.agent.tools.shell import ExecTool
 from meowmeowclaw.agent.tools.web_fetch import WebFetchTool
@@ -26,7 +25,7 @@ from meowmeowclaw.agent.tools.web_search import WebSearchTool
 from meowmeowclaw.config import Settings, load_config
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
-from meowmeowclaw.skills import SkillsLoader
+from meowmeowclaw.skills import LoadSkillTool, SkillCatalog, SkillConfigError
 
 # 应用显示名(项目名见 README 与人设文件)
 APP_NAME = "MeowMeowClaw"
@@ -81,13 +80,20 @@ def build_agent() -> AgentLoop:
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
 
-    # 技能: 内置在 <包>/skills/builtin/ 下, 每个子目录一个 SKILL.md, 随代码分发
-    skills_loader = SkillsLoader()
-    skills_summary = skills_loader.build_skills_summary()
+    # 技能: 内置在 <包>/skills/builtin/ 下, 启动扫描一次并建立索引
+    try:
+        skill_catalog = SkillCatalog()
+    except SkillConfigError as exc:
+        print(f"[启动失败] 技能配置错误: {exc}")
+        sys.exit(1)
+
+    skills_summary = skill_catalog.summary()
     if skills_summary:
-        print(f"发现 {len(skills_loader.list_skills())} 个技能: {skills_loader.skills_dir}")
+        print(f"发现 {len(skill_catalog)} 个技能: {skill_catalog.root}")
         # 有技能才注册 load_skill: 没技能时不该给模型一个必然失败的工具
-        tools.register(LoadSkillTool(skills_loader))
+        tools.register(LoadSkillTool(skill_catalog))
+    else:
+        print("[启动警告] 未发现内置技能, load_skill 不会注册")
 
     context = ContextBuilder(
         config.workspace, IDENTITY_FILE, skills_summary=skills_summary

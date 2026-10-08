@@ -3,7 +3,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 14 个源码模块 / 约 2200 行; 测试 14 个文件 / **622 个用例**(610 passed + 6 skipped + 6 xfailed)
+- **代码规模**: 17 个源码模块 / 约 2400 行; 测试 14 个文件 / **613 个用例**(601 passed + 6 skipped + 6 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -116,9 +116,10 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/agent/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
 | `meowmeowclaw/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
 | `meowmeowclaw/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
-| `meowmeowclaw/agent/tools/load_skill.py` | 82 | 技能加载工具(内置技能按需取回正文的入口) | `LoadSkillTool` |
+| `meowmeowclaw/skills/loader.py` | 237 | 技能扫描/索引/摘要(importlib.resources + 启动扫描一次) | `SkillCatalog` |
+| `meowmeowclaw/skills/models.py` | 33 | 技能数据模型与配置错误 | `Skill` / `SkillConfigError` |
+| `meowmeowclaw/skills/tool.py` | 85 | `load_skill` 工具(技能子系统对 Agent 的唯一出口) | `LoadSkillTool` |
 | `meowmeowclaw/agent/context.py` | 150 | 组装 System Prompt 与 messages(人设路径显式注入) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
-| `meowmeowclaw/skills/loader.py` | 221 | 内置技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
 | `meowmeowclaw/agent/loop.py` | 241 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
 | `meowmeowclaw/main.py` | 215 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
 
@@ -190,11 +191,11 @@ description: 在工作区内执行 Shell 命令的用法与安全限制
 
 | 环节 | 实现 |
 | --- | --- |
-| 扫描 / 解析 | `skills/loader.py :: SkillsLoader`(frontmatter 解析、坏文件跳过、按目录名排序) |
-| 注入提示词 | `main.build_agent()` 把摘要传给 `ContextBuilder(skills_summary=...)`, `build_system_prompt()` 追加 `## 可用技能` 章节 |
-| 按需取回 | `agent/tools/load_skill.py :: LoadSkillTool`(**有技能时才注册**), 模型调用 `load_skill(name="exec")` |
+| 扫描 / 解析 | `skills/loader.py :: SkillCatalog`(importlib.resources、启动扫描一次、坏 YAML 跳过、重名报错) |
+| 注入提示词 | `main.build_agent()` 把 `catalog.summary()` 传给 `ContextBuilder(skills_summary=...)`, `build_system_prompt()` 追加 `## 可用技能` 章节 |
+| 按需取回 | `skills/tool.py :: LoadSkillTool`(**有技能时才注册**), 模型调用 `load_skill(name="exec")` |
 | 技能不存在 | 返回 `[错误] 未找到技能: xxx. 可用技能: ...`, 把可用名字回给模型便于自纠 |
-| 越界防护 | `load_skill("../xxx")`、绝对路径一律拒绝(`commonpath` 判定, 同前缀兄弟目录也拦得住) |
+| 越界防护 | 先按名**精确查内存索引**, 未知名直接返回错误, 不拼接路径、不触碰文件系统 |
 
 System Prompt 里最终长这样:
 
@@ -338,7 +339,7 @@ registry.register(HttpGetTool())     # 注册后模型即可见
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 610 passed, 6 skipped, 6 xfailed
+pytest                                        # 全量: 601 passed, 6 skipped, 6 xfailed
 pytest tests/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ```
@@ -353,8 +354,8 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 | `test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
 | `test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
 | `test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
-| `test_skills.py` | 53 | frontmatter 12 类边界、摘要排序与回退、越界拦截、自带技能内容 |
-| `test_skills_tool.py` | 21 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
+| `skills/test_catalog.py` | 36 | frontmatter 边界、索引/摘要、坏 YAML 跳过、重名报错、内置资源可发现 |
+| `skills/test_tool.py` | 30 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
 | `test_context.py` | 47 | 人设查找链(工作区→项目根兜底)、时间实时取值、记忆/技能章节 |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
@@ -372,7 +373,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 14 个测试文件 / 622 用例
+├── tests/                       # 14 个测试文件 / 613 用例
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -382,9 +383,11 @@ MeowMeowClaw/
     │   ├── context.py           # System Prompt / messages
     │   ├── loop.py              # AgentLoop 控制流
     │   └── tools/               # BaseTool · registry · filesystem · shell ·
-    │                            #   web_search · web_fetch · load_skill
+    │                            #   web_search · web_fetch
     ├── skills/
-    │   ├── loader.py            # SkillsLoader 技能扫描/解析
+    │   ├── loader.py            # SkillCatalog 扫描/索引/摘要
+    │   ├── models.py            # Skill / SkillConfigError
+    │   ├── tool.py              # load_skill 工具(子系统唯一出口)
     │   └── builtin/             # 6 个内置技能(每子目录一个 SKILL.md, 随包发布)
     └── providers/               # LLMProvider - OpenAICompatProvider
 ```

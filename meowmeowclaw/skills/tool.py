@@ -1,15 +1,18 @@
-"""把技能加载能力暴露成工具, 供模型按需取回 SKILL.md 正文.
+"""把技能目录暴露成 ``load_skill`` 工具, 供模型按需取回 SKILL.md 正文.
 
 为什么要有这个工具: 技能是随代码分发的内置资源, read_file 只能读工作区内的文件;
 即使用户拷贝一份到工作区, read_file 也会把 frontmatter 一并读回来。用专门的工具直接
 返回"去掉 frontmatter 的正文"更干净, 也更符合"技能按需加载"的语义。
+
+本模块是技能子系统对 Agent 的唯一出口: 只依赖 ``BaseTool`` 契约与 ``SkillCatalog``,
+不反向依赖 agent 的控制流。
 """
 
 import logging
 from typing import Any
 
-from meowmeowclaw.agent.tools import BaseTool
-from meowmeowclaw.skills import SkillsLoader
+from meowmeowclaw.agent.tools.base import BaseTool
+from meowmeowclaw.skills.loader import SkillCatalog
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +25,14 @@ class LoadSkillTool(BaseTool):
     按名加载技能指南
 
     Args:
-        loader: 已配置好技能目录的 SkillsLoader 实例
+        catalog: 已完成扫描的技能索引(``SkillCatalog``)
     """
 
-    def __init__(self, loader: SkillsLoader) -> None:
-        self.loader = loader
+    def __init__(self, catalog: SkillCatalog) -> None:
+        self.catalog = catalog
 
     def __repr__(self) -> str:
-        return f"<Tool name={self.name}, label={self.label}, skills_dir={self.loader.skills_dir!r}>"
+        return f"<Tool name={self.name}, label={self.label}, skills={len(self.catalog)}>"
 
     # ------------------------------------------------------------------ 工具契约
 
@@ -51,7 +54,7 @@ class LoadSkillTool(BaseTool):
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "技能名, 取自系统提示的技能列表, 例如 pdf",
+                    "description": "技能名, 取自系统提示的技能列表, 例如 exec",
                 }
             },
             "required": ["name"],
@@ -71,12 +74,12 @@ class LoadSkillTool(BaseTool):
         if not name:
             return "[错误] 技能名不能为空"
 
-        content = self.loader.load_skill(name)
-        if content is None:
-            available = ", ".join(record["name"] for record in self.loader.list_skills()) or "无"
-            logger.warning("技能不存在或不可读: %r", name)
+        skill = self.catalog.get(name)
+        if skill is None:
+            available = ", ".join(self.catalog.names()) or "无"
+            logger.warning("技能不存在: %r", name)
             return f"[错误] 未找到技能: {name}. 可用技能: {available}"
 
-        if len(content) > MAX_SKILL_CHARS:
-            content = content[:MAX_SKILL_CHARS] + TRUNCATE_NOTICE
-        return content
+        if len(skill.body) > MAX_SKILL_CHARS:
+            return skill.body[:MAX_SKILL_CHARS] + TRUNCATE_NOTICE
+        return skill.body

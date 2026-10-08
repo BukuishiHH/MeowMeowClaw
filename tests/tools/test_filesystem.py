@@ -714,3 +714,36 @@ class TestMemoryProtection:
 
         assert result == "[成功] 文件已写入: memory/notes.md"
         assert not (Path(memory_workspace) / "memory" / "notes.md.bak").exists()
+
+
+# ------------------------------------------------- 符号链接逃逸防护(M7)
+
+
+class TestSymlinkHardening:
+    @pytest.mark.asyncio
+    async def test_symlink_to_outside_is_blocked(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("top-secret", encoding="utf-8")
+
+        file_link = workspace / "secret.txt"
+        dir_link = workspace / "linkdir"
+        try:
+            file_link.symlink_to(outside / "secret.txt")
+            dir_link.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:  # pragma: no cover - Windows 无权限创建符号链接
+            pytest.skip(f"当前环境无法创建符号链接: {exc}")
+
+        read_result = await ReadFileTool(str(workspace)).execute(file_path="secret.txt")
+        write_result = await WriteFileTool(str(workspace)).execute(
+            file_path="linkdir/pwned.txt", content="pwned"
+        )
+        list_result = await ListDirTool(str(workspace)).execute(dir_path="linkdir")
+
+        assert "[安全拦截]" in read_result
+        assert "[安全拦截]" in write_result
+        assert "[安全拦截]" in list_result
+        assert not (outside / "pwned.txt").exists()
+        assert (outside / "secret.txt").read_text(encoding="utf-8") == "top-secret"

@@ -1,6 +1,6 @@
 # MeowMeowClaw 记忆系统设计（v1：单用户 / CLI + QQ 私聊）
 
-> 状态：**范围与细节已确认，待实施**
+> 状态：**v1 已实现（M1-M7）**；里程碑到代码/测试的映射见 §14
 > v1 包含：短期记忆（按渠道隔离）+ `MEMORY.md` 最简长期记忆（跨渠道共享、Agent 可写）
 > 群聊、结构化长期记忆、多用户、多后端、加密均为"预留扩展"，见 §11
 > 关联：`docs/ARCHITECTURE.md`
@@ -551,3 +551,20 @@ async close() -> None
 | `--purge` | 直接执行，输入短 ID 即视为确认 |
 
 M1 实施范围：`SessionKey` / `SessionMessage` / `SessionMeta` / `SessionSummary` 类型 + `SessionStore` 抽象接口 + JSONL 实现 + 契约测试。
+
+
+---
+
+## 14. 实现状态（M1-M7）
+
+| 里程碑 | 状态 | 实现位置 | 测试 |
+|---|---|---|---|
+| M1 类型 / SessionStore / JSONL | ✅ | `meowmeowclaw/memory/{models,store,jsonl}.py` | `tests/memory/{contract.py,test_jsonl_store.py}` |
+| M2 编排 / 历史快照 | ✅ | `meowmeowclaw/conversation.py`、`agent/loop.py::run_turn` | `tests/test_conversation.py`、`tests/agent/test_loop.py` |
+| M3 CLI 接入 | ✅ | `config.py`/`paths.py`(memory_*)、`bootstrap.py`、`cli.py` | `tests/test_cli.py`、`tests/test_bootstrap.py`、`tests/test_config.py` |
+| M4 QQ 私聊 | ✅ | `meowmeowclaw/channels/{base,qq_private}.py` | `tests/channels/test_qq_private.py` |
+| M5 MEMORY.md 备份 / 约定 | ✅ | `tools/filesystem.py`、`agent/context.py` | `tests/tools/test_filesystem.py`、`tests/agent/test_context.py` |
+| M6 LongTermStore / Noop / 注入点 | ✅ | `memory/{models,store,noop}.py`、`agent/context.py` | `tests/memory/test_long_term.py`、`tests/agent/test_context.py` |
+| M7 并发 / 崩溃 / 工具边界 | ✅ | `memory/filelock.py`、`jsonl.py`(文件锁/补行)、`tools/filesystem.py`(realpath) | `tests/memory/test_filelock.py`、`tests/memory/test_jsonl_store.py`、`tests/tools/test_filesystem.py` |
+
+尚未实现（超出 v1 范围）: 结构化长期记忆的持久化后端；QQ 的 OneBot/NapCat 传输适配器；群聊；记忆加密。

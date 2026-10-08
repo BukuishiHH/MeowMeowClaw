@@ -4,6 +4,7 @@
 - 额外覆盖 JSONL 特有的文件布局、UTF-8 原文、损坏行容错、归档/删除、关闭语义与短 ID。
 """
 
+import asyncio
 import json
 
 import pytest
@@ -213,3 +214,70 @@ class TestJsonlDuplicatePrecedence:
 
         assert len(summaries) == 1
         assert summaries[0].archived is False
+
+
+# ------------------------------------------------- 并发与崩溃恢复(M7)
+
+
+class TestConcurrencyAndCrashRecovery:
+    @pytest.mark.asyncio
+    async def test_two_store_instances_serialize_appends(self, tmp_path):
+        root = tmp_path / "memory"
+        key = SessionKey(channel="cli", scope="session", conversation_id="conv", session_id="s9")
+        store_a = JsonlSessionStore(root)
+        store_b = JsonlSessionStore(root)
+
+        await asyncio.gather(
+            store_a.append_turn(key, [SessionMessage(role="user", content="A")]),
+            store_b.append_turn(key, [SessionMessage(role="user", content="B")]),
+        )
+
+        meta = await store_a.get_meta(key)
+        assert meta is not None
+        assert meta.turn_count == 2
+        loaded = await store_a.load_recent(key)
+        assert {message.content for message in loaded} == {"A", "B"}
+
+        path = store_a.sessions_dir / f"{key.storage_id}.jsonl"
+        turns = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if json.loads(line).get("type") == "turn"
+        ]
+        assert [turn["seq"] for turn in turns] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_partial_last_line_is_skipped_and_newline_restored(self, tmp_path):
+        store = JsonlSessionStore(tmp_path / "memory")
+        key = SessionKey(channel="cli", scope="session", conversation_id="conv", session_id="s10")
+        await store.append_turn(key, [SessionMessage(role="user", content="第一条")])
+        path = store.sessions_dir / f"{key.storage_id}.jsonl"
+
+        # 模拟崩溃: 末尾留下一个没有换行的半行 JSON
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"type":"turn","seq":2,"ts_ms":')
+
+        loaded = await store.load_recent(key)
+        meta = await store.get_meta(key)
+        assert [message.content for message in loaded] == ["第一条"]
+        assert meta is not None
+        assert meta.turn_count == 1
+
+        # 下一次写入应先补换行, 且 seq 从有效记录继续
+        await store.append_turn(key, [SessionMessage(role="user", content="第二条")])
+
+        loaded = await store.load_recent(key)
+        meta = await store.get_meta(key)
+        assert [message.content for message in loaded] == ["第一条", "第二条"]
+        assert meta is not None
+        assert meta.turn_count == 2
+
+        valid_turns = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") == "turn":
+                valid_turns.append(record)
+        assert [turn["seq"] for turn in valid_turns] == [1, 2]

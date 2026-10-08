@@ -32,11 +32,12 @@ def resolve_in_workspace(workspace: str, user_path: Any) -> str:
     :raises PathOutsideWorkspaceError: 目标落在工作区之外
     :raises TypeError: user_path 不是 str/bytes/os.PathLike
     """
-    base = os.path.abspath(os.fspath(workspace))
+    # realpath: 把工作区内指向外部的符号链接解析掉, 防止绕过路径防护(M7)
+    base = os.path.realpath(os.path.abspath(os.fspath(workspace)))
     raw = os.fspath(user_path)  # None/int 等在这里抛 TypeError, 由调用方包装成可读文本
     if isinstance(raw, bytes):
         raw = os.fsdecode(raw)
-    candidate = os.path.abspath(os.path.join(base, raw))
+    candidate = os.path.realpath(os.path.abspath(os.path.join(base, raw)))
 
     try:
         common = os.path.commonpath([candidate, base])
@@ -51,9 +52,9 @@ def resolve_in_workspace(workspace: str, user_path: Any) -> str:
 def is_within(path: str, base: str) -> bool:
     """path 是否落在 base 内(commonpath 判定, 防同前缀兄弟目录绕过)."""
     try:
-        return os.path.commonpath(
-            [os.path.abspath(path), os.path.abspath(base)]
-        ) == os.path.abspath(base)
+        real_path = os.path.realpath(os.path.abspath(path))
+        real_base = os.path.realpath(os.path.abspath(base))
+        return os.path.commonpath([real_path, real_base]) == real_base
     except ValueError:  # Windows 跨盘符
         return False
 
@@ -66,9 +67,11 @@ def is_memory_denied(absolute_path: str, memory_dir: str, *, listing: bool = Fal
     - ``memory`` 根目录: 仅列举时拒绝(读写本身会因"IsADirectory"失败);
     - 其他路径(含 ``memory/MEMORY.md``): 放行。
     """
-    if not is_within(absolute_path, memory_dir):
+    real_path = os.path.realpath(os.path.abspath(absolute_path))
+    real_memory = os.path.realpath(os.path.abspath(memory_dir))
+    if not is_within(real_path, real_memory):
         return False
-    relative = os.path.relpath(absolute_path, memory_dir)
+    relative = os.path.relpath(real_path, real_memory)
     if relative in (os.curdir, ""):
         return listing
     top = relative.split(os.sep, 1)[0]
@@ -113,8 +116,8 @@ class _MemoryAwareTool(BaseTool):
         return is_memory_denied(absolute_path, self.memory_dir, listing=listing)
 
     def _is_memory_file(self, absolute_path: str) -> bool:
-        return os.path.normcase(absolute_path) == os.path.normcase(
-            memory_file_path(self.memory_dir)
+        return os.path.normcase(os.path.realpath(absolute_path)) == os.path.normcase(
+            os.path.realpath(memory_file_path(self.memory_dir))
         )
 
 

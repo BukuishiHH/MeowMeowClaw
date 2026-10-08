@@ -18,11 +18,13 @@ import json
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
 from .errors import InvalidSessionKeyError, SessionStoreError
+from .filelock import async_file_lock
 from .models import (
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     MIN_SHORT_ID_LENGTH,
@@ -71,6 +73,7 @@ class JsonlSessionStore:
         max_tool_result_chars: int = DEFAULT_MAX_TOOL_RESULT_CHARS,
         fsync: bool = False,
         short_id_min_length: int = MIN_SHORT_ID_LENGTH,
+        lock_timeout: float = 5.0,
     ) -> None:
         self.root = Path(root).expanduser()
         self.sessions_dir = self.root / "sessions"
@@ -78,6 +81,7 @@ class JsonlSessionStore:
         self.max_tool_result_chars = int(max_tool_result_chars)
         self.fsync = bool(fsync)
         self.short_id_min_length = max(4, int(short_id_min_length))
+        self.lock_timeout = float(lock_timeout)
         self._locks: dict[str, asyncio.Lock] = {}
         self._closed = False
         self._ensure_dirs()
@@ -104,6 +108,18 @@ class JsonlSessionStore:
             lock = asyncio.Lock()
             self._locks[storage_id] = lock
         return lock
+
+    def _lock_path(self, storage_id: str) -> Path:
+        return self.sessions_dir / f"{storage_id}.jsonl.lock"
+
+    @asynccontextmanager
+    async def _session_guard(self, storage_id: str):
+        """会话级写保护: 进程内 asyncio.Lock + 跨进程文件锁."""
+        async with self._lock_for(storage_id):
+            async with async_file_lock(
+                self._lock_path(storage_id), timeout=self.lock_timeout
+            ):
+                yield
 
     def _active_path(self, key: SessionKey) -> Path:
         return self.sessions_dir / f"{key.storage_id}.jsonl"
@@ -212,9 +228,17 @@ class JsonlSessionStore:
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         is_new = not path.exists()
+        needs_newline = False
+        if not is_new:
+            # 崩溃可能留下没有换行的半行; 追加前先补一个换行, 避免与新记录粘连
+            with open(path, "rb") as probe:
+                probe.seek(-1, os.SEEK_END)
+                needs_newline = probe.read(1) != b"\n"
         with open(path, "a", encoding="utf-8") as handle:
             if is_new and header is not None:
                 handle.write(self._dumps(header) + "\n")
+            elif needs_newline:
+                handle.write("\n")
             handle.write(self._dumps(turn) + "\n")
             handle.flush()
             if self.fsync:
@@ -253,7 +277,7 @@ class JsonlSessionStore:
         if not normalized:
             raise SessionStoreError("append_turn 至少需要一条消息")
 
-        async with self._lock_for(key.storage_id):
+        async with self._session_guard(key.storage_id):
             path = self._active_path(key)
             state = await asyncio.to_thread(self._read_file, path)
             now = utc_now_ms()
@@ -475,7 +499,7 @@ class JsonlSessionStore:
         source = self._active_path(key)
         target = self._archive_path(key)
 
-        async with self._lock_for(key.storage_id):
+        async with self._session_guard(key.storage_id):
             def _move() -> None:
                 if not source.exists():
                     return
@@ -493,7 +517,7 @@ class JsonlSessionStore:
             raise SessionStoreError("key 必须是 SessionKey")
         paths = (self._active_path(key), self._archive_path(key))
 
-        async with self._lock_for(key.storage_id):
+        async with self._session_guard(key.storage_id):
             def _purge() -> None:
                 for path in paths:
                     try:

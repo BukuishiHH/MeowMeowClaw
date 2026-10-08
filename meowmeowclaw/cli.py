@@ -69,7 +69,7 @@ def _handle_command(command: str, app: Application) -> bool:
     name = command.strip().lower()
 
     if name in EXIT_COMMANDS:
-        print("再见!")
+        print("再见喵!")
         return True
     if name == "/clear":
         app.agent.clear_history()
@@ -102,10 +102,10 @@ async def interactive_loop(app: Application) -> None:
         try:
             user_input = input(PROMPT).strip()
         except KeyboardInterrupt:  # 提示符处 Ctrl+C: 直接优雅退出
-            print("\n(已按下 Ctrl+C) 再见!")
+            print("\n(已按下 Ctrl+C) 再见喵!")
             return
         except EOFError:  # Ctrl+D / 管道输入结束
-            print("\n(输入已结束) 再见!")
+            print("\n(输入已结束) 再见喵!")
             return
 
         if not user_input:
@@ -165,5 +165,5 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         asyncio.run(interactive_loop(app))
     except KeyboardInterrupt:  # 回答生成过程中 Ctrl+C: 不打印堆栈
-        print("\n已中断, 再见!")
+        print("\n已中断, 再见喵!")
     return 0

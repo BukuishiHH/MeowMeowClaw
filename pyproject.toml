@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meowmeowclaw"
+version = "0.1.0"
+description = "MeowMeowClaw: 一个会用工具的本地 CLI Agent(零编排框架)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "ddgs",
+    "html2text",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+meowmeowclaw = "meowmeowclaw.main:main"
+
+[tool.setuptools.packages.find]
+include = ["meowmeowclaw*"]
+
+# 内置技能迁入包内(阶段 2)后启用:
+# [tool.setuptools.package-data]
+# "meowmeowclaw.skills" = ["builtin/*/SKILL.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "network: 真实联网用例(默认跳过, 需 RUN_NETWORK_TESTS=1 才运行)",
+]

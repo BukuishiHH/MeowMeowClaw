@@ -11,11 +11,11 @@
 ## 1. 快速开始
 
 ```bash
-pip install openai python-dotenv httpx ddgs html2text pytest pytest-asyncio
+pip install -e ".[dev]"                  # 安装依赖 + 开发工具; 仅运行可去掉 [dev]
 
 cp .env.example .env
 export DEEPSEEK_API_KEY=sk-xxxx          # .env 里用 ${DEEPSEEK_API_KEY} 引用
-python -m backend.main                   # 或 python backend/main.py
+python -m meowmeowclaw                   # 安装后也可以直接运行 meowmeowclaw
 ```
 
 ### 交互命令
@@ -27,7 +27,7 @@ python -m backend.main                   # 或 python backend/main.py
 | `/clear` | 清空对话历史与工具调用记录 |
 | `/tools` | 查看已注册工具 |
 
-### 配置项(`.env`, 与 `backend/` 同级)
+### 配置项(`.env`, 与 `meowmeowclaw/` 同级)
 
 优先级: **系统环境变量 > .env 文件 > 代码默认值**. 相对路径一律按**项目根**解析, 不随当前工作目录漂移.
 
@@ -38,7 +38,7 @@ python -m backend.main                   # 或 python backend/main.py
 | `base_url` | `https://api.deepseek.com` | OpenAI 兼容服务地址 |
 | `workspace` | `<项目根>/workspace` | 留空或写 `.` 均表示该预设; 加载时自动创建 |
 | `max_iterations` | `32` | 单轮"模型↔工具"往返上限; 非法值回退默认 |
-| `identity_file` | `identity.md` | 人设文件: 优先 `workspace/` 再兜底 `backend/` |
+| `identity_file` | `identity.md` | 人设文件: 优先 `workspace/` 再兜底 `meowmeowclaw/` |
 
 ### 内置工具(默认注册 6 个; 发现技能时额外注册 `load_skill`)
 
@@ -105,20 +105,20 @@ python -m backend.main                   # 或 python backend/main.py
 
 | 模块 | 行数 | 职责 | 关键 API |
 | --- | ---: | --- | --- |
-| `backend/config.py` | 149 | 读 `.env`、校验兜底、解析并创建工作目录 | `load_config()` / `settings` / `Settings` |
-| `backend/providers/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
-| `backend/providers/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
-| `backend/agent/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
-| `backend/agent/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
-| `backend/agent/tools/filesystem.py` | 163 | 本地文件读写/列目录 | `ReadFileTool` / `WriteFileTool` / `ListDirTool` |
-| `backend/agent/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
-| `backend/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
-| `backend/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
-| `backend/agent/tools/load_skill.py` | 83 | 技能加载工具(绕开 read_file 的工作区限制) | `LoadSkillTool` |
-| `backend/agent/context.py` | 181 | 组装 System Prompt 与 messages(可注入技能摘要) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
-| `backend/agent/skills.py` | 216 | 技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
-| `backend/agent/loop.py` | 236 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
-| `backend/main.py` | 207 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
+| `meowmeowclaw/config.py` | 149 | 读 `.env`、校验兜底、解析并创建工作目录 | `load_config()` / `settings` / `Settings` |
+| `meowmeowclaw/providers/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
+| `meowmeowclaw/providers/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
+| `meowmeowclaw/agent/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
+| `meowmeowclaw/agent/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
+| `meowmeowclaw/agent/tools/filesystem.py` | 163 | 本地文件读写/列目录 | `ReadFileTool` / `WriteFileTool` / `ListDirTool` |
+| `meowmeowclaw/agent/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
+| `meowmeowclaw/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
+| `meowmeowclaw/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
+| `meowmeowclaw/agent/tools/load_skill.py` | 83 | 技能加载工具(绕开 read_file 的工作区限制) | `LoadSkillTool` |
+| `meowmeowclaw/agent/context.py` | 181 | 组装 System Prompt 与 messages(可注入技能摘要) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
+| `meowmeowclaw/agent/skills.py` | 216 | 技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
+| `meowmeowclaw/agent/loop.py` | 236 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
+| `meowmeowclaw/main.py` | 207 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -275,7 +275,7 @@ export NO_PROXY="127.0.0.1,localhost,::1,*.local,10.0.0.0/8,172.16.0.0/12,192.16
 
 ```bash
 curl -x http://127.0.0.1:7897 -o /dev/null -w '%{http_code}\n' https://duckduckgo.com/
-RUN_NETWORK_TESTS=1 pytest backend/test/ -m network -q     # 真实联网用例
+RUN_NETWORK_TESTS=1 pytest tests/ -m network -q     # 真实联网用例
 ```
 
 ---
@@ -334,7 +334,7 @@ registry.register(HttpGetTool())     # 注册后模型即可见
 
 ```bash
 pytest                                        # 全量: 610 passed, 6 skipped, 6 xfailed
-pytest backend/test/test_loop.py -v
+pytest tests/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ```
 
@@ -350,7 +350,7 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 | `test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
 | `test_skills.py` | 53 | frontmatter 12 类边界、摘要排序与回退、越界拦截、自带技能内容 |
 | `test_skills_tool.py` | 21 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
-| `test_context.py` | 47 | 人设查找链(工作区→backend 兜底)、时间实时取值、记忆/技能章节 |
+| `test_context.py` | 47 | 人设查找链(工作区→meowmeowclaw 兜底)、时间实时取值、记忆/技能章节 |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
 | `test_loop.py` | 35 | 消息格式、防爆阈值、历史写入策略、配置驱动默认值 |
@@ -365,9 +365,9 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 MeowMeowClaw/
 ├── .env / .env.example          # 配置与模板(密钥不入库)
 ├── pytest.ini                   # pythonpath=., 注册 network 标记
-├── workspace/                   # 运行时工作区: 与 backend/ 同级, 自动创建
+├── workspace/                   # 运行时工作区: 与 meowmeowclaw/ 同级, 自动创建
 │   └── skills/                # 技能目录: 每子目录一个 SKILL.md (自带 6 个工具用法)
-└── backend/
+└── meowmeowclaw/
     ├── config.py                # 配置加载
     ├── identity.md              # 人设(可被 workspace/identity.md 覆盖)
     ├── main.py                  # 入口(装配 + 交互)

@@ -12,12 +12,10 @@
 """
 
 import asyncio
-import os
 import sys
 
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
-from meowmeowclaw.agent.skills import SkillsLoader
 from meowmeowclaw.agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
 from meowmeowclaw.agent.tools.load_skill import LoadSkillTool
 from meowmeowclaw.agent.tools.registry import ToolRegistry
@@ -26,6 +24,7 @@ from meowmeowclaw.agent.tools.web_fetch import WebFetchTool
 from meowmeowclaw.agent.tools.web_search import WebSearchTool
 from meowmeowclaw.config import Settings, load_config
 from meowmeowclaw.providers.openai_compat import OpenAICompatProvider
+from meowmeowclaw.skills import SkillsLoader
 
 # 应用显示名(项目名见 README 与人设文件)
 APP_NAME = "MeowMeowClaw"
@@ -73,12 +72,11 @@ def build_agent() -> AgentLoop:
     tools.register(WebSearchTool())
     tools.register(WebFetchTool())
 
-    # 技能: 约定放在工作区下的 skills/ 目录, 每个子目录一个 SKILL.md
-    skills_dir = os.path.join(config.workspace, "skills")
-    skills_loader = SkillsLoader(skills_dir)
+    # 技能: 内置在 <包>/skills/builtin/ 下, 每个子目录一个 SKILL.md, 随代码分发
+    skills_loader = SkillsLoader()
     skills_summary = skills_loader.build_skills_summary()
     if skills_summary:
-        print(f"发现 {len(skills_loader.list_skills())} 个技能: {skills_dir}")
+        print(f"发现 {len(skills_loader.list_skills())} 个技能: {skills_loader.skills_dir}")
         # 有技能才注册 load_skill: 没技能时不该给模型一个必然失败的工具
         tools.register(LoadSkillTool(skills_loader))
 

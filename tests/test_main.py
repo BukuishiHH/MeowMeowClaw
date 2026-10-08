@@ -12,7 +12,6 @@
 
 import asyncio
 import copy
-import pathlib
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -30,6 +29,8 @@ WORKSPACE = "/tmp/fake-workspace"
 
 # build_agent() 应当注册的工具清单(新增工具时只改这一处, 计数与断言自动跟随)
 EXPECTED_TOOLS = ("read_file", "write_file", "list_dir", "exec", "web_search", "web_fetch")
+# 内置技能随包分发, 默认总能发现 6 个技能, 因此 load_skill 总是会被注册
+EXPECTED_ALL_TOOLS = EXPECTED_TOOLS + ("load_skill",)
 
 
 # --------------------------------------------------------------------- 测试替身
@@ -129,8 +130,8 @@ class TestBuildAgent:
         assert agent.provider.api_key == config.api_key
         assert agent.provider.base_url == config.base_url
         assert agent.provider.model == config.model
-        # 工具清单与预期完全一致(多一个少一个都要失败)
-        assert agent.tools.list_tools() == list(EXPECTED_TOOLS)
+        # 工具清单与预期完全一致(多一个少一个都要失败): 6 内置 + 内置技能带来的 load_skill
+        assert agent.tools.list_tools() == list(EXPECTED_ALL_TOOLS)
         # Context 与 Loop 的配置
         assert isinstance(agent.context, ContextBuilder)
         assert agent.context.workspace == config.workspace
@@ -152,8 +153,8 @@ class TestBuildAgent:
         main_module.build_agent()
 
         out = capsys.readouterr().out
-        assert f"已注册工具({len(EXPECTED_TOOLS)} 个)" in out
-        for name in EXPECTED_TOOLS:
+        assert f"已注册工具({len(EXPECTED_ALL_TOOLS)} 个)" in out
+        for name in EXPECTED_ALL_TOOLS:
             assert name in out
 
     def test_startup_output_does_not_leak_api_key(self, monkeypatch, capsys):
@@ -189,19 +190,24 @@ class TestBuildAgent:
 
 
 class TestBuildAgentSkills:
-    @staticmethod
-    def write_skill(workspace: pathlib.Path, dir_name: str, name: str, description: str) -> None:
-        skill_dir = workspace / "skills" / dir_name
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(
-            f"---\nname: {name}\ndescription: {description}\n---\n# 指南\n正文\n",
-            encoding="utf-8",
-        )
+    """build_agent 固定加载包内置技能; workspace/skills 不再参与技能发现."""
 
-    def test_skills_are_loaded_from_workspace_and_count_is_printed(
-        self, monkeypatch, capsys, tmp_path
-    ):
-        self.write_skill(tmp_path, "pdf", "pdf", "处理 PDF 文件")
+    @staticmethod
+    def make_empty_loader(*args, **kwargs):
+        """返回一个"没有任何技能"的假 loader, 用于覆盖无技能分支."""
+
+        class _EmptyLoader:
+            skills_dir = "/nonexistent/skills"
+
+            def build_skills_summary(self) -> str:
+                return ""
+
+            def list_skills(self) -> list:
+                return []
+
+        return _EmptyLoader()
+
+    def test_builtin_skills_are_loaded_and_count_is_printed(self, monkeypatch, capsys, tmp_path):
         monkeypatch.setattr(
             main_module, "load_config", lambda *a, **k: make_settings(workspace=str(tmp_path))
         )
@@ -209,25 +215,35 @@ class TestBuildAgentSkills:
         agent = main_module.build_agent()
 
         out = capsys.readouterr().out
-        assert f"发现 1 个技能: {tmp_path}/skills" in out
-        # 方案B: 有技能时才注册 load_skill, 并出现在工具清单里
-        assert agent.tools.list_tools() == list(EXPECTED_TOOLS) + ["load_skill"]
+        assert "发现 6 个技能:" in out
+        assert "skills/builtin" in out
+        # 有技能才注册 load_skill, 并出现在工具清单里
+        assert agent.tools.list_tools() == list(EXPECTED_ALL_TOOLS)
         system_prompt = agent.context.build_system_prompt()
         assert "## 可用技能" in system_prompt
-        assert "- pdf (pdf/SKILL.md): 处理 PDF 文件" in system_prompt
+        assert "- exec (exec/SKILL.md): " in system_prompt
 
-    def test_multiple_skills_count(self, monkeypatch, capsys, tmp_path):
-        self.write_skill(tmp_path, "pdf", "pdf", "处理 PDF")
-        self.write_skill(tmp_path, "docx", "docx", "读写 Word")
+    def test_workspace_skills_are_ignored(self, monkeypatch, capsys, tmp_path):
+        # 技能只来自包内置目录: 用户往 workspace/skills 放技能不应被读取
+        skill_dir = tmp_path / "skills" / "pdf"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: pdf\ndescription: 处理 PDF 文件\n---\n# 指南\n正文\n", encoding="utf-8"
+        )
         monkeypatch.setattr(
             main_module, "load_config", lambda *a, **k: make_settings(workspace=str(tmp_path))
         )
 
-        main_module.build_agent()
+        agent = main_module.build_agent()
 
-        assert "发现 2 个技能" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "发现 6 个技能:" in out
+        assert "pdf" not in out
+        assert "pdf" not in agent.context.build_system_prompt()
 
-    def test_missing_skills_dir_is_silent(self, monkeypatch, capsys, tmp_path):
+    def test_empty_skills_are_silent_and_tool_not_registered(self, monkeypatch, capsys, tmp_path):
+        # 内置资源缺失/为空时: 不打印发现信息, 不注入技能章节, 不注册 load_skill
+        monkeypatch.setattr(main_module, "SkillsLoader", self.make_empty_loader)
         monkeypatch.setattr(
             main_module, "load_config", lambda *a, **k: make_settings(workspace=str(tmp_path))
         )
@@ -236,27 +252,10 @@ class TestBuildAgentSkills:
 
         assert "发现" not in capsys.readouterr().out
         assert "## 可用技能" not in agent.context.build_system_prompt()
-        assert "load_skill" not in agent.tools.list_tools()  # 没技能就不该注册它
-
-    def test_skills_dir_is_workspace_scoped_not_project_root(self, monkeypatch, capsys, tmp_path):
-        # 技能必须取自 <workspace>/skills; 项目根下的 skills/ 不应被误用
-        project_skills = pathlib.Path(main_module.__file__).resolve().parents[1] / "skills"
-        assert not project_skills.exists() or True  # 仅说明: 本用例不依赖它
-        other = tmp_path / "elsewhere" / "skills" / "pdf"
-        other.mkdir(parents=True)
-        (other / "SKILL.md").write_text("---\nname: pdf\n---\n正文\n", encoding="utf-8")
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        monkeypatch.setattr(
-            main_module, "load_config", lambda *a, **k: make_settings(workspace=str(workspace))
-        )
-
-        agent = main_module.build_agent()
-
-        assert "发现" not in capsys.readouterr().out
-        assert "## 可用技能" not in agent.context.build_system_prompt()
+        assert "load_skill" not in agent.tools.list_tools()
 
     def test_empty_summary_passed_when_no_skills(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main_module, "SkillsLoader", self.make_empty_loader)
         monkeypatch.setattr(
             main_module, "load_config", lambda *a, **k: make_settings(workspace=str(tmp_path))
         )

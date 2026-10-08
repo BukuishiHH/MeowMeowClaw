@@ -1,8 +1,8 @@
 """meowmeowclaw/agent/tools/load_skill.py 的单元测试.
 
 LoadSkillTool 是"技能系统"对模型的唯一入口: 它把 SkillsLoader 的按名加载能力
-暴露成工具, 从而绕开 read_file 的工作区路径限制。这里既验证工具契约与行为,
-也验证它与引导语(skills.py)的口径一致 —— 引导语说"调用 load_skill", 工具就必须真的在。
+暴露成工具, 从而让模型无需接触工作区文件即可取回内置技能正文。这里既验证工具契约与行为,
+也验证它与引导语(skills/loader.py)的口径一致 —— 引导语说"调用 load_skill", 工具就必须真的在。
 
 运行: pytest tests/test_skills_tool.py -v
 """
@@ -12,10 +12,10 @@ from typing import Any, Optional
 
 import pytest
 
-from meowmeowclaw.agent.skills import SKILLS_SUMMARY_HEADER, SkillsLoader
 from meowmeowclaw.agent.tools import BaseTool, LoadSkillTool
 from meowmeowclaw.agent.tools.load_skill import MAX_SKILL_CHARS, TRUNCATE_NOTICE
 from meowmeowclaw.agent.tools.registry import ToolRegistry
+from meowmeowclaw.skills import SKILLS_SUMMARY_HEADER, SkillsLoader
 
 
 def write_skill(root: pathlib.Path, dir_name: str, name: str, description: str, body: str) -> pathlib.Path:

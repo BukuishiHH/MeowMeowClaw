@@ -1,16 +1,15 @@
 """把技能加载能力暴露成工具, 供模型按需取回 SKILL.md 正文.
 
-为什么要有这个工具: 技能文件位于工作区下的 skills/ 目录, 而 read_file 的路径是相对
-工作区解析的, 模型按摘要里的相对路径去 read_file 会差一层目录; 更重要的是 read_file
-会把 frontmatter 一并读回来。用专门的工具直接返回"去掉 frontmatter 的正文"更干净,
-也更符合"技能按需加载"的语义。
+为什么要有这个工具: 技能是随代码分发的内置资源, read_file 只能读工作区内的文件;
+即使用户拷贝一份到工作区, read_file 也会把 frontmatter 一并读回来。用专门的工具直接
+返回"去掉 frontmatter 的正文"更干净, 也更符合"技能按需加载"的语义。
 """
 
 import logging
 from typing import Any
 
-from meowmeowclaw.agent.skills import SkillsLoader
 from meowmeowclaw.agent.tools import BaseTool
+from meowmeowclaw.skills import SkillsLoader
 
 logger = logging.getLogger(__name__)
 

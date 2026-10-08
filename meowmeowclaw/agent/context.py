@@ -9,8 +9,8 @@
     messages = builder.build_messages(history=history, current_message="帮我改个 bug")
 
 人设文件的查找顺序(前者优先):
-    1. workspace/identity_file     -- 工作区里的人设, 随项目走
-    2. meowmeowclaw/identity_file       -- 项目自带兜底人设(identity.md 就放在这里)
+    1. workspace/identity_file  -- 工作区里的人设, 可临时覆盖
+    2. <项目根>/identity_file   -- 项目自带人设(identity.md 固定放在项目根)
 两者都不可用时回退 DEFAULT_IDENTITY.
 """
 
@@ -22,8 +22,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# 人设兜底目录: 项目 meowmeowclaw/ 目录(与 agent/ 同级), 工作区里没放人设时用它自带的 identity.md
-FALLBACK_IDENTITY_DIR = str(Path(__file__).resolve().parents[1])
+# 人设兜底目录: 项目根目录, 工作区里没放人设时读取根目录的 identity.md
+FALLBACK_IDENTITY_DIR = str(Path(__file__).resolve().parents[2])
 
 # 人设文件全都不可用时的兜底人设
 DEFAULT_IDENTITY = "你是 MeowMeowClaw, 一个善解人意的 AI 助手, 可以调用工具帮用户读写文件、分析代码."
@@ -41,7 +41,7 @@ class ContextBuilder:
 
     Args:
         workspace: 工作区根目录, 也是文件工具的操作范围(会归一化为绝对路径)
-        identity_file: 人设文件名; 绝对路径直接使用, 相对路径先查 workspace/ 再兜底 meowmeowclaw/
+        identity_file: 人设文件名; 绝对路径直接使用, 相对路径先查 workspace/ 再兜底项目根
         skills_summary: 技能摘要文本(来自 SkillsLoader.build_skills_summary());
             非空时在 System Prompt 末尾追加 "## 可用技能" 章节
 
@@ -60,10 +60,10 @@ class ContextBuilder:
         self.identity_file = identity_file
         # 技能摘要由调用方(如 main.build_agent)注入, ContextBuilder 不关心技能从哪来
         self.skills_summary = skills_summary
-        # 候选路径按优先级排列: [工作区, meowmeowclaw/]
+        # 候选路径按优先级排列: [工作区, 项目根]
         self.identity_candidates = self._resolve_identity_candidates(identity_file)
         self.identity_path = self.identity_candidates[0]            # 首选: 工作区
-        self.fallback_identity_path = self.identity_candidates[1]   # 兜底: 项目 meowmeowclaw/
+        self.fallback_identity_path = self.identity_candidates[1]   # 兜底: 项目根
 
     def __repr__(self) -> str:
         return (
@@ -76,7 +76,7 @@ class ContextBuilder:
         """
         解析人设文件候选路径
 
-        :return: (首选路径, 兜底路径); 首个是工作区下的文件, 次个是 meowmeowclaw/ 下的同名文件
+        :return: (首选路径, 兜底路径); 首个是工作区下的文件, 次个是项目根下的同名文件
         """
         primary = (
             identity_file
@@ -94,7 +94,7 @@ class ContextBuilder:
     # ------------------------------------------------------------------ 私有加载
 
     def _load_identity(self) -> str:
-        """按 工作区 → meowmeowclaw/ 顺序取第一个非空人设; 都不可用则返回默认人设."""
+        """按 工作区 → 项目根 顺序取第一个非空人设; 都不可用则返回默认人设."""
         for path in self.identity_candidates:
             content = self._read_identity_candidate(path)
             if content:

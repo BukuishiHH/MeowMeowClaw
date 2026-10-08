@@ -1,4 +1,4 @@
-"""meowmeowclaw/agent/skills.py 的单元测试.
+"""meowmeowclaw/skills/loader.py 的单元测试.
 
 测试策略:
 - 全部使用 tmp_path 里的真实文件树, 覆盖面最广(目录缺失/非目录/无 SKILL.md/坏 YAML/不可读);
@@ -15,14 +15,14 @@ from typing import Any, Optional
 
 import pytest
 
-from meowmeowclaw.agent.skills import (
+from meowmeowclaw.config import PROJECT_ROOT
+from meowmeowclaw.skills import (
+    BUILTIN_SKILLS_DIR,
     DEFAULT_DESCRIPTION,
-    DEFAULT_SKILLS_DIR,
     SKILL_FILE_NAME,
     SKILLS_SUMMARY_HEADER,
     SkillsLoader,
 )
-from meowmeowclaw.config import PRESET_WORKSPACE, PROJECT_ROOT
 
 # 规格要求的摘要引导语(按项目"统一英文标点"约定落地)
 EXPECTED_HEADER = (
@@ -99,7 +99,7 @@ class TestParseFrontmatter:
     def test_missing_closing_fence_is_treated_as_no_frontmatter(self, caplog):
         content = "---\nname: pdf\n正文没有结束符\n"
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.skills"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.skills.loader"):
             metadata, body = SkillsLoader._parse_frontmatter(content)
 
         assert (metadata, body) == ({}, content)
@@ -108,7 +108,7 @@ class TestParseFrontmatter:
     def test_malformed_yaml_is_treated_as_no_frontmatter(self, caplog):
         content = "---\nname: [未闭合\n---\n正文\n"
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.skills"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.skills.loader"):
             metadata, body = SkillsLoader._parse_frontmatter(content)
 
         assert (metadata, body) == ({}, content)
@@ -247,7 +247,7 @@ class TestBuildSkillsSummary:
 
         monkeypatch.setattr(pathlib.Path, "read_text", fake_read_text)
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.skills"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.skills.loader"):
             result = SkillsLoader(str(skills_root)).build_skills_summary()
 
         assert "- good (good/SKILL.md): 正常技能" in result
@@ -289,7 +289,7 @@ class TestLoadSkill:
         outside = tmp_path / "outside"
         write_skill(outside, "secret", name="secret", description="机密")
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.skills"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.skills.loader"):
             result = SkillsLoader(str(skills_root)).load_skill("../outside/secret")
 
         assert result is None
@@ -317,7 +317,7 @@ class TestLoadSkill:
 
         monkeypatch.setattr(pathlib.Path, "read_text", boom)
 
-        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.skills"):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.skills.loader"):
             assert SkillsLoader(str(skills_root)).load_skill("blocked") is None
 
         assert any("加载技能失败" in r.message for r in caplog.records)
@@ -376,8 +376,8 @@ class TestListSkills:
 
 
 class TestSkillsDirResolution:
-    def test_default_is_project_root_skills(self):
-        assert SkillsLoader().skills_dir == str(PROJECT_ROOT / DEFAULT_SKILLS_DIR)
+    def test_default_is_builtin_skills(self):
+        assert SkillsLoader().skills_dir == BUILTIN_SKILLS_DIR
 
     def test_relative_path_resolves_against_project_root_not_cwd(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -398,24 +398,24 @@ class TestSkillsDirResolution:
 
 
 class TestShippedSkills:
-    """workspace/skills 下自带"工具用法"技能, 这里保证它们始终可被发现且 frontmatter 合法."""
+    """包内 skills/builtin 自带"工具用法"技能, 这里保证它们始终可被发现且 frontmatter 合法."""
 
     TOOL_SKILLS = ("exec", "list_dir", "read_file", "web_fetch", "web_search", "write_file")
 
     def test_tool_skills_exist_and_are_parsable(self):
-        loader = SkillsLoader(os.path.join(str(PRESET_WORKSPACE), "skills"))
+        loader = SkillsLoader()  # 默认即内置技能目录
 
         found = {record["name"]: record for record in loader.list_skills()}
 
         missing = [name for name in self.TOOL_SKILLS if name not in found]
-        assert not missing, f"workspace/skills 缺少工具技能: {missing}"
+        assert not missing, f"skills/builtin 缺少工具技能: {missing}"
         for name in self.TOOL_SKILLS:
             assert found[name]["description"] != DEFAULT_DESCRIPTION, f"{name} 缺少 description"
             body = loader.load_skill(name)
             assert body and body.startswith("# "), f"{name} 正文异常"
 
     def test_summary_lists_all_tool_skills(self):
-        summary = SkillsLoader(os.path.join(str(PRESET_WORKSPACE), "skills")).build_skills_summary()
+        summary = SkillsLoader().build_skills_summary()
 
         for name in self.TOOL_SKILLS:
             assert f"- {name} ({name}/SKILL.md): " in summary

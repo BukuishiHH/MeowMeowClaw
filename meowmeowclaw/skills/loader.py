@@ -11,7 +11,7 @@ SKILL.md 约定(参考 Claude Skills / OpenClaw 的 frontmatter 写法)::
 
 用法::
 
-    loader = SkillsLoader()                 # 默认 <项目根>/skills
+    loader = SkillsLoader()                 # 默认内置技能目录 <包>/skills/builtin
     summary = loader.build_skills_summary() # 拼进 System Prompt
     guide = loader.load_skill("pdf")        # 按需加载正文
 
@@ -32,7 +32,8 @@ from meowmeowclaw.config import PROJECT_ROOT
 logger = logging.getLogger(__name__)
 
 SKILL_FILE_NAME = "SKILL.md"
-DEFAULT_SKILLS_DIR = "skills"
+# 内置技能资源目录: <包>/skills/builtin, 随代码入库与分发, 不依赖 workspace 与当前工作目录
+BUILTIN_SKILLS_DIR = os.path.normpath(str(Path(__file__).resolve().parent / "builtin"))
 DEFAULT_DESCRIPTION = "无描述"
 
 # frontmatter: 首行必须是独占一行的 ---, 结束符也是独占一行的 ---
@@ -51,16 +52,20 @@ class SkillsLoader:
     技能目录扫描器
 
     Args:
-        skills_dir: 技能目录; 相对路径按**项目根**解析(不随当前工作目录漂移),
-                    绝对路径原样使用。默认 ``<项目根>/skills``。
+        skills_dir: 技能目录; 不传时默认使用内置技能目录 ``BUILTIN_SKILLS_DIR``;
+                    显式传入的相对路径按**项目根**解析(不随当前工作目录漂移),
+                    绝对路径原样使用。
 
     容错约定:
         - 目录不存在 / 没有任何技能 -> 摘要返回空字符串;
         - 单个 SKILL.md 读不了或 YAML 坏了 -> 跳过该技能并打 warning, 不影响其余技能。
     """
 
-    def __init__(self, skills_dir: str = DEFAULT_SKILLS_DIR) -> None:
-        self.skills_dir = self._resolve_skills_dir(skills_dir)
+    def __init__(self, skills_dir: Optional[str] = None) -> None:
+        if skills_dir is None:
+            self.skills_dir = BUILTIN_SKILLS_DIR
+        else:
+            self.skills_dir = self._resolve_skills_dir(skills_dir)
 
     def __repr__(self) -> str:
         return f"<SkillsLoader skills_dir={self.skills_dir!r} skills={len(self.list_skills())}>"
@@ -69,7 +74,7 @@ class SkillsLoader:
 
     @staticmethod
     def _resolve_skills_dir(skills_dir: str) -> str:
-        """相对路径按项目根解析, 绝对路径原样(与 config.resolve_workspace 同一约定)."""
+        """显式传入的目录: 相对路径按项目根解析, 绝对路径原样(与 config.resolve_workspace 同一约定)."""
         path = Path(skills_dir).expanduser()
         if not path.is_absolute():
             path = PROJECT_ROOT / path

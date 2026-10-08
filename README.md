@@ -36,11 +36,12 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `model` | `deepseek-chat` | 模型名 |
 | `api_key` | 空(启动即提示并退出码 1) | 支持 `${ENV_VAR}` 引用系统环境变量 |
 | `base_url` | `https://api.deepseek.com` | OpenAI 兼容服务地址 |
-| `workspace` | `<项目根>/workspace` | 留空或写 `.` 均表示该预设; 加载时自动创建 |
+| `workspace` | `<项目根>/workspace` | 留空或写 `.` 均表示该预设; 可写绝对路径覆盖; 加载时自动创建 |
 | `max_iterations` | `32` | 单轮"模型↔工具"往返上限; 非法值回退默认 |
-| `identity_file` | `identity.md` | 人设文件: 优先 `workspace/` 再兜底 `meowmeowclaw/` |
 
-### 内置工具(默认注册 6 个; 发现技能时额外注册 `load_skill`)
+> 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
+
+### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)
 
 | 工具 | 能力 | 关键限制 |
 | --- | --- | --- |
@@ -85,7 +86,7 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 ┌────────────────────────────────────────────────────────────────▼───────────┐
 │ 配置层             config.py :: Settings + load_config()                   │
 │   .env → 环境变量 > 文件 > 默认值 → 校验/兜底 → 预设 workspace 自动创建    │
-│   技能目录 = <workspace>/skills   ·   统一数据契约: LLMResponse 等         │
+│   技能目录 = <包>/skills/builtin  ·   统一数据契约: LLMResponse 等         │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -114,11 +115,11 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/agent/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
 | `meowmeowclaw/agent/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
 | `meowmeowclaw/agent/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
-| `meowmeowclaw/agent/tools/load_skill.py` | 83 | 技能加载工具(绕开 read_file 的工作区限制) | `LoadSkillTool` |
+| `meowmeowclaw/agent/tools/load_skill.py` | 82 | 技能加载工具(内置技能按需取回正文的入口) | `LoadSkillTool` |
 | `meowmeowclaw/agent/context.py` | 181 | 组装 System Prompt 与 messages(可注入技能摘要) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
-| `meowmeowclaw/agent/skills.py` | 216 | 技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
+| `meowmeowclaw/skills/loader.py` | 221 | 内置技能扫描: frontmatter 解析 / 摘要 / 按名加载 | `SkillsLoader` |
 | `meowmeowclaw/agent/loop.py` | 236 | **控制流**: 多轮往返、防爆护栏、会话历史 | `AgentLoop.run()` / `clear_history()` |
-| `meowmeowclaw/main.py` | 207 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
+| `meowmeowclaw/main.py` | 198 | 入口: 装配(工具/技能/提示词) + 命令行交互 | `build_agent()` / `interactive_loop()` / `main()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -162,11 +163,14 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 ### 4.1 目录约定
 
 ```
-<workspace>/skills/
+meowmeowclaw/skills/builtin/       # 内置技能随包发布(入 git / 随 wheel)
 ├── exec/SKILL.md
 ├── read_file/SKILL.md
-└── ...                    # 每个子目录一个技能, 只扫描一层
+└── ...                            # 每个子目录一个技能, 只扫描一层
 ```
+
+> 技能不再放在 `workspace/` 下: `workspace/` 只保留 Agent 运行时产物, 内置技能随代码分发,
+> 保证全新克隆/安装后技能一定存在。
 
 `SKILL.md` 用 YAML frontmatter 描述元信息, 正文就是给模型看的指南:
 
@@ -185,7 +189,7 @@ description: 在工作区内执行 Shell 命令的用法与安全限制
 
 | 环节 | 实现 |
 | --- | --- |
-| 扫描 / 解析 | `agent/skills.py :: SkillsLoader`(frontmatter 解析、坏文件跳过、按目录名排序) |
+| 扫描 / 解析 | `skills/loader.py :: SkillsLoader`(frontmatter 解析、坏文件跳过、按目录名排序) |
 | 注入提示词 | `main.build_agent()` 把摘要传给 `ContextBuilder(skills_summary=...)`, `build_system_prompt()` 追加 `## 可用技能` 章节 |
 | 按需取回 | `agent/tools/load_skill.py :: LoadSkillTool`(**有技能时才注册**), 模型调用 `load_skill(name="exec")` |
 | 技能不存在 | 返回 `[错误] 未找到技能: xxx. 可用技能: ...`, 把可用名字回给模型便于自纠 |
@@ -204,9 +208,9 @@ System Prompt 里最终长这样:
 
 ### 4.3 自带技能
 
-仓库在 `workspace/skills/` 下自带 6 个"工具用法"技能(`read_file` / `write_file` / `list_dir` /
-`exec` / `web_search` / `web_fetch`), 把每个工具的参数、限制(截断 / 超时 / 命令黑名单 / SSRF 防护)
-与推荐用法写成指南 —— 相当于让 Agent 随身带一本自己的说明书.
+仓库在 `meowmeowclaw/skills/builtin/` 下自带 6 个"工具用法"技能(`read_file` / `write_file` /
+`list_dir` / `exec` / `web_search` / `web_fetch`), 把每个工具的参数、限制(截断 / 超时 / 命令黑名单 /
+SSRF 防护)与推荐用法写成指南 —— 技能随代码入库、随包分发, 克隆/安装后必然可用.
 
 ### 4.4 边界
 
@@ -350,7 +354,7 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 | `test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
 | `test_skills.py` | 53 | frontmatter 12 类边界、摘要排序与回退、越界拦截、自带技能内容 |
 | `test_skills_tool.py` | 21 | `load_skill` 契约、自纠提示、截断、与引导语口径一致 |
-| `test_context.py` | 47 | 人设查找链(工作区→meowmeowclaw 兜底)、时间实时取值、记忆/技能章节 |
+| `test_context.py` | 47 | 人设查找链(工作区→项目根兜底)、时间实时取值、记忆/技能章节 |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
 | `test_loop.py` | 35 | 消息格式、防爆阈值、历史写入策略、配置驱动默认值 |
@@ -364,21 +368,23 @@ RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ```
 MeowMeowClaw/
 ├── .env / .env.example          # 配置与模板(密钥不入库)
-├── pytest.ini                   # pythonpath=., 注册 network 标记
-├── workspace/                   # 运行时工作区: 与 meowmeowclaw/ 同级, 自动创建
-│   └── skills/                # 技能目录: 每子目录一个 SKILL.md (自带 6 个工具用法)
+├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
+├── identity.md                  # 人设文件(固定放项目根)
+├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
+├── tests/                       # 14 个测试文件 / 622 用例
 └── meowmeowclaw/
     ├── config.py                # 配置加载
-    ├── identity.md              # 人设(可被 workspace/identity.md 覆盖)
     ├── main.py                  # 入口(装配 + 交互)
+    ├── __main__.py              # python -m meowmeowclaw
     ├── agent/
     │   ├── context.py           # System Prompt / messages
     │   ├── loop.py              # AgentLoop 控制流
-    │   ├── skills.py            # SkillsLoader 技能扫描/解析
     │   └── tools/               # BaseTool · registry · filesystem · shell ·
     │                            #   web_search · web_fetch · load_skill
-    ├── providers/               # LLMProvider - OpenAICompatProvider
-    └── test/                    # 14 个测试文件 / 622 用例
+    ├── skills/
+    │   ├── loader.py            # SkillsLoader 技能扫描/解析
+    │   └── builtin/             # 6 个内置技能(每子目录一个 SKILL.md, 随包发布)
+    └── providers/               # LLMProvider - OpenAICompatProvider
 ```
 
 ---
@@ -390,5 +396,5 @@ MeowMeowClaw/
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
 - 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(路径前缀绕过、命令黑名单绕过、抓取重定向/重绑定)
 - 单实例 `AgentLoop` 不建议并发 `run()`(内部状态未加锁)
-- 无 `requirements.txt`(依赖见"快速开始"); 无 CI 配置
+- 工程配置见 `pyproject.toml`(依赖 / 控制台入口 / pytest); 暂无 CI 配置
 

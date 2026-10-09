@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 27 个源码模块 / 约 4800 行; 测试 21 个文件 / **774 个用例**(766 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 30 个源码模块 / 约 6300 行; 测试 24 个文件 / **921 个用例**(913 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -49,8 +49,30 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `memory_dir` | `<workspace>/memory` | 记忆存储目录; 留空取默认; 相对路径按项目根解析 |
 | `memory_max_turns` | `20` | 装载历史窗口的轮数上限; 非法或 <=0 回退默认 |
 | `memory_max_chars` | `50000` | 装载历史窗口的字符上限; 非法或 <=0 回退默认 |
+| `compression_enabled` | `true` | 上下文 Token 压缩总开关; `false` 时只按轮数/字符窗口装载历史 |
+| `token_budget` | `48000` | 输入 Token 预算(估算 × 1.1 后比较); 超预算触发摘要/硬裁/工具占位 |
+| `tokenizer` | `auto` | `auto` / `heuristic` / `tiktoken[:encoding]` / `hf` |
+| `hf_tokenizer_path` | 空 | 本地 `tokenizer.json` 覆盖路径; 空时查 `<项目根>/tokenizers/<模型名>/tokenizer.json` |
+| `keep_recent_turns` | `2` | 压缩时至少保留原文的最近完整轮数(下限 1) |
+| `summary_model` | 空 | 摘要模型; 空 = 使用主 `model` |
+| `summary_max_tokens` | `768` | 摘要输出上限 |
+| `summary_timeout` | `15` | 摘要调用超时(秒) |
+| `history_log_max_bytes` | `2097152` | `HISTORY.md` 轮转阈值(字节) |
+| `history_log_original_chars` | `32000` | 单条审计记录原文 JSON 上限(字符) |
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
+
+### 上下文 Token 压缩(自动)
+
+每次 `provider.chat()` 前按 `token_budget` 估算「system prompt + 工具定义 + 全部消息」;
+超预算时按 **L1 摘要 → L2 硬裁最旧完整 turn → L3 当前轮工具结果占位** 逐级压缩。压缩只作用于
+发给模型的**请求视图**: 不修改事实源消息、不写 JSONL; 每次摘要/降级会把「原文 + 摘要」追加到
+`<memory_dir>/HISTORY.md`(仅供人工校验, 模型不可读写)。预算耗尽仍放不下时本轮返回
+`context_overflow`, 提示拆分问题或 `/clear`。
+
+- 精确计数: 安装 `pip install "meowmeowclaw[tokenizers]"`, 并在 `<项目根>/tokenizers/<模型名>/tokenizer.json`
+  放好分词器(如 `tokenizers/deepseek-flash/tokenizer.json`); 找不到时自动回退 CJK 加权启发式。
+- 设计细节见 `docs/CONTEXT_COMPRESSION_DESIGN.md`。
 
 ### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)
 
@@ -329,7 +351,7 @@ RUN_NETWORK_TESTS=1 pytest tests/ -m network -q     # 真实联网用例
 | **持久化 / 断点续跑** | 无内建(`_session_history` 在内存里) | 内建 checkpointer, 可从任意节点恢复 |
 | **人工审批(HITL)** | 需自行在循环里加确认步骤 | 一等公民: 中断/恢复 API |
 | **多 Agent 编排** | 需自己写调度(子 Agent 即另一个 `AgentLoop`) | 天然支持 supervisor / swarm 等拓扑 |
-| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 633 用例) | 通常要驱动图运行时, 或按节点分别测 |
+| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 921 用例) | 通常要驱动图运行时, 或按节点分别测 |
 | **调试体验** | 断点就在 `run()` 里, 栈短、易读易改 | 需要在框架抽象层之间跳转 |
 | **适合场景** | 单 Agent + 工具调用的主线业务; 想快速看懂/改控制流 | 复杂分支编排、长流程、需要暂停恢复与人工介入 |
 
@@ -411,7 +433,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 21 个测试文件 / 774 用例(agent/skills/tools/memory/channels 分层)
+├── tests/                       # 24 个测试文件 / 921 用例(agent/skills/tools/memory/channels/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源

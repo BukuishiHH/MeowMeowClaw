@@ -94,6 +94,21 @@ class TestFormatEvent:
         assert "elapsed=15.0s" in text
 
     @pytest.mark.asyncio
+    async def test_tool_elision_bullet_is_rendered(self, audit):
+        await audit.record(
+            make_event(
+                event="tool_elision",
+                result="ok",
+                summary=None,
+                tool_elisions=2,
+                original_messages=[{"role": "tool", "tool_call_id": "c1", "content": "原始结果"}],
+            )
+        )
+
+        text = audit.path.read_text(encoding="utf-8")
+        assert "- 当前轮工具结果占位: 2 条" in text
+
+    @pytest.mark.asyncio
     async def test_missing_fields_are_tolerated(self, tmp_path):
         audit = HistoryAuditLog(tmp_path / "HISTORY.md")
 

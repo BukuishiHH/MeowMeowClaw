@@ -20,6 +20,7 @@ from meowmeowclaw.agent.compression import (
     DEFAULT_SUMMARY_MAX_TOKENS,
     HISTORY_OMITTED_TEMPLATE,
     SUMMARY_HEADER,
+    TOOL_ELIDED_PLACEHOLDER,
     CompressionError,
     ContextCompressor,
     split_turns,
@@ -736,3 +737,121 @@ class TestSummaryConstruction:
                 token_budget=100,
                 summary_timeout=value,  # type: ignore[arg-type]
             )
+
+# ---------------------------------------------------------- P5: L3 工具占位
+
+
+class TestToolElision:
+    @staticmethod
+    def _messages() -> list[dict[str, Any]]:
+        return [
+            {"role": "system", "content": "SYS"},
+            user("current"),
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "read_file"}},
+                    {"id": "c2", "type": "function", "function": {"name": "read_file"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "旧结果" + "x" * 500},
+            {"role": "tool", "tool_call_id": "c2", "content": "新结果" + "y" * 500},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_elides_oldest_tool_first_until_budget_fits(self):
+        messages = self._messages()
+        counter = CharCounter()
+        base = counter.estimate_request(messages)
+        audit = RecordingAuditSink()
+        compressor = ContextCompressor(
+            counter=counter,
+            token_budget=base - 100,  # 放不下全部, 但占位最旧一条后即可放下
+            keep_recent_turns=1,
+            audit_log=audit,
+        )
+
+        view = await compressor.prepare_request(messages)
+
+        outcome = compressor.last_outcome
+        assert outcome is not None
+        assert outcome.changed is True
+        assert outcome.tool_elisions == 1
+        assert outcome.still_over_budget is False
+        tools = [message for message in view if message["role"] == "tool"]
+        assert tools[0]["content"] == TOOL_ELIDED_PLACEHOLDER
+        assert tools[1]["content"].startswith("新结果")  # 从最旧开始
+        assert [message["tool_call_id"] for message in tools] == ["c1", "c2"]
+        calls = [
+            call
+            for message in view
+            if message["role"] == "assistant"
+            for call in (message.get("tool_calls") or [])
+        ]
+        assert [call["id"] for call in calls] == ["c1", "c2"]  # 配对结构不变
+
+        assert len(audit.events) == 1
+        event = audit.events[0]
+        assert event["event"] == "tool_elision"
+        assert event["result"] == "ok"
+        assert event["tool_elisions"] == 1
+        assert len(event["original_messages"]) == 1
+        assert event["original_messages"][0]["content"].startswith("旧结果")
+
+    @pytest.mark.asyncio
+    async def test_all_tools_elided_but_still_over_reports_overflow(self):
+        messages = self._messages()
+        audit = RecordingAuditSink()
+        compressor = ContextCompressor(
+            counter=CharCounter(),
+            token_budget=50,
+            keep_recent_turns=1,
+            audit_log=audit,
+        )
+
+        view = await compressor.prepare_request(messages)
+
+        outcome = compressor.last_outcome
+        assert outcome is not None
+        assert outcome.tool_elisions == 2
+        assert outcome.still_over_budget is True
+        assert all(
+            message["content"] == TOOL_ELIDED_PLACEHOLDER
+            for message in view
+            if message["role"] == "tool"
+        )
+        assert [event["event"] for event in audit.events] == [
+            "tool_elision",
+            "context_overflow",
+        ]
+        assert audit.events[0]["result"] == "failed"
+        assert audit.events[1]["reason"] == "budget_exceeded"
+        assert audit.events[1]["tool_elisions"] == 2
+
+    @pytest.mark.asyncio
+    async def test_fact_source_is_not_mutated_by_tool_elision(self):
+        messages = self._messages()
+        snapshot = json.dumps(messages, ensure_ascii=False)
+        compressor = ContextCompressor(
+            counter=CharCounter(), token_budget=50, keep_recent_turns=1
+        )
+
+        await compressor.prepare_request(messages)
+
+        assert json.dumps(messages, ensure_ascii=False) == snapshot
+
+    @pytest.mark.asyncio
+    async def test_no_tool_messages_no_elision(self):
+        messages = [{"role": "system", "content": "SYS"}, user("current")]
+        compressor = ContextCompressor(
+            counter=CharCounter(), token_budget=1, keep_recent_turns=1
+        )
+
+        view = await compressor.prepare_request(messages)
+
+        assert view is messages
+        outcome = compressor.last_outcome
+        assert outcome is not None
+        assert outcome.tool_elisions == 0
+        assert outcome.still_over_budget is True

@@ -1,6 +1,6 @@
 # MeowMeowClaw 上下文 Token 压缩设计（v1）
 
-> 状态：**设计已确认；P1（TokenCounter/配置）、P2（请求视图/L2 硬裁）、P3（摘要/滚动缓存/降级/bootstrap 接入）、P4（HISTORY.md 审计 + 工具禁读写）已实现，P5（L3/L4）待实现**。本文只定义行为与边界，不改 JSONL 存储格式。
+> 状态：**设计已确认并全部落地（P1–P5）：TokenCounter/配置、请求视图与 L2 硬裁、滚动摘要与降级、HISTORY.md 审计与工具禁读写、L3 工具占位与 L4 `context_overflow`**。本文只定义行为与边界，不改 JSONL 存储格式。
 > 关联：`docs/MEMORY_DESIGN.md` §5.4、`meowmeowclaw/agent/loop.py`、`meowmeowclaw/conversation.py`、`meowmeowclaw/llm/openai_compat.py`。
 
 ---
@@ -292,7 +292,7 @@ compressible = turns[:-keep_recent_turns]    # 最旧的若干完整 turn
 | L1 摘要 | 估算 > 预算且有可压缩 turn | 1 次摘要调用 → 摘要 system 消息替换最旧 turn → 采纳需同时满足"非空 + 收益达标" |
 | L2 硬裁 + 占位 | 摘要调用失败 / 超时 / 空 / 收益不足 / 摘要输入超限 | 丢弃同批最旧完整 turn，替换为一条 **system 角色**的 `[历史省略] 因上下文预算，最早的 N 轮对话已省略。`；不重试 |
 | L3 当前轮工具占位 | L2 后仍超，且当前轮存在 tool 消息 | 从最旧开始把 `tool.content` 换成 `[工具结果已省略: 上下文预算不足]`，保留 role / tool_call_id / 其余字段（结构合法） |
-| L4 失败结束 | L3 后仍超（system + 当前提问本身过大），或已无可裁内容 | 返回 `AgentTurn(completed=False, finish_reason="context_overflow")`，answer 提示用户拆分问题或 `/clear`；本轮不写 JSONL |
+| L4 失败结束 | L3 后仍超（system + 当前提问本身过大），或已无可裁内容 | `AgentLoop` **不调用 Provider**，直接返回 `AgentTurn(completed=False, finish_reason="context_overflow")`，answer 固定为「上下文超出预算，请拆分问题或使用 /clear」；本轮不写 JSONL |
 
 补充规则：
 
@@ -413,7 +413,7 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 
 - `prepare_request` 未超预算时**返回原列表对象**（零改写/零额外调用）；压缩详情见 `compressor.last_outcome`（`changed` / `estimated_tokens` / `dropped_turns` / `still_over_budget`），P5 的溢出错误路径据此判断；
 - **事实源 `messages`、`new_start`、`AgentTurn.messages`、`_session_history` 全部不动**（C1）；现有 `run()` / `run_turn()` / 错误与护栏语义零变化；
-- 新增结束原因常量 `FINISH_REASON_CONTEXT_OVERFLOW = "context_overflow"`（loop 层常量，与 `max_iterations` / `circuit_break` 同级；`ConversationService` 只认 `completed`，无需改判断）。
+- 新增结束原因常量 `FINISH_REASON_CONTEXT_OVERFLOW = "context_overflow"` 与固定提示 `CONTEXT_OVERFLOW_MESSAGE`（loop 层常量，与 `max_iterations` / `circuit_break` 同级；`ConversationService` 只认 `completed`，无需改判断）；P5 已实现。
 
 ### 9.2 `bootstrap`
 
@@ -500,4 +500,4 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 
 **路径校验结论（P4 收尾）**：`model` 与目录名已对齐，`resolve_tokenizer_path(None, "deepseek-flash")` 命中 `tokenizers/deepseek-flash/tokenizer.json`，`build_counter` 实际返回 `hf:deepseek-flash/tokenizer.json`，不再回退启发式。目录名必须等于 `sanitize_model_name(model)`：仅替换 `[^A-Za-z0-9._-]`，**连字符 `-` 保留**（`deepseek_flash` 会匹配失败）。
 
-按 §12 继续 P5。
+**P1–P5 全部完成**：实现文件为 `llm/tokenizer.py`、`agent/compression.py`、`agent/audit.py`、`agent/loop.py`、`bootstrap.py`、`tools/filesystem.py` + 配置/文档/测试；全量回归 913 passed / 6 skipped / 2 xfailed。

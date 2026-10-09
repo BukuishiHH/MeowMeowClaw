@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 HISTORY_OMITTED_TEMPLATE = "[历史省略] 因上下文预算不足，最早的 {count} 轮对话已省略。"
 # L1 摘要消息前缀(设计文档 C6)
 SUMMARY_HEADER = "[历史摘要]"
+# L3 当前轮工具结果占位提示: 只替换 content, role/tool_call_id 保持不变
+TOOL_ELIDED_PLACEHOLDER = "[工具结果已省略: 上下文预算不足]"
 
 # 摘要调用默认值(与 config.py / 设计文档 §8 保持一致)
 DEFAULT_SUMMARY_MAX_TOKENS = 768
@@ -84,6 +86,7 @@ class CompressionOutcome:
     dropped_turns: int = 0
     still_over_budget: bool = False
     summary_applied: bool = False
+    tool_elisions: int = 0
 
 
 @dataclass(frozen=True)
@@ -274,13 +277,8 @@ class ContextCompressor:
         rest = messages[1:] if has_system else list(messages)
 
         last_user = _find_last_user_index(rest)
-        if last_user is None:
-            return self._over_budget(messages, estimated, dropped_turns=0)
-
-        protected_current = rest[last_user:]
-        turns = split_turns(rest[:last_user])
-        if not turns:
-            return self._over_budget(messages, estimated, dropped_turns=0)
+        protected_current = rest[last_user:] if last_user is not None else []
+        turns = split_turns(rest[:last_user]) if last_user is not None else []
 
         best: Optional[CompressionOutcome] = None
         best_dropped: list[dict[str, Any]] = []
@@ -373,39 +371,152 @@ class ContextCompressor:
                 break
 
         if best is None:
-            return self._over_budget(messages, estimated, dropped_turns=0)
-
-        if best.still_over_budget:
             logger.warning(
-                "历史硬裁后仍超预算: estimated=%d > budget=%d (dropped_turns=%d, keep=%d)",
-                best.estimated_tokens,
-                self.token_budget,
-                best.dropped_turns,
-                best_keep,
-            )
-        else:
-            logger.info(
-                "历史硬裁完成: estimated=%d -> %d, budget=%d, dropped_turns=%d, keep=%d",
+                "上下文超预算且无可压缩的完整旧 turn: estimated=%d > budget=%d, 尝试当前轮工具占位",
                 estimated,
-                best.estimated_tokens,
                 self.token_budget,
-                best.dropped_turns,
-                best_keep,
             )
-        await self._emit_audit(
-            event="fallback_trim",
-            result="failed" if best.still_over_budget else "fallback",
-            reason=summary_reason,
-            estimated_before=estimated,
-            estimated_after=best.estimated_tokens,
-            dropped_turns=best.dropped_turns,
-            original_messages=best_dropped,
-            summary=summary_text or None,
-            summary_tokens=summary_tokens,
-            elapsed_ms=summary_elapsed,
-            cached=summary_cached,
+            view = messages
+            changed = False
+            dropped_turns = 0
+            final_estimated = estimated
+        else:
+            view = best.messages
+            changed = True
+            dropped_turns = best.dropped_turns
+            final_estimated = best.estimated_tokens
+
+        # L3: 当前轮工具结果内容占位(从最旧开始; 结构/配对不变, 只改请求视图)
+        elided_messages: list[dict[str, Any]] = []
+        elided_count = 0
+        if final_estimated > self.token_budget:
+            view, elided_count, final_estimated, elided_messages = self._elide_current_tools(
+                view, tool_defs
+            )
+            if elided_count:
+                changed = True
+
+        still_over = final_estimated > self.token_budget
+
+        if best is not None:
+            if best.still_over_budget:
+                logger.warning(
+                    "历史硬裁后仍超预算: estimated=%d > budget=%d (dropped_turns=%d, keep=%d)",
+                    best.estimated_tokens,
+                    self.token_budget,
+                    best.dropped_turns,
+                    best_keep,
+                )
+            else:
+                logger.info(
+                    "历史硬裁完成: estimated=%d -> %d, budget=%d, dropped_turns=%d, keep=%d",
+                    estimated,
+                    best.estimated_tokens,
+                    self.token_budget,
+                    best.dropped_turns,
+                    best_keep,
+                )
+            await self._emit_audit(
+                event="fallback_trim",
+                result="failed" if best.still_over_budget else "fallback",
+                reason=summary_reason,
+                estimated_before=estimated,
+                estimated_after=best.estimated_tokens,
+                dropped_turns=best.dropped_turns,
+                original_messages=best_dropped,
+                summary=summary_text or None,
+                summary_tokens=summary_tokens,
+                elapsed_ms=summary_elapsed,
+                cached=summary_cached,
+            )
+
+        if elided_count:
+            before_elision = best.estimated_tokens if best is not None else estimated
+            logger.info(
+                "当前轮工具结果占位: elided=%d, estimated=%d -> %d, budget=%d, still_over=%s",
+                elided_count,
+                before_elision,
+                final_estimated,
+                self.token_budget,
+                still_over,
+            )
+            await self._emit_audit(
+                event="tool_elision",
+                result="failed" if still_over else "ok",
+                reason="current_turn_overflow",
+                estimated_before=before_elision,
+                estimated_after=final_estimated,
+                dropped_turns=dropped_turns,
+                original_messages=elided_messages,
+                tool_elisions=elided_count,
+            )
+
+        if still_over:
+            logger.warning(
+                "上下文预算耗尽(含 L3 工具占位): estimated=%d > budget=%d, "
+                "交由 AgentLoop 返回 context_overflow",
+                final_estimated,
+                self.token_budget,
+            )
+            await self._emit_audit(
+                event="context_overflow",
+                result="failed",
+                reason="budget_exceeded",
+                estimated_before=estimated,
+                estimated_after=final_estimated,
+                dropped_turns=dropped_turns,
+                original_messages=[],
+                tool_elisions=elided_count,
+            )
+
+        return CompressionOutcome(
+            messages=view,
+            changed=changed,
+            estimated_tokens=final_estimated,
+            budget=self.token_budget,
+            dropped_turns=dropped_turns,
+            still_over_budget=still_over,
+            tool_elisions=elided_count,
         )
-        return best
+
+    def _elide_current_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tool_defs: Optional[Sequence[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], int, int, list[dict[str, Any]]]:
+        """
+        L3: 把当前轮 ``tool`` 消息的 content 换成占位, 从最旧开始直到放得下.
+
+        - 只替换 ``content``, 保留 role / tool_call_id / 其它字段, 配对结构合法;
+        - 只作用于请求视图(浅拷贝), 事实源消息不会被修改;
+        - 返回 (请求视图, 占位条数, 压缩后估算, 被占位的原始消息).
+        """
+        estimated = self.counter.estimate_request(messages, tool_defs)
+        last_user = _find_last_user_index(messages)
+        if last_user is None:
+            return messages, 0, estimated, []
+
+        view = list(messages)
+        originals: list[dict[str, Any]] = []
+        elided = 0
+        for index in range(last_user, len(messages)):
+            message = messages[index]
+            if message.get("role") != "tool":
+                continue
+            if message.get("content") == TOOL_ELIDED_PLACEHOLDER:
+                continue
+            originals.append(dict(message))
+            replaced = dict(message)
+            replaced["content"] = TOOL_ELIDED_PLACEHOLDER
+            view[index] = replaced
+            elided += 1
+            estimated = self.counter.estimate_request(view, tool_defs)
+            if estimated <= self.token_budget:
+                break
+
+        if not elided:
+            return messages, 0, self.counter.estimate_request(messages, tool_defs), []
+        return view, elided, estimated, originals
 
     def _keep_attempts(self) -> tuple[int, ...]:
         """保留策略: 先按配置值, 若仍超预算再降到 1(设计文档 C5)."""
@@ -442,28 +553,6 @@ class ContextCompressor:
             ),
         }
         return [*fixed, summary_message, *_flatten(kept), *protected_current]
-
-    def _over_budget(
-        self,
-        messages: list[dict[str, Any]],
-        estimated: int,
-        *,
-        dropped_turns: int,
-    ) -> CompressionOutcome:
-        logger.warning(
-            "上下文超预算且无可压缩的完整旧 turn: estimated=%d > budget=%d, "
-            "保持原样交给后续 L3/L4 处理",
-            estimated,
-            self.token_budget,
-        )
-        return CompressionOutcome(
-            messages=messages,
-            changed=False,
-            estimated_tokens=estimated,
-            budget=self.token_budget,
-            dropped_turns=dropped_turns,
-            still_over_budget=True,
-        )
 
     # ------------------------------------------------------------------ 摘要
 
@@ -680,6 +769,7 @@ class ContextCompressor:
         summary_tokens: Optional[int] = None,
         elapsed_ms: Optional[int] = None,
         cached: bool = False,
+        tool_elisions: int = 0,
     ) -> None:
         """把审计事件交给注入的 sink; sink 不存在或异常都 fail-soft."""
         if self.audit_log is None:
@@ -701,6 +791,7 @@ class ContextCompressor:
             "summary_model": self.summary_model or self.model or "",
             "elapsed_ms": elapsed_ms,
             "cached": cached,
+            "tool_elisions": tool_elisions,
             "original_messages": list(original_messages),
         }
         try:

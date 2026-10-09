@@ -48,6 +48,10 @@ TOOL_CALL_WINDOW_SIZE = 30
 # run_turn 结果里用于区分"未完成"的结束原因(与 Provider 的 FINISH_REASON_* 区分)
 FINISH_REASON_MAX_ITERATIONS = "max_iterations"
 FINISH_REASON_CIRCUIT_BREAK = "circuit_break"
+# L4: 压缩(含 L3 工具占位)后仍超预算, 不调用 Provider, 直接结束本轮
+FINISH_REASON_CONTEXT_OVERFLOW = "context_overflow"
+# L4 固定用户提示(设计文档确认口径, 不在回复里追加其它压缩提示)
+CONTEXT_OVERFLOW_MESSAGE = "上下文超出预算，请拆分问题或使用 /clear"
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,21 @@ class AgentLoop:
             request_messages = messages
             if self.compressor is not None:
                 request_messages = await self.compressor.prepare_request(messages, tool_defs)
+                outcome = self.compressor.last_outcome
+                if outcome is not None and outcome.still_over_budget:
+                    # L4: 已无可压缩内容(含当前轮工具占位), 不发请求, 明确告知用户
+                    logger.warning(
+                        "上下文压缩后仍超预算, 中止本轮: estimated=%d > budget=%d",
+                        outcome.estimated_tokens,
+                        outcome.budget,
+                    )
+                    return AgentTurn(
+                        answer=CONTEXT_OVERFLOW_MESSAGE,
+                        messages=messages[new_start:],
+                        finish_reason=FINISH_REASON_CONTEXT_OVERFLOW,
+                        iterations=iterations,
+                        completed=False,
+                    )
             response = await self.provider.chat(
                 request_messages, tools=tool_defs, model=self.model
             )

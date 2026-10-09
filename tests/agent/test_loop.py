@@ -19,12 +19,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from meowmeowclaw.agent.compression import ContextCompressor
+from meowmeowclaw.agent.compression import TOOL_ELIDED_PLACEHOLDER, ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import (
     CIRCUIT_BREAK_PREFIX,
+    CONTEXT_OVERFLOW_MESSAGE,
     DEFAULT_MAX_ITERATIONS,
     FINISH_REASON_CIRCUIT_BREAK,
+    FINISH_REASON_CONTEXT_OVERFLOW,
     FINISH_REASON_MAX_ITERATIONS,
     LOOP_CIRCUIT_BREAK_THRESHOLD,
     LOOP_WARNING_PREFIX,
@@ -802,12 +804,12 @@ class TestCompressorRequestView:
         registry = make_registry()
         registry.get_definitions.return_value = []
         compressor = ContextCompressor(
-            counter=_CharCounter(), token_budget=150, keep_recent_turns=1
+            counter=_CharCounter(), token_budget=310, keep_recent_turns=1
         )
         loop = make_loop(provider, registry=registry, compressor=compressor)
 
         await loop.run("q1" + "u" * 100)
-        await loop.run("q2" + "u" * 100)
+        await loop.run("q2" + "u" * 200)
         await loop.run("q3")
 
         # 第三次请求超预算: provider 收到占位 + 最近原文
@@ -862,3 +864,66 @@ class TestCompressorSummaryIntegration:
         # 事实源: 本轮新增消息不含摘要/system
         assert [message["role"] for message in turn.messages] == ["user", "assistant"]
         assert turn.messages[0]["content"] == "current"
+
+class TestToolElisionAndOverflowIntegration:
+    """P5: L3 工具占位只改请求视图; L4 直接返回 context_overflow."""
+
+    @pytest.mark.asyncio
+    async def test_l3_elides_tool_result_in_request_view_only(self):
+        provider = ScriptedProvider(tool_response(make_call()), text_response("最终回答"))
+        registry = make_registry(result=lambda name, args: "工具结果" + "x" * 5000)
+        counter = _CharCounter()
+        elided_view = [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"file_path": "a.py"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": TOOL_ELIDED_PLACEHOLDER},
+        ]
+        budget = counter.estimate_request(elided_view, TOOL_DEFS) + 10
+        compressor = ContextCompressor(
+            counter=counter, token_budget=budget, keep_recent_turns=1
+        )
+        loop = make_loop(provider, registry=registry, compressor=compressor)
+
+        turn = await loop.run_turn("hi", history=[])
+
+        assert turn.completed is True
+        assert turn.answer == "最终回答"
+        assert len(provider.calls) == 2
+        second_request = provider.calls[1]["messages"]
+        tool_message = next(m for m in second_request if m["role"] == "tool")
+        assert tool_message["content"] == TOOL_ELIDED_PLACEHOLDER
+        assert tool_message["tool_call_id"] == "call_1"
+        # 事实源仍保留完整工具结果(供持久化/下一轮使用)
+        fact_tool = next(m for m in turn.messages if m["role"] == "tool")
+        assert fact_tool["content"].startswith("工具结果")
+        assert len(fact_tool["content"]) > 5000
+
+    @pytest.mark.asyncio
+    async def test_l4_context_overflow_returns_without_provider_call(self):
+        provider = ScriptedProvider(text_response("不应被调用"))
+        compressor = ContextCompressor(
+            counter=_CharCounter(), token_budget=50, keep_recent_turns=1
+        )
+        loop = make_loop(provider, compressor=compressor)
+
+        turn = await loop.run_turn("hi" * 1000, history=[])
+
+        assert provider.calls == []  # 预算耗尽: 不发请求
+        assert turn.completed is False
+        assert turn.finish_reason == FINISH_REASON_CONTEXT_OVERFLOW
+        assert turn.answer == CONTEXT_OVERFLOW_MESSAGE
+        assert [message["role"] for message in turn.messages] == ["user"]

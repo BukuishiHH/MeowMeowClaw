@@ -105,6 +105,7 @@ class HistoryAuditLog:
             f"- 触发: estimated_input_tokens={event.get('estimated_before', 0)} "
             f"> budget={event.get('budget', 0)} (counter={event.get('counter') or '-'})",
             f"- 替换: 最早 {event.get('dropped_turns', 0)} 个 turn / {len(original)} 条消息",
+            f"- 当前轮工具结果占位: {event.get('tool_elisions') or 0} 条",
             "- 摘要: model={model}, summary_tokens≈{tokens}, elapsed={elapsed}, cached={cached}".format(
                 model=event.get("summary_model") or "-",
                 tokens=event.get("summary_tokens")

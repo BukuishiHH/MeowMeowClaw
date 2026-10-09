@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+from meowmeowclaw.agent.audit import HistoryAuditLog
 from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
@@ -121,11 +122,18 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
     # token 计数器无状态, 全局构造一次即可(精确档 lazy 加载, 失败自动回退启发式);
     # 关闭压缩时不构造, 避免无谓的可选依赖探测
     counter = None
+    audit_log = None
     if config.compression_enabled:
         counter = build_counter(
             config.model,
             tokenizer=config.tokenizer,
             hf_tokenizer_path=config.hf_tokenizer_path,
+        )
+        # HISTORY.md 只为人工校验, 不读回、不注入 Prompt; 写入失败 fail-soft
+        audit_log = HistoryAuditLog(
+            config.memory_dir / "HISTORY.md",
+            max_bytes=config.history_log_max_bytes,
+            original_chars=config.history_log_original_chars,
         )
 
     # 每个会话一个 AgentLoop: 工具调用护栏与摘要缓存按会话隔离; 共享 Provider/Registry/Context
@@ -142,7 +150,8 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
                 summary_max_tokens=config.summary_max_tokens,
                 summary_timeout=config.summary_timeout,
                 session=session_key.canonical,
-                # audit_log: P4 接入 HistoryAuditLog
+                storage_id=session_key.storage_id,
+                audit_log=audit_log,
             )
         return AgentLoop(
             provider=provider,

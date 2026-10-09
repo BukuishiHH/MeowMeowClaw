@@ -30,7 +30,7 @@ from meowmeowclaw.llm.tokenizer import (
 from meowmeowclaw.paths import resolve_tokenizer_path
 
 # 本地真实 tokenizer(存在才跑冒烟用例; 见设计文档 §4.7)
-_REAL_TOKENIZER_PATH = resolve_tokenizer_path(None, "deepseek-ai/DeepSeek-V4-Flash")
+_REAL_TOKENIZER_PATH = resolve_tokenizer_path(None, "deepseek-flash")
 
 
 @pytest.fixture(autouse=True)

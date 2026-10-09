@@ -650,6 +650,33 @@ class TestMemoryProtection:
         assert "[安全拦截] 禁止列举记忆运行时目录" in result
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("file_name", ["HISTORY.md", "HISTORY.md.1", "HISTORY.md.lock"])
+    async def test_history_audit_files_are_denied(self, memory_workspace, file_name):
+        relative = f"memory/{file_name}"
+
+        read_result = await ReadFileTool(memory_workspace).execute(file_path=relative)
+        write_result = await WriteFileTool(memory_workspace).execute(
+            file_path=relative, content="pwned"
+        )
+        list_result = await ListDirTool(memory_workspace).execute(dir_path=relative)
+
+        assert "[安全拦截] 禁止读取记忆运行时目录" in read_result
+        assert "[安全拦截] 禁止写入记忆运行时目录" in write_result
+        assert "[安全拦截] 禁止列举记忆运行时目录" in list_result
+
+    @pytest.mark.asyncio
+    async def test_other_memory_files_are_still_allowed(self, memory_workspace):
+        write_result = await WriteFileTool(memory_workspace).execute(
+            file_path="memory/notes.txt", content="普通笔记"
+        )
+        read_result = await ReadFileTool(memory_workspace).execute(
+            file_path="memory/notes.txt"
+        )
+
+        assert "[成功] 文件已写入" in write_result
+        assert read_result == "普通笔记"
+
+    @pytest.mark.asyncio
     async def test_memory_file_is_readable_and_writable_with_backup(self, memory_workspace):
         read_result = await ReadFileTool(memory_workspace).execute(file_path="memory/MEMORY.md")
         assert read_result == "v1 笔记"

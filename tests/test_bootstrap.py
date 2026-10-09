@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import meowmeowclaw.bootstrap as bootstrap_module
+from meowmeowclaw.agent.audit import HistoryAuditLog
 from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.bootstrap import Application, ConfigError, build_application
@@ -251,6 +252,9 @@ class TestBuildApplication:
         assert compressor.summary_model == "cheap-model"
         assert compressor.session == key.canonical
         assert compressor.provider is app.provider
+        assert compressor.storage_id == key.storage_id
+        assert isinstance(compressor.audit_log, HistoryAuditLog)
+        assert compressor.audit_log.path == config.memory_dir / "HISTORY.md"
         # 同会话复用同一个 AgentLoop/compressor, 不同会话各自实例
         assert app.conversation._agent_for(key) is agent  # noqa: SLF001
         other = app.conversation._agent_for(
@@ -267,6 +271,7 @@ class TestBuildApplication:
         agent = app.conversation._agent_for(key)  # noqa: SLF001
 
         assert agent.compressor is None
+        assert not (config.memory_dir / "HISTORY.md").exists()
 
 
 # ------------------------------------------------------- 包导入边界(无副作用)

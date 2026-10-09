@@ -156,8 +156,9 @@ class ContextCompressor:
         summary_model: 摘要模型; 空串表示用主 model
         summary_max_tokens: 摘要输出上限
         summary_timeout: 摘要调用超时(秒)
-        session: 会话标识(写入审计事件, 便于与 JSONL 对齐)
-        audit_log: 审计事件接收端(P4 接入 HISTORY.md); None 表示不记录
+        session: 会话标识 canonical(写入审计事件, 便于与 JSONL 对齐)
+        storage_id: 会话存储 ID(与 sessions/<storage_id>.jsonl 对齐)
+        audit_log: 审计事件接收端(P4 注入 HISTORY.md); None 表示不记录
 
     注意:
         - ``last_outcome`` 保存最近一次结果, 供 AgentLoop / P5 错误路径读取;
@@ -177,6 +178,7 @@ class ContextCompressor:
         summary_max_tokens: int = DEFAULT_SUMMARY_MAX_TOKENS,
         summary_timeout: float = DEFAULT_SUMMARY_TIMEOUT,
         session: str = "",
+        storage_id: str = "",
         audit_log: Optional[AuditSink] = None,
     ) -> None:
         if not isinstance(token_budget, int) or isinstance(token_budget, bool):
@@ -206,6 +208,7 @@ class ContextCompressor:
         self.summary_max_tokens = summary_max_tokens
         self.summary_timeout = float(summary_timeout)
         self.session = session
+        self.storage_id = storage_id
         self.audit_log = audit_log
         self.last_outcome: Optional[CompressionOutcome] = None
 
@@ -684,6 +687,7 @@ class ContextCompressor:
         payload = {
             "timestamp_ms": int(time.time() * 1000),
             "session": self.session,
+            "storage_id": self.storage_id,
             "event": event,
             "result": result,
             "reason": reason,

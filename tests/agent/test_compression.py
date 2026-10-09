@@ -24,6 +24,7 @@ from meowmeowclaw.agent.compression import (
     ContextCompressor,
     split_turns,
 )
+from meowmeowclaw.agent.audit import HistoryAuditLog
 from meowmeowclaw.llm.base import FINISH_REASON_ERROR, FINISH_REASON_STOP, LLMResponse
 
 
@@ -641,6 +642,45 @@ class TestSummaryCompression:
 
         assert view[1]["content"].startswith(SUMMARY_HEADER)
         assert any("审计日志记录失败" in record.message for record in caplog.records)
+
+
+class TestHistoryAuditIntegration:
+    """P4: 真实 HistoryAuditLog 落盘(压缩器 -> HISTORY.md)."""
+
+    @pytest.mark.asyncio
+    async def test_summary_event_is_written_to_history_md(self, tmp_path):
+        path = tmp_path / "memory" / "HISTORY.md"
+        audit = HistoryAuditLog(path)
+        compressor = summary_compressor(
+            FakeSummaryProvider("落盘摘要"),
+            session="cli:session:abc",
+            storage_id="stor-1",
+            audit_log=audit,
+        )
+
+        await compressor.prepare_request(build_conversation(turns=3))
+
+        text = path.read_text(encoding="utf-8")
+        assert "event=summary | result=ok" in text
+        assert "session=cli:session:abc" in text
+        assert "storage=stor-1" in text
+        assert "落盘摘要" in text
+        assert "```json" in text
+
+    @pytest.mark.asyncio
+    async def test_fallback_event_is_written_to_history_md(self, tmp_path):
+        path = tmp_path / "memory" / "HISTORY.md"
+        audit = HistoryAuditLog(path)
+        compressor = summary_compressor(
+            FakeSummaryProvider(RuntimeError("boom")), audit_log=audit
+        )
+
+        await compressor.prepare_request(build_conversation(turns=3))
+
+        text = path.read_text(encoding="utf-8")
+        assert "event=fallback_trim | result=fallback" in text
+        assert "原因: provider_error" in text
+        assert "（无：本次为硬裁降级）" in text
 
 
 class TestSummaryCache:

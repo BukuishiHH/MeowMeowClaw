@@ -1,6 +1,6 @@
 # MeowMeowClaw 上下文 Token 压缩设计（v1）
 
-> 状态：**设计已确认；P1（TokenCounter/配置）、P2（请求视图/L2 硬裁）、P3（摘要/滚动缓存/降级/bootstrap 接入）已实现，P4（HISTORY.md）/P5（L3/L4）待实现**。本文只定义行为与边界，不改 JSONL 存储格式。
+> 状态：**设计已确认；P1（TokenCounter/配置）、P2（请求视图/L2 硬裁）、P3（摘要/滚动缓存/降级/bootstrap 接入）、P4（HISTORY.md 审计 + 工具禁读写）已实现，P5（L3/L4）待实现**。本文只定义行为与边界，不改 JSONL 存储格式。
 > 关联：`docs/MEMORY_DESIGN.md` §5.4、`meowmeowclaw/agent/loop.py`、`meowmeowclaw/conversation.py`、`meowmeowclaw/llm/openai_compat.py`。
 
 ---
@@ -85,7 +85,7 @@ ConversationService._load_history()
 |---|---|
 | `meowmeowclaw/llm/tokenizer.py` | `TokenCounter` 协议 + `TiktokenCounter` / `HFTokenizerCounter` / `HeuristicCounter` + `build_counter(model, config)`；只做计数，无状态、可单测 |
 | `meowmeowclaw/agent/compression.py` | `split_turns()`、`ContextCompressor`（估算、预算判断、摘要、滚动缓存、硬裁、工具占位、请求视图投影）、降级矩阵 |
-| `meowmeowclaw/agent/audit.py`（或并入 compression.py） | `HistoryAuditLog`：HISTORY.md 追加写、时间戳、轮转、文件锁、fail-soft |
+| `meowmeowclaw/agent/audit.py` | `HistoryAuditLog`：HISTORY.md 追加写、UTC 时间戳、原文 head/tail 截断、大小轮转、跨进程文件锁、fail-soft |
 | `meowmeowclaw/agent/loop.py`（改） | 注入可选 `compressor`；每次 chat 前 `prepare_request`；新增一个结束原因；默认 `None` 时行为与现在完全一致 |
 | `meowmeowclaw/bootstrap.py`（改） | 在 `agent_factory(session_key)` 内按会话构造 `ContextCompressor`（带 `SessionKey`），与 AgentLoop 同生命周期 |
 | `meowmeowclaw/config.py` / `.env.example` / `README.md`（改） | 10 个配置键、默认值、校验、文档表 |
@@ -134,9 +134,9 @@ TokenCounter (Protocol)
 
 ```
 <项目根>/tokenizers/                       # DEFAULT_TOKENIZER_DIR，整体加入 .gitignore
-├── deepseek-chat/
-│   └── tokenizer.json                     # 推荐形态：按模型名建子目录
-└── deepseek-ai_DeepSeek-V3.json           # 也接受：<净化模型名>.json 单文件
+├── deepseek-flash/
+│   └── tokenizer.json                     # 推荐形态：目录名 = 模型名净化结果
+└── deepseek-flash.json                    # 也接受：<净化模型名>.json 单文件
 ```
 
 查找规则（`hf_tokenizer_path` 为空时）：
@@ -145,6 +145,7 @@ TokenCounter (Protocol)
 2. `<PROJECT_ROOT>/tokenizers/<sanitized_model>.json`
 
 其中 `sanitized_model = re.sub(r"[^A-Za-z0-9._-]", "_", model)`（如 `deepseek-ai/DeepSeek-V3` → `deepseek-ai_DeepSeek-V3`）；按顺序取第一个存在的文件。
+注意：该规则只替换名单外的特殊字符，**连字符 `-` 原样保留**——`model=deepseek-flash` 必须放在 `tokenizers/deepseek-flash/`，写成 `deepseek_flash` 会匹配不到（P4 路径校验时已实际踩到并修正）。
 
 - `hf_tokenizer_path` 非空时优先：绝对路径原样使用，相对路径按**项目根**解析（与 `workspace` / `memory_dir` 同一约定）；
 - 路径不存在/不是文件 → warning + 回退启发式（不报错）；
@@ -195,8 +196,8 @@ tokens = ceil(cjk * 1.0 + other * 0.3)
 | 精确档 A：`tiktoken` | **可用**：`tiktoken 0.14.0` 有 cp312 manylinux wheel，可从 PyPI 下载安装；`encoding_for_model("gpt-4o") → o200k_base` 正常 |
 | tiktoken 数据文件 | **首次使用需联网下载**：`cl100k_base` 1.68 MB ≈ 20 s，`o200k_base` 3.61 MB ≈ 60 s（本机网络）；下载后由 `TIKTOKEN_CACHE_DIR`（默认用户缓存）持久化，之后可离线。加载失败必须回退启发式 |
 | 精确档 B：`tokenizers` | **可用**：`tokenizers 0.23.2` 有 cp312 wheel，可安装；声明依赖 `huggingface-hub>=0.16.4,<2.0`，会随 optional extra 一并装入 |
-| 本地 tokenizer 文件 | **可用**：项目内已有 `<项目根>/tokenizers/deepseek-ai_DeepSeek-V4-Flash/tokenizer.json`（6.37 MB，vocab=129280），`Tokenizer.from_file()` 离线加载约 0.24 s，计数正常 |
-| 模型名匹配 | ⚠️ 该文件按 `deepseek-ai/DeepSeek-V4-Flash` 命名；当前 `.env` 的 `model=deepseek-chat` 不会自动命中，需显式 `hf_tokenizer_path=tokenizers/deepseek-ai_DeepSeek-V4-Flash/tokenizer.json`，或按 §4.2 规则补对应模型目录 |
+| 本地 tokenizer 文件 | **可用**：项目内已有 `<项目根>/tokenizers/deepseek-flash/tokenizer.json`（6.37 MB，vocab=129280；原 DeepSeek-V4-Flash 分词器随模型名简化一并重命名），`Tokenizer.from_file()` 离线加载约 0.24 s，计数正常 |
+| 模型名匹配 | ✅ `model=deepseek-flash` + 空 `hf_tokenizer_path` 时，`resolve_tokenizer_path` 自动命中 `tokenizers/deepseek-flash/tokenizer.json`；实测 `build_counter` 返回 `hf:deepseek-flash/tokenizer.json`，不再回退启发式 |
 
 同批样本的精确值与启发式/`len//2` 对比（DeepSeek 系列 tokenizer）：
 
@@ -210,7 +211,7 @@ tokens = ceil(cjk * 1.0 + other * 0.3)
 
 1. `tiktoken` 首次加载可能耗时/失败 → 计数 lazy 加载、失败一次性告警并永久回落启发式（不阻塞、不重试）；
 2. `tokenizers` 的 `huggingface-hub` 传递依赖接受，计入 optional extra 的安装体积；
-3. 已放置的 `DeepSeek-V4-Flash` tokenizer 与当前 `deepseek-chat` 模型名不匹配，需显式配置 `hf_tokenizer_path` 或调整目录/`model` 后才走精确档。
+3. 模型名与目录名已对齐（`model=deepseek-flash` ↔ `tokenizers/deepseek-flash/`），`auto` 模式可直接命中精确档；目录名必须等于净化后的模型名（连字符保留，不能写成下划线）。
 
 ---
 
@@ -368,8 +369,8 @@ compressible = turns[:-keep_recent_turns]    # 最旧的若干完整 turn
 
 - 大小上限 `history_log_max_bytes`（默认 2 MiB）；超限时 `HISTORY.md → HISTORY.md.1`（单代覆盖）后新建，避免无界增长；
 - HISTORY.md 含原始对话内容，属敏感数据：`workspace/` 已在 `.gitignore`（第 220 行）内，不会误提交；
-- **已确认**：把 `HISTORY.md` 纳入 `filesystem.py` 的记忆运行时保护名单，对 `read_file` / `write_file` / `list_dir` 禁止访问，避免模型篡改审计记录；`MEMORY.md` 的现有可读写策略不变；
-- 实现方式：`is_memory_denied` 由"目录名单"扩展为"目录名单 + 运行时文件名单"，`HISTORY.md`、`HISTORY.md.1`、`HISTORY.md.lock` 全部命中；`memory` 根目录**列举**仍拒绝，`MEMORY.md` 读写照旧放行。
+- **已实现**：`HISTORY.md` 已纳入 `filesystem.py` 记忆运行时保护名单，对 `read_file` / `write_file` / `list_dir` 禁止访问，避免模型篡改/读取审计记录；`MEMORY.md` 的现有可读写策略不变；
+- 实现方式：`RUNTIME_MEMORY_FILE_NAMES = ("HISTORY.md", "HISTORY.md.1", "HISTORY.md.lock")`，`is_memory_denied` 由"目录名单"扩展为"目录名单 + 运行时文件名单"；`memory` 根目录**列举**仍拒绝，`MEMORY.md` 读写照旧放行。
 
 ---
 
@@ -419,7 +420,7 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 - `agent_factory(session_key)` 内构造 `TokenCounter`（全局共享，无状态）+ `HistoryAuditLog`（全局共享）+ `ContextCompressor(session_key=..., counter=..., provider=..., model=..., tools=..., config=...)`，注入 AgentLoop；
 - `compression_enabled=false` 时**不构造 counter/compressor，直接向 AgentLoop 传 `None`**（零开销）；
 - 摘要调用复用同一个 `provider` 实例与连接池；`summary_model` 空时复用主 model；
-- P3 已按此装配；`audit_log` 暂为 `None`，P4 注入 `HistoryAuditLog`。
+- P3 已按此装配；P4 已注入 `HistoryAuditLog`（`config.memory_dir / "HISTORY.md"` + `history_log_max_bytes` / `history_log_original_chars`），压缩事件自动落盘。
 
 ### 9.3 `config.py` / `paths.py` / 文档
 
@@ -434,7 +435,7 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 - 核心：零新增硬依赖（启发式永远可用）；
 - 可选：`pyproject.toml` 已加入 `[project.optional-dependencies] tokenizers = ["tiktoken>=0.7", "tokenizers>=0.19"]`；
 - 实测（§4.7）：`tiktoken 0.14.0` 首次使用需联网下载编码文件（可缓存）；`tokenizers 0.23.2` 传递依赖 `huggingface-hub`；两者均有 CPython 3.12 manylinux wheel；
-- 安装 extra 后，DeepSeek 等模型仍需自备 `<项目根>/tokenizers/<净化模型名>/tokenizer.json`（或配置 `hf_tokenizer_path`）才会启用精确计数；项目内已有 `deepseek-ai_DeepSeek-V4-Flash` 一份，但与当前 `model=deepseek-chat` 不自动匹配；
+- 安装 extra 后，DeepSeek 等模型仍需自备 `<项目根>/tokenizers/<净化模型名>/tokenizer.json`（或配置 `hf_tokenizer_path`）才会启用精确计数；项目内已有 `tokenizers/deepseek-flash/tokenizer.json`，与当前 `model=deepseek-flash` 自动匹配；
 - 文档说明离线限制：无 cache、无文件时自动走启发式。
 
 ---
@@ -495,11 +496,8 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 | 4 | `token_budget=48000` 写入 `.env.example` 作为默认值 |
 | 5 | 接受可选 extra `tiktoken` + `tokenizers`；两档依赖与本地 tokenizer 文件已验证可用（§4.7） |
 | 6 | L4 文案固定为"上下文超出预算，请拆分问题或使用 /clear" |
-| 7 | `tokenizer.json` 路径约定：`<项目根>/tokenizers/<sanitized_model>/tokenizer.json`（备选单文件形态），`tokenizers/` 加入 `.gitignore`；项目内已按此放置 `deepseek-ai_DeepSeek-V4-Flash/tokenizer.json` |
+| 7 | `tokenizer.json` 路径约定：`<项目根>/tokenizers/<sanitized_model>/tokenizer.json`（备选单文件形态），`tokenizers/` 加入 `.gitignore`；项目内已放置 `tokenizers/deepseek-flash/tokenizer.json`，与 `model=deepseek-flash` 匹配 |
 
-**遗留操作项（不阻塞编码）**：已放文件对应 `deepseek-ai/DeepSeek-V4-Flash`，而当前 `.env` 是 `model=deepseek-chat`；使用精确档前需二选一：
+**路径校验结论（P4 收尾）**：`model` 与目录名已对齐，`resolve_tokenizer_path(None, "deepseek-flash")` 命中 `tokenizers/deepseek-flash/tokenizer.json`，`build_counter` 实际返回 `hf:deepseek-flash/tokenizer.json`，不再回退启发式。目录名必须等于 `sanitize_model_name(model)`：仅替换 `[^A-Za-z0-9._-]`，**连字符 `-` 保留**（`deepseek_flash` 会匹配失败）。
 
-- 在 `.env` 设置 `hf_tokenizer_path=tokenizers/deepseek-ai_DeepSeek-V4-Flash/tokenizer.json`；或
-- 让 `model` 与目录名一致/补放 `tokenizers/deepseek-chat/tokenizer.json`。
-
-确认完毕，按 §12 的 P1 → P5 顺序开始编码。
+按 §12 继续 P5。

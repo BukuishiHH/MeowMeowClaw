@@ -16,6 +16,8 @@ from .base import BaseTool
 MEMORY_FILE_NAME = "MEMORY.md"
 MEMORY_BACKUP_NAME = "MEMORY.md.bak"
 RUNTIME_MEMORY_DIRS = ("sessions", "active", "archive")
+# 审计日志等运行时文件: 与运行时目录一样对文件工具全禁, 防模型篡改/读取
+RUNTIME_MEMORY_FILE_NAMES = ("HISTORY.md", "HISTORY.md.1", "HISTORY.md.lock")
 
 
 class PathOutsideWorkspaceError(ValueError):
@@ -65,6 +67,7 @@ def is_memory_denied(absolute_path: str, memory_dir: str, *, listing: bool = Fal
 
     - ``memory/sessions|active|archive`` 及其子路径: 读写列举全禁;
     - ``memory`` 根目录: 仅列举时拒绝(读写本身会因"IsADirectory"失败);
+    - ``memory/HISTORY.md`` / ``.1`` / ``.lock``: 读写列举全禁(审计日志防篡改);
     - 其他路径(含 ``memory/MEMORY.md``): 放行。
     """
     real_path = os.path.realpath(os.path.abspath(absolute_path))
@@ -75,7 +78,11 @@ def is_memory_denied(absolute_path: str, memory_dir: str, *, listing: bool = Fal
     if relative in (os.curdir, ""):
         return listing
     top = relative.split(os.sep, 1)[0]
-    return top in RUNTIME_MEMORY_DIRS
+    if top in RUNTIME_MEMORY_DIRS:
+        return True
+    return os.path.normcase(relative).casefold() in {
+        os.path.normcase(name).casefold() for name in RUNTIME_MEMORY_FILE_NAMES
+    }
 
 
 def memory_file_path(memory_dir: str) -> str:

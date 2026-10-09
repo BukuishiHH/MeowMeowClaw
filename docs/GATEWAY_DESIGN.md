@@ -202,18 +202,21 @@ CLI 与 QQ/飞书同路径，但保留 REPL 语义：
 ```
 CliAdapter.start()
  ├─ _outbound_loop(): env = await bus.get("outbound:cli")
- │      print(env.text)  →  resolve(self._pending[env.correlation_id])
- └─ _read_loop():
-        text = await asyncio.to_thread(input, "> ")   # 不阻塞事件循环
-        if text in ("/exit", "/quit"): 触发 Gateway 关闭
-        message_id = uuid4().hex
-        future = loop.create_future(); pending[message_id] = future
-        publish(inbound Envelope(kind=request, channel="cli", ...))
-        await future                                # 等回复打印后再显示下一个提示符
+ │      print(f"\n{APP_NAME} > {env.text}")
+ │      resolve(self._pending[env.correlation_id])
+ └─ run_repl():
+        raw = input(PROMPT)          # 同步读取; 单用户单在途, 阻塞事件循环是安全的
+        if raw.lower() in {"/exit", "/quit", "/q"}: return "exit"
+        await ask(raw): 入站 Envelope -> publish -> await Future(由 send 唤醒)
 ```
 
-- `/exit`、`/quit` 属 REPL 本地命令，由适配器处理，不发布；
-- 其余 `/` 指令（`/help /new /clear /sessions /skills`）**发布进总线**，由 `CliPolicy` 处理；
+- **单在途**：`ask()` 等到回复打印后才显示下一个提示符；`input()` 阻塞事件循环期间没有在途请求，
+  因此无需线程池，也避免了 Ctrl+C 时阻塞线程导致进程退不出的问题；
+- **Ctrl+C**：`run_repl()` 不吞 `KeyboardInterrupt`；`cli.main` 捕获后由 `_run_gateway_repl` 的
+  `finally` 调用 `gateway.stop()`（取消 pending Future → 排空出站 → 关总线）。
+
+- `/exit`、`/quit`、`/q` 属 REPL 本地命令，由适配器处理，不发布；
+- 其余 `/` 指令（`/help /new /clear /sessions /tools /skills`）**发布进总线**，由 `CliPolicy` 处理；
   CLI 每次进程启动创建新 `SessionKey(channel="cli", scope="session", conversation_id=<uuid>)`，
   `/new` 换新 uuid，`/clear` 归档当前 + 换新（与现有 `cli.py` 行为对齐）；
 - banner / 启动信息仍由交付层 `cli.py` 在 `gateway.start()` 前打印；

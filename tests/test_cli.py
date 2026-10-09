@@ -6,6 +6,8 @@
 - ``main``: monkeypatch build_application / asyncio.run, 验证启动输出与退出码。
 """
 
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock
@@ -16,6 +18,8 @@ import meowmeowclaw.cli as cli_module
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.bootstrap import Application, ConfigError
+from meowmeowclaw.channels.cli_adapter import CliAdapter
+from meowmeowclaw.channels.cli_policy import CliPolicy
 from meowmeowclaw.config import Settings
 from meowmeowclaw.conversation import ConversationService
 from meowmeowclaw.llm.base import (
@@ -418,6 +422,33 @@ class TestMain:
         assert "已注册工具(1 个)" in out
         assert "会话      : v1:cli:session:" in out
         assert len(coroutines) == 1
+
+    def test_gateway_enabled_routes_to_gateway_repl(self, tmp_path, monkeypatch, capsys):
+        app = replace(make_application(tmp_path, ScriptedProvider()), gateway=MagicMock())
+        called: dict = {}
+
+        async def fake_gateway_repl(app_, policy, adapter):
+            called["policy"] = policy
+            called["adapter"] = adapter
+
+        def fake_run(coro):
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        monkeypatch.setattr(cli_module, "_run_gateway_repl", fake_gateway_repl)
+        monkeypatch.setattr(cli_module, "build_application", MagicMock(return_value=app))
+        monkeypatch.setattr(cli_module.asyncio, "run", fake_run)
+
+        code = cli_module.main()
+
+        assert code == 0
+        assert isinstance(called["policy"], CliPolicy)
+        assert isinstance(called["adapter"], CliAdapter)
+        out = capsys.readouterr().out
+        assert "会话      : v1:cli:session:" in out
 
     def test_missing_api_key_returns_code_1(self, monkeypatch, capsys):
         monkeypatch.setattr(

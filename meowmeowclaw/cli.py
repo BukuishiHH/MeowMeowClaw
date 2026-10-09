@@ -5,11 +5,20 @@
 """
 
 import asyncio
-import uuid
 from dataclasses import dataclass
 from typing import Optional
 
 from meowmeowclaw.bootstrap import Application, ConfigError, build_application
+from meowmeowclaw.channels.cli_adapter import CliAdapter
+from meowmeowclaw.channels.cli_policy import (
+    CLI_APP_NAME,
+    CLI_EXIT_COMMANDS,
+    CLI_HELP_TEXT,
+    CLI_PROMPT,
+    CliPolicy,
+    new_cli_session,
+    session_short_id,
+)
 from meowmeowclaw.config import Settings
 from meowmeowclaw.memory import (
     MemoryStoreError,
@@ -20,12 +29,11 @@ from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.skills import SkillCatalog, SkillConfigError
 from meowmeowclaw.tools.registry import ToolRegistry
 
-# 应用显示名(项目名见 README 与人设文件)
-APP_NAME = "MeowMeowClaw"
-# 交互提示符
-PROMPT = "\n你 > "
-# 退出命令
-EXIT_COMMANDS = {"/exit", "/quit", "/q"}
+# 应用显示名/提示符/退出命令/帮助文本: 唯一来源 channels/cli_policy.py(CLI 网关路径共用)
+APP_NAME = CLI_APP_NAME
+PROMPT = CLI_PROMPT
+EXIT_COMMANDS = CLI_EXIT_COMMANDS
+HELP_TEXT = CLI_HELP_TEXT
 
 BANNER = r"""
     /\\_/\\
@@ -33,30 +41,6 @@ BANNER = r"""
     >     <     一个会用工具的小猫
                 输入内容开始对话, /exit 退出
 """
-
-HELP_TEXT = """可用命令:
-  /help                       查看本帮助
-  /new                        新建会话(旧会话保留在 sessions/)
-  /clear                      归档当前会话并新建
-  /clear <会话ID>             归档指定会话
-  /clear <会话ID> --purge     永久删除指定会话
-  /sessions [--active|--archived]  列出会话
-  /tools                      查看已注册工具
-  /skills                     查看已发现技能
-  /exit (/quit /q)            退出"""
-
-
-# ------------------------------------------------------------------ 会话
-
-
-def new_cli_session() -> SessionKey:
-    """生成一个新的 CLI 进程级会话键(每次启动 /new /clear 后调用)."""
-    return SessionKey(channel="cli", scope="session", conversation_id=uuid.uuid4().hex)
-
-
-def session_short_id(session: SessionKey) -> str:
-    return session.storage_id[:8]
-
 
 # ------------------------------------------------------------------ 启动信息
 
@@ -268,6 +252,25 @@ async def interactive_loop(app: Application, session_key: Optional[SessionKey] =
         print(f"\n{APP_NAME} > {result.answer}")
 
 
+async def _run_gateway_repl(app: Application, policy: CliPolicy, adapter: CliAdapter) -> None:
+    """CLI 网关路径: 注册策略/适配器 -> 启动 -> REPL -> 优雅关闭."""
+    gateway = app.gateway
+    if gateway is None:  # pragma: no cover - 调用方保证
+        raise RuntimeError("gateway 未装配")
+    gateway.add_policy(policy)
+    await gateway.start(adapters=[adapter])
+    try:
+        print("输入内容开始对话. 命令: /help 帮助, /sessions 会话, /new 新会话, /clear 归档, /exit 退出")
+        print("-" * 62)
+        reason = await adapter.run_repl()
+        if reason == "exit":
+            print("再见喵!")
+        elif reason == "eof":
+            print("\n(输入已结束) 再见喵!")
+    finally:
+        await gateway.stop()
+
+
 # ------------------------------------------------------------------ 入口
 
 
@@ -302,9 +305,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         print("[启动警告] 未发现内置技能, load_skill 不会注册")
 
-    session = new_cli_session()
+    if app.gateway is not None:
+        policy: Optional[CliPolicy] = CliPolicy(
+            app.conversation, tools=app.registry, catalog=app.catalog
+        )
+        session = policy.current_session
+    else:
+        policy = None
+        session = new_cli_session()
+
     _print_startup_info(app.config, session)
     _print_tools(app.registry)
+
+    if app.gateway is not None and policy is not None:
+        adapter = CliAdapter()
+        try:
+            asyncio.run(_run_gateway_repl(app, policy, adapter))
+        except KeyboardInterrupt:  # 输入/回答过程中 Ctrl+C: 不打印堆栈
+            print("\n已中断, 再见喵!")
+        return 0
 
     try:
         asyncio.run(interactive_loop(app, session))

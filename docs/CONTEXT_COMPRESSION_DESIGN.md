@@ -289,7 +289,7 @@ compressible = turns[:-keep_recent_turns]    # 最旧的若干完整 turn
 |---|---|---|
 | L0 正常 | 估算 ≤ 预算 | 原样发送，零 LLM 调用 |
 | L1 摘要 | 估算 > 预算且有可压缩 turn | 1 次摘要调用 → 摘要 system 消息替换最旧 turn → 采纳需同时满足"非空 + 收益达标" |
-| L2 硬裁 + 占位 | 摘要调用失败 / 超时 / 空 / 收益不足 / 摘要输入超限 | 丢弃同批最旧完整 turn，替换为 `[历史省略] 因上下文预算，最早的 N 轮对话已省略。`；不重试 |
+| L2 硬裁 + 占位 | 摘要调用失败 / 超时 / 空 / 收益不足 / 摘要输入超限 | 丢弃同批最旧完整 turn，替换为一条 **system 角色**的 `[历史省略] 因上下文预算，最早的 N 轮对话已省略。`；不重试 |
 | L3 当前轮工具占位 | L2 后仍超，且当前轮存在 tool 消息 | 从最旧开始把 `tool.content` 换成 `[工具结果已省略: 上下文预算不足]`，保留 role / tool_call_id / 其余字段（结构合法） |
 | L4 失败结束 | L3 后仍超（system + 当前提问本身过大），或已无可裁内容 | 返回 `AgentTurn(completed=False, finish_reason="context_overflow")`，answer 提示用户拆分问题或 `/clear`；本轮不写 JSONL |
 
@@ -410,6 +410,7 @@ if self.compressor is not None:
 response = await self.provider.chat(request_messages, tools=..., model=self.model)
 ```
 
+- `prepare_request` 未超预算时**返回原列表对象**（零改写/零额外调用）；压缩详情见 `compressor.last_outcome`（`changed` / `estimated_tokens` / `dropped_turns` / `still_over_budget`），P5 的溢出错误路径据此判断；
 - **事实源 `messages`、`new_start`、`AgentTurn.messages`、`_session_history` 全部不动**（C1）；现有 `run()` / `run_turn()` / 错误与护栏语义零变化；
 - 新增结束原因常量 `FINISH_REASON_CONTEXT_OVERFLOW = "context_overflow"`（loop 层常量，与 `max_iterations` / `circuit_break` 同级；`ConversationService` 只认 `completed`，无需改判断）。
 

@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import (
     CIRCUIT_BREAK_PREFIX,
@@ -726,3 +727,98 @@ class TestRunTurnHistorySnapshot:
         assert [message["content"] for message in second_call if message["role"] != "system"] == [
             "q1", "a1", "q2",
         ]
+
+
+class _CharCounter:
+    """集成测试用确定性计数器: 1 字符 = 1 token."""
+
+    name = "char"
+
+    def count_text(self, text: str) -> int:
+        return len(text or "")
+
+    def count_message(self, message: dict[str, Any]) -> int:
+        total = len(message.get("content") or "")
+        if message.get("tool_calls"):
+            total += len(json.dumps(message["tool_calls"], ensure_ascii=False))
+        return total
+
+    def count_messages(self, messages: list[dict[str, Any]]) -> int:
+        return sum(self.count_message(message) for message in messages)
+
+    def count_tools(self, tool_defs: Any) -> int:
+        if not tool_defs:
+            return 0
+        return len(json.dumps(list(tool_defs), ensure_ascii=False))
+
+    def estimate_request(
+        self,
+        messages: list[dict[str, Any]],
+        tool_defs: Any = None,
+        *,
+        safety_factor: float = 1.0,
+    ) -> int:
+        return self.count_messages(messages) + self.count_tools(tool_defs)
+
+
+class TestCompressorRequestView:
+    """P2: 压缩只影响 provider 收到的请求视图, 事实源与持久化不受影响."""
+
+    @pytest.mark.asyncio
+    async def test_external_history_is_trimmed_in_request_view_only(self):
+        provider = ScriptedProvider(text_response("最终回答"))
+        registry = make_registry()
+        registry.get_definitions.return_value = []  # 隔离工具定义, 便于锁定预算
+        history: list[dict[str, Any]] = []
+        for index in range(1, 4):
+            history.append({"role": "user", "content": f"q{index}" + "u" * 100})
+            history.append({"role": "assistant", "content": f"a{index}" + "a" * 100})
+        compressor = ContextCompressor(
+            counter=_CharCounter(), token_budget=300, keep_recent_turns=2
+        )
+        loop = make_loop(provider, registry=registry, compressor=compressor)
+
+        turn = await loop.run_turn("current", history=history)
+
+        request = provider.calls[0]["messages"]
+        assert request[0] == {"role": "system", "content": "SYS"}
+        assert request[1]["content"].startswith("[历史省略]")
+        assert any("q3" in (message.get("content") or "") for message in request)
+        assert not any("q1" in (message.get("content") or "") for message in request)
+        # 事实源: 只返回本轮新增消息, 不含 system / 占位 / 被裁历史
+        assert [message["role"] for message in turn.messages] == ["user", "assistant"]
+        assert turn.messages[0]["content"] == "current"
+        assert turn.messages[1]["content"] == "最终回答"
+
+    @pytest.mark.asyncio
+    async def test_internal_history_never_stores_request_view(self):
+        provider = ScriptedProvider(text_response("a1"), text_response("a2"), text_response("a3"))
+        registry = make_registry()
+        registry.get_definitions.return_value = []
+        compressor = ContextCompressor(
+            counter=_CharCounter(), token_budget=150, keep_recent_turns=1
+        )
+        loop = make_loop(provider, registry=registry, compressor=compressor)
+
+        await loop.run("q1" + "u" * 100)
+        await loop.run("q2" + "u" * 100)
+        await loop.run("q3")
+
+        # 第三次请求超预算: provider 收到占位 + 最近原文
+        third_request = provider.calls[2]["messages"]
+        assert third_request[1]["content"].startswith("[历史省略]")
+        # 实例历史仍保存三轮完整问答, 绝不含占位消息
+        assert len(loop._session_history) == 6  # noqa: SLF001 - 契约测试
+        assert all(
+            "历史省略" not in str(message) for message in loop._session_history  # noqa: SLF001
+        )
+
+    @pytest.mark.asyncio
+    async def test_compressor_none_keeps_legacy_behavior(self):
+        provider = ScriptedProvider(text_response("答"))
+        loop = make_loop(provider)
+
+        await loop.run_turn("hi", history=[])
+
+        assert "compressor=False" in repr(loop)
+        assert provider.calls[0]["messages"][-1]["content"] == "hi"

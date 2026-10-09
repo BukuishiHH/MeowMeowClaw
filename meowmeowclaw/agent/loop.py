@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.llm.base import (
     FINISH_REASON_ERROR,
@@ -77,6 +78,8 @@ class AgentLoop:
         max_iterations: 单轮对话内 "模型<->工具" 往返次数上限, 防止死循环;
             生产路径由装配层传入 ``.env`` 的 max_iterations; None 表示使用模块兜底值
             DEFAULT_MAX_ITERATIONS(32), 便于直接构造与单测
+        compressor: 可选的上下文压缩器; 每次 chat 前生成请求视图(超预算时硬裁/摘要),
+            None(默认)时行为与不压缩完全一致
 
     注意:
         - ``run(user_message)`` 保留旧行为: 使用并更新实例内 ``_session_history``,
@@ -95,11 +98,14 @@ class AgentLoop:
         context: ContextBuilder,
         model: Optional[str] = None,
         max_iterations: Optional[int] = None,
+        compressor: Optional[ContextCompressor] = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.context = context
         self.model = model
+        # 可选: 每次 provider.chat 前把事实源投影成压缩后的请求视图; None 表示不压缩
+        self.compressor = compressor
         # 未显式注入时使用模块兜底值; 生产路径由 bootstrap.build_application 传入配置值
         self.max_iterations = (
             DEFAULT_MAX_ITERATIONS if max_iterations is None else max_iterations
@@ -112,7 +118,7 @@ class AgentLoop:
     def __repr__(self) -> str:
         return (
             f"<AgentLoop model={self.model!r} max_iterations={self.max_iterations} "
-            f"tools={self.tools.list_tools()}>"
+            f"compressor={self.compressor is not None} tools={self.tools.list_tools()}>"
         )
 
     # ------------------------------------------------------------------ 主循环
@@ -155,8 +161,14 @@ class AgentLoop:
         iterations = 0
 
         for iterations in range(1, self.max_iterations + 1):
+            tool_defs = self.tools.get_definitions()
+            # C1 请求视图隔离: 压缩只影响发给 Provider 的副本,
+            # 事实源 messages / new_start / AgentTurn.messages 保持完整
+            request_messages = messages
+            if self.compressor is not None:
+                request_messages = await self.compressor.prepare_request(messages, tool_defs)
             response = await self.provider.chat(
-                messages, tools=self.tools.get_definitions(), model=self.model
+                request_messages, tools=tool_defs, model=self.model
             )
 
             # Provider 层已把异常包装成 finish_reason="error" 的响应

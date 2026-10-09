@@ -10,7 +10,7 @@
 ### 0.1 现状
 
 - 短期历史已有两级"字符口径"的静态护栏：
-  - `ConversationService` 装载窗口 `memory_max_turns=20` / `memory_max_chars=50000`（`conversation.py:95-101`）；
+  - `ConversationService` 装载窗口 `memory_max_turns=50` / `memory_max_chars=120000`（`conversation.py:95-101`）；
   - `JsonlSessionStore._trim_by_chars` 从最新往回取**完整 turn**，超预算丢最旧（`memory/jsonl.py:338-394`）；
 - 工具输出另有单条上限（8k~16k 字符）与落盘截断（8000 字符/条）；
 - 但没有任何**模型上下文窗口感知**：不数 token、不识别 `context_length_exceeded`、没有压缩/降级，超限时 `OpenAICompatProvider` 统一包成 `finish_reason="error"`（`llm/openai_compat.py:39-47`），同一会话会反复失败。
@@ -220,7 +220,7 @@ tokens = ceil(cjk * 1.0 + other * 0.3)
 ### 5.1 处理顺序（Q2 结论：轮数裁剪仍需保留，前后各一道）
 
 ```
-① store.load_recent(max_turns=20, max_chars=50000)      # 现有粗筛（摘要前，保护摘要输入）
+① store.load_recent(max_turns=50, max_chars=120000)     # 现有粗筛（摘要前，保护摘要输入）
 ② 组装 + 估算（全量口径）
 ③ 未超预算 → 原样发送，不做任何摘要/改写
 ④ 超预算 → 压缩"最旧的可压缩完整 turn"为摘要
@@ -237,6 +237,10 @@ tokens = ceil(cjk * 1.0 + other * 0.3)
 4. 无限保留 + 纯摘要会导致摘要不断滚动重写、信息漂移、每次都可能触发额外 LLM 调用。
 
 顺序结论：**粗筛在摘要前**（不白花摘要调用），**token 硬裁在摘要后**（最终保险）；二者都以"完整 turn"为单位，绝不切开 `tool_calls` ↔ `tool` 配对。
+
+> 默认窗口 `50 轮 / 120000 字符` 与 `token_budget=48000` 联动：实测 DeepSeek 分词器中文约 0.5 token/字符，
+> 120k 中文字符 ≈ 60k token，叠加固定开销后可触达 48k 预算，L1 摘要因此在默认配置下可用；
+> 旧默认（20 轮 / 50k 字符 ≈ 25k token）在默认预算下永远触达不到历史压缩（真实冒烟测试实测结论）。
 
 ### 5.2 turn 切分与保护规则
 
@@ -501,3 +505,8 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 **路径校验结论（P4 收尾）**：`model` 与目录名已对齐，`resolve_tokenizer_path(None, "deepseek-flash")` 命中 `tokenizers/deepseek-flash/tokenizer.json`，`build_counter` 实际返回 `hf:deepseek-flash/tokenizer.json`，不再回退启发式。目录名必须等于 `sanitize_model_name(model)`：仅替换 `[^A-Za-z0-9._-]`，**连字符 `-` 保留**（`deepseek_flash` 会匹配失败）。
 
 **P1–P5 全部完成**：实现文件为 `llm/tokenizer.py`、`agent/compression.py`、`agent/audit.py`、`agent/loop.py`、`bootstrap.py`、`tools/filesystem.py` + 配置/文档/测试；全量回归 913 passed / 6 skipped / 2 xfailed。
+
+**默认配置真实冒烟（2026-10-09，真实 DeepSeek API）**：
+- L1：`model=deepseek-flash`、`token_budget=48000`、窗口 50 轮/120k 字符；第 9 轮估算 44151，第 10 轮越界触发 L1（丢最旧 7 轮，压缩后 15352，1 次摘要调用）；真实主请求含 `[历史摘要]`，HISTORY.md 记录 `event=summary | result=ok`，JSONL 无摘要/占位。
+- L3：同样默认 48000 预算，单轮内连续读取 16×16000 字符文件，累计约 59.6k token，触发 6 次 `event=tool_elision | result=ok`（估算 60k+ → 44k），真实主请求含 `[工具结果已省略: 上下文预算不足]`，JSONL 保留完整工具消息、无占位。
+- 结论：窗口调至 50 轮/120k 字符后，默认 `token_budget=48000` 下 L1 摘要真正可达；L3 在单轮工具膨胀时也按预期生效。

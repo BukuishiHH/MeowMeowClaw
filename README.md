@@ -47,8 +47,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `workspace` | `<项目根>/workspace` | 留空或写 `.` 均表示该预设; 可写绝对路径覆盖; 启动装配时自动创建 |
 | `max_iterations` | `32` | 单轮"模型↔工具"往返上限; 非法值回退默认 |
 | `memory_dir` | `<workspace>/memory` | 记忆存储目录; 留空取默认; 相对路径按项目根解析 |
-| `memory_max_turns` | `20` | 装载历史窗口的轮数上限; 非法或 <=0 回退默认 |
-| `memory_max_chars` | `50000` | 装载历史窗口的字符上限; 非法或 <=0 回退默认 |
+| `memory_max_turns` | `50` | 装载历史窗口的轮数上限; 非法或 <=0 回退默认 |
+| `memory_max_chars` | `120000` | 装载历史窗口的字符上限(≈60k 中文 token); 非法或 <=0 回退默认 |
 | `compression_enabled` | `true` | 上下文 Token 压缩总开关; `false` 时只按轮数/字符窗口装载历史 |
 | `token_budget` | `48000` | 输入 Token 预算(估算 × 1.1 后比较); 超预算触发摘要/硬裁/工具占位 |
 | `tokenizer` | `auto` | `auto` / `heuristic` / `tiktoken[:encoding]` / `hf` |
@@ -72,6 +72,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 
 - 精确计数: 安装 `pip install "meowmeowclaw[tokenizers]"`, 并在 `<项目根>/tokenizers/<模型名>/tokenizer.json`
   放好分词器(如 `tokenizers/deepseek-flash/tokenizer.json`); 找不到时自动回退 CJK 加权启发式。
+- 默认装载窗口 `50 轮 / 120000 字符`: 120k 中文字符 ≈ 60k token, 叠加固定开销后可触达 48k 预算,
+  让「历史摘要压缩」在默认配置下真正可用(此前 20 轮/50k 字符≈25k token, 默认预算不可达)。
 - 设计细节见 `docs/CONTEXT_COMPRESSION_DESIGN.md`。
 
 ### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)

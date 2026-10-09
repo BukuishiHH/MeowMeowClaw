@@ -132,8 +132,8 @@ def make_application(
         workspace=Path("/tmp/fake-workspace"),
         max_iterations=3,
         memory_dir=tmp_path / "memory",
-        memory_max_turns=20,
-        memory_max_chars=50_000,
+        memory_max_turns=50,
+        memory_max_chars=120_000,
         source="/tmp/fake.env",
     )
     registry = ToolRegistry()

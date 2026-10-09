@@ -34,8 +34,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MAX_ITERATIONS = 32
-DEFAULT_MEMORY_MAX_TURNS = 20
-DEFAULT_MEMORY_MAX_CHARS = 50_000
+# 历史装载窗口: 50 轮 / 120k 字符; 与 token 压缩联动
+# (120k 中文字符 ≈ 60k token, 可触达默认 48000 输入预算, 使 L1 摘要可用)
+DEFAULT_MEMORY_MAX_TURNS = 50
+DEFAULT_MEMORY_MAX_CHARS = 120_000
 
 # 上下文 token 压缩默认值(设计见 docs/CONTEXT_COMPRESSION_DESIGN.md §8)
 DEFAULT_COMPRESSION_ENABLED = True

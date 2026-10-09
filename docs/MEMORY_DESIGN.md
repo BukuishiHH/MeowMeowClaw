@@ -66,7 +66,7 @@
 | D12 | QQ active 指针 | **持久化**（联系人 → 当前 session_id + 最后活动时间），重启可恢复 |
 | D13 | QQ 超时旧会话 | 轮换后**归档保留，不自动删除** |
 | D14 | QQ 超时提示 | 固定文案：**"已开始新对话"** |
-| D15 | QQ 上下文恢复 | 6 小时内恢复最近 **20 轮 / 50000 字符**（可配置） |
+| D15 | QQ 上下文恢复 | 6 小时内恢复最近 **50 轮 / 120000 字符**（可配置） |
 | D16 | QQ 指令集 | **`/help`、`/new`、`/clear`、`/sessions`**；仅私聊、仅本人可用 |
 | D17 | QQ 并发 | 同一联系人消息**排队串行**处理 |
 | D18 | 进程部署 | QQ 机器人服务与 CLI **可能同时运行在同一台机器**，文件所有权互不冲突 |
@@ -164,7 +164,7 @@
         · 生成新 session_id，更新 active 指针
         · 回复"已开始新对话"
   → 否则沿用当前会话
-  → 装载最近窗口(20 轮 / 50000 字符)
+  → 装载最近窗口(50 轮 / 120000 字符)
   → AgentLoop.run
   → append_turn
   → 更新 active.last_activity_ms = 本次用户消息到达时间
@@ -271,8 +271,8 @@ e5f6a7b8  archived  qq     2025-12-31T10:00:00Z  2025-12-31T11:00:00Z  33
 
 | 项 | v1 默认 | 可配置 |
 |---|---|---|
-| 装载轮数 | 20 轮 | ✅ `max_turns` |
-| 装载字符上限 | 50,000 字符 | ✅ `max_chars` |
+| 装载轮数 | 50 轮 | ✅ `max_turns` |
+| 装载字符上限 | 120,000 字符（≈60k 中文 token） | ✅ `max_chars` |
 | 工具结果截断 | 8,000 字符/条 | ✅ `max_tool_result_chars` |
 | 超出窗口 | 丢弃最旧的整轮 | — |
 | 摘要压缩 | ✅ 由上下文压缩承担(L1 摘要 / L2 硬裁 / L3 工具占位) | 见 `docs/CONTEXT_COMPRESSION_DESIGN.md` |
@@ -322,7 +322,7 @@ async close() -> None
 ### 6.3 ConversationService（编排层）
 
 1. **会话解析**：CLI 进程 session_id；QQ 读 active 指针 + 6 小时惰性轮换；
-2. **装载**：`load_recent(key, 20 轮 / 50k 字符)`；
+2. **装载**：`load_recent(key, 50 轮 / 120k 字符)`；
 3. **执行**：历史快照交给 `AgentLoop.run(user_message, history=...)`；
 4. **回写**：`append_turn`；更新 QQ active 指针；
 5. **指令**：`/sessions`、`/new`、`/clear [id] [--purge]`、`/help`；
@@ -478,7 +478,7 @@ async close() -> None
 | QQ 会话 | 6 小时前沿用/之后轮换；active 指针持久化；重启恢复；提示语；`/new`/`/clear` |
 | 会话管理 | 短 ID 解析（唯一/冲突）；`/clear <id>`；`--purge`；归档与永久删除 |
 | 跨渠道 | CLI 删除 QQ 会话后 QQ 服务重建会话并提示；QQ 删除 CLI 会话 |
-| 窗口与截断 | 20 轮/50k 字符；不切开 turn；8000 字符工具结果截断 |
+| 窗口与截断 | 50 轮/120k 字符；不切开 turn；8000 字符工具结果截断 |
 | 并发 | 同联系人串行；不同会话并行；归档/删除与写入互斥 |
 | 崩溃恢复 | 半行 JSON、部分 turn、归档替换中断 |
 | 工具边界 | sessions/active/archive 全禁；MEMORY.md 可读写、写前备份 |

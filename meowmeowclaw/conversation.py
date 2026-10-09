@@ -26,8 +26,8 @@ from meowmeowclaw.memory import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_TURNS = 20
-DEFAULT_MAX_CHARS = 50_000
+DEFAULT_MAX_TURNS = 50
+DEFAULT_MAX_CHARS = 120_000
 
 
 @dataclass(frozen=True)

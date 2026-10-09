@@ -52,8 +52,8 @@ def make_settings(**overrides) -> Settings:
     params["workspace"] = Path(params["workspace"])
     # 默认把记忆目录放到 tmp workspace 下, 避免污染仓库
     params["memory_dir"] = Path(params.get("memory_dir") or (params["workspace"] / "memory"))
-    params.setdefault("memory_max_turns", 20)
-    params.setdefault("memory_max_chars", 50_000)
+    params.setdefault("memory_max_turns", 50)
+    params.setdefault("memory_max_chars", 120_000)
     return Settings(**params)
 
 

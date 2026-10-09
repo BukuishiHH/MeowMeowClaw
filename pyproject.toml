@@ -23,6 +23,10 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
 ]
+tokenizers = [
+  "tiktoken>=0.7",
+  "tokenizers>=0.19"
+]
 
 [project.scripts]
 meowmeowclaw = "meowmeowclaw.cli:main"

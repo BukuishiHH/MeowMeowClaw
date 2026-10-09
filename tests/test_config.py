@@ -17,22 +17,33 @@ import pytest
 
 from meowmeowclaw.config import (
     DEFAULT_BASE_URL,
+    DEFAULT_COMPRESSION_ENABLED,
+    DEFAULT_HISTORY_LOG_MAX_BYTES,
+    DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
+    DEFAULT_KEEP_RECENT_TURNS,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MEMORY_MAX_CHARS,
     DEFAULT_MEMORY_MAX_TURNS,
     DEFAULT_MODEL,
+    DEFAULT_SUMMARY_MAX_TOKENS,
+    DEFAULT_SUMMARY_TIMEOUT,
+    DEFAULT_TOKEN_BUDGET,
+    DEFAULT_TOKENIZER,
     Settings,
     load_config,
     load_settings,
     read_env_file,
 )
 from meowmeowclaw.paths import (
+    DEFAULT_TOKENIZER_DIR,
     DEFAULT_WORKSPACE,
     ENV_FILE,
     IDENTITY_FILE,
     PROJECT_ROOT,
     resolve_memory_dir,
+    resolve_tokenizer_path,
     resolve_workspace,
+    sanitize_model_name,
 )
 
 # 可能影响取值来源的进程环境变量, 测试期间一律清空
@@ -56,6 +67,16 @@ ENV_KEYS = (
     "HISTORY_MAX_TURNS",
     "MEMORY_MAX_CHARS",
     "HISTORY_MAX_CHARS",
+    "COMPRESSION_ENABLED",
+    "TOKEN_BUDGET",
+    "TOKENIZER",
+    "HF_TOKENIZER_PATH",
+    "KEEP_RECENT_TURNS",
+    "SUMMARY_MODEL",
+    "SUMMARY_MAX_TOKENS",
+    "SUMMARY_TIMEOUT",
+    "HISTORY_LOG_MAX_BYTES",
+    "HISTORY_LOG_ORIGINAL_CHARS",
 )
 
 
@@ -352,6 +373,185 @@ class TestApiKeyHandling:
 
         assert s.has_api_key is False
         assert any("api_key" in r.message for r in caplog.records)
+
+
+# ------------------------------------------------------------ token 压缩配置
+
+
+class TestCompressionSettings:
+    def test_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.compression_enabled is DEFAULT_COMPRESSION_ENABLED
+        assert s.token_budget == DEFAULT_TOKEN_BUDGET
+        assert s.tokenizer == DEFAULT_TOKENIZER
+        assert s.hf_tokenizer_path == ""
+        assert s.keep_recent_turns == DEFAULT_KEEP_RECENT_TURNS
+        assert s.summary_model == ""
+        assert s.summary_max_tokens == DEFAULT_SUMMARY_MAX_TOKENS
+        assert s.summary_timeout == DEFAULT_SUMMARY_TIMEOUT
+        assert s.history_log_max_bytes == DEFAULT_HISTORY_LOG_MAX_BYTES
+        assert s.history_log_original_chars == DEFAULT_HISTORY_LOG_ORIGINAL_CHARS
+
+    def test_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "compression_enabled=false\n"
+            "token_budget=32000\n"
+            "tokenizer=tiktoken:o200k_base\n"
+            "hf_tokenizer_path=tokenizers/my-model/tokenizer.json\n"
+            "keep_recent_turns=3\n"
+            "summary_model=deepseek-chat\n"
+            "summary_max_tokens=512\n"
+            "summary_timeout=8.5\n"
+            "history_log_max_bytes=1048576\n"
+            "history_log_original_chars=16000\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.compression_enabled is False
+        assert s.token_budget == 32000
+        assert s.tokenizer == "tiktoken:o200k_base"
+        assert s.hf_tokenizer_path == "tokenizers/my-model/tokenizer.json"
+        assert s.keep_recent_turns == 3
+        assert s.summary_model == "deepseek-chat"
+        assert s.summary_max_tokens == 512
+        assert s.summary_timeout == 8.5
+        assert s.history_log_max_bytes == 1048576
+        assert s.history_log_original_chars == 16000
+
+    @pytest.mark.parametrize("raw", ["true", "1", "YES", "On"])
+    def test_bool_true_values(self, tmp_path, raw):
+        assert load_settings(write_env(tmp_path, f"compression_enabled={raw}\n")).compression_enabled is True
+
+    @pytest.mark.parametrize("raw", ["false", "0", "NO", "off"])
+    def test_bool_false_values(self, tmp_path, raw):
+        assert load_settings(write_env(tmp_path, f"compression_enabled={raw}\n")).compression_enabled is False
+
+    @pytest.mark.parametrize("raw", ["abc", "3.5", "0", "-1", "999"])
+    def test_invalid_token_budget_falls_back(self, tmp_path, caplog, raw):
+        env = write_env(tmp_path, f"token_budget={raw}\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.token_budget == DEFAULT_TOKEN_BUDGET
+        assert any("token_budget" in record.message for record in caplog.records)
+
+    def test_invalid_bool_falls_back(self, tmp_path, caplog):
+        env = write_env(tmp_path, "compression_enabled=maybe\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.compression_enabled is DEFAULT_COMPRESSION_ENABLED
+        assert any("compression_enabled" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize("raw", ["auto", "heuristic", "tiktoken", "tiktoken:cl100k_base", "hf"])
+    def test_valid_tokenizer_modes(self, tmp_path, raw):
+        assert load_settings(write_env(tmp_path, f"tokenizer={raw}\n")).tokenizer == raw
+
+    def test_invalid_tokenizer_falls_back(self, tmp_path, caplog):
+        env = write_env(tmp_path, "tokenizer=magic\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.tokenizer == DEFAULT_TOKENIZER
+        assert any("tokenizer" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "keep_recent_turns=0\n",
+            "summary_max_tokens=abc\n",
+            "summary_timeout=-1\n",
+            "history_log_max_bytes=0\n",
+            "history_log_original_chars=xyz\n",
+        ],
+    )
+    def test_invalid_positive_values_fall_back(self, tmp_path, caplog, line):
+        env = write_env(tmp_path, line)
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        name = line.split("=")[0]
+        defaults = {
+            "keep_recent_turns": DEFAULT_KEEP_RECENT_TURNS,
+            "summary_max_tokens": DEFAULT_SUMMARY_MAX_TOKENS,
+            "summary_timeout": DEFAULT_SUMMARY_TIMEOUT,
+            "history_log_max_bytes": DEFAULT_HISTORY_LOG_MAX_BYTES,
+            "history_log_original_chars": DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
+        }
+        assert getattr(s, name) == defaults[name]
+        assert any(name in record.message for record in caplog.records)
+
+
+# --------------------------------------------------------- tokenizer 路径解析
+
+
+class TestTokenizerPathResolution:
+    def test_sanitize_model_name(self):
+        assert sanitize_model_name("deepseek-ai/DeepSeek-V4-Flash") == (
+            "deepseek-ai_DeepSeek-V4-Flash"
+        )
+        assert sanitize_model_name("a b:c/d") == "a_b_c_d"
+        assert sanitize_model_name("") == "unknown"
+        assert sanitize_model_name(None) == "unknown"
+
+    def test_default_subdir_candidate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("meowmeowclaw.paths.DEFAULT_TOKENIZER_DIR", tmp_path)
+        target = tmp_path / "deepseek-ai_DeepSeek-V4-Flash" / "tokenizer.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+
+        assert resolve_tokenizer_path(None, "deepseek-ai/DeepSeek-V4-Flash") == target
+
+    def test_default_single_file_candidate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("meowmeowclaw.paths.DEFAULT_TOKENIZER_DIR", tmp_path)
+        target = tmp_path / "my-model.json"
+        target.write_text("{}", encoding="utf-8")
+
+        assert resolve_tokenizer_path(None, "my-model") == target
+
+    def test_subdir_candidate_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("meowmeowclaw.paths.DEFAULT_TOKENIZER_DIR", tmp_path)
+        subdir = tmp_path / "m" / "tokenizer.json"
+        subdir.parent.mkdir(parents=True)
+        subdir.write_text("{}", encoding="utf-8")
+        single = tmp_path / "m.json"
+        single.write_text("{}", encoding="utf-8")
+
+        assert resolve_tokenizer_path(None, "m") == subdir
+
+    def test_missing_candidates_return_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("meowmeowclaw.paths.DEFAULT_TOKENIZER_DIR", tmp_path)
+
+        assert resolve_tokenizer_path(None, "m") is None
+        assert resolve_tokenizer_path("", "m") is None
+
+    def test_explicit_relative_path_resolves_against_project_root(self):
+        # 用仓库内真实存在的根级文件验证"相对路径按项目根解析"的约定
+        assert resolve_tokenizer_path(".env.example", "m") == PROJECT_ROOT / ".env.example"
+
+    def test_explicit_absolute_path(self, tmp_path):
+        target = tmp_path / "tokenizer.json"
+        target.write_text("{}", encoding="utf-8")
+
+        assert resolve_tokenizer_path(str(target), "m") == target
+
+    def test_explicit_missing_path_ignores_default_candidates(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("meowmeowclaw.paths.DEFAULT_TOKENIZER_DIR", tmp_path)
+        fallback = tmp_path / "m" / "tokenizer.json"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_text("{}", encoding="utf-8")
+
+        assert resolve_tokenizer_path("no-such-file.json", "m") is None
+
+    def test_default_dir_constant_points_to_project_root(self):
+        assert DEFAULT_TOKENIZER_DIR == PROJECT_ROOT / "tokenizers"
 
 
 # ------------------------------------------------------------------ Settings

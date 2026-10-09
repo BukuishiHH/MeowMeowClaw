@@ -157,7 +157,7 @@ TokenCounter (Protocol)
 ### 4.3 启发式公式
 
 ```
-cjk   = count(ch in CJK ranges)          # \u4e00-\u9fff / \u3400-\u4dbf / \uf900-\ufaff / \u3000-\u303f
+cjk   = count(ch in CJK ranges)          # \u4e00-\u9fff / \u3400-\u4dbf / \uf900-\ufaff / \u3000-\u303f / \uff00-\uffef(全角标点) 等
 other = len(text) - cjk
 tokens = ceil(cjk * 1.0 + other * 0.3)
 ```

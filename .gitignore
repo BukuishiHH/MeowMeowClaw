@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 workspace/
+
+# 本地 tokenizer 资产(模型分词器文件体积较大, 不入库; 确需入库用 git add -f)
+tokenizers/

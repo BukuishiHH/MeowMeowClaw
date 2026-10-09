@@ -37,6 +37,16 @@ DEFAULT_MAX_ITERATIONS = 32
 DEFAULT_MEMORY_MAX_TURNS = 20
 DEFAULT_MEMORY_MAX_CHARS = 50_000
 
+# 上下文 token 压缩默认值(设计见 docs/CONTEXT_COMPRESSION_DESIGN.md §8)
+DEFAULT_COMPRESSION_ENABLED = True
+DEFAULT_TOKEN_BUDGET = 48_000
+DEFAULT_TOKENIZER = "auto"
+DEFAULT_KEEP_RECENT_TURNS = 2
+DEFAULT_SUMMARY_MAX_TOKENS = 768
+DEFAULT_SUMMARY_TIMEOUT = 15.0
+DEFAULT_HISTORY_LOG_MAX_BYTES = 2_097_152
+DEFAULT_HISTORY_LOG_ORIGINAL_CHARS = 32_000
+
 # 键别名映射
 _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "model": ("model", "model_name"),
@@ -47,6 +57,16 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "memory_dir": ("memory_dir", "memory_path", "session_dir"),
     "memory_max_turns": ("memory_max_turns", "history_max_turns"),
     "memory_max_chars": ("memory_max_chars", "history_max_chars"),
+    "compression_enabled": ("compression_enabled",),
+    "token_budget": ("token_budget",),
+    "tokenizer": ("tokenizer",),
+    "hf_tokenizer_path": ("hf_tokenizer_path",),
+    "keep_recent_turns": ("keep_recent_turns",),
+    "summary_model": ("summary_model",),
+    "summary_max_tokens": ("summary_max_tokens",),
+    "summary_timeout": ("summary_timeout",),
+    "history_log_max_bytes": ("history_log_max_bytes",),
+    "history_log_original_chars": ("history_log_original_chars",),
 }
 
 # 已废弃配置键: 人设已固定为 <项目根>/identity.md, 出现时警告并忽略
@@ -110,6 +130,65 @@ def _resolve_positive_int(value: Optional[str], default: int, name: str) -> int:
     return num
 
 
+def _resolve_bool(value: Optional[str], default: bool, name: str) -> bool:
+    """解析布尔开关; 非法值回退默认值并告警."""
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    logger.warning("%s 不是合法布尔值(%r), 回退默认值 %s", name, value, default)
+    return default
+
+
+def _resolve_positive_float(value: Optional[str], default: float, name: str) -> float:
+    """解析正浮点值(摘要超时等); 非法/<=0 回退默认值."""
+    if value is None:
+        return default
+    try:
+        num = float(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("%s 不是数字(%r), 回退默认值 %s", name, value, default)
+        return default
+    if num <= 0:
+        logger.warning("%s 必须为正数(%r), 回退默认值 %s", name, value, default)
+        return default
+    return num
+
+
+def _resolve_token_budget(value: Optional[str]) -> int:
+    """解析输入 token 预算; 非法或过小(<1000)回退默认值, 避免把正常对话全压光."""
+    if value is None:
+        return DEFAULT_TOKEN_BUDGET
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("token_budget 不是整数(%r), 回退默认值 %d", value, DEFAULT_TOKEN_BUDGET)
+        return DEFAULT_TOKEN_BUDGET
+    if num < 1000:
+        logger.warning(
+            "token_budget 过小(%r), 回退默认值 %d", value, DEFAULT_TOKEN_BUDGET
+        )
+        return DEFAULT_TOKEN_BUDGET
+    return num
+
+
+def _resolve_tokenizer(value: Optional[str]) -> str:
+    """解析分词器模式: auto/heuristic/tiktoken[:encoding]/hf; 非法值回退默认."""
+    if value is None:
+        return DEFAULT_TOKENIZER
+    text = str(value).strip()
+    lowered = text.lower()
+    if lowered in ("auto", "heuristic", "tiktoken", "hf") or lowered.startswith(
+        "tiktoken:"
+    ):
+        return text
+    logger.warning("tokenizer 取值不合法(%r), 回退默认值 %s", value, DEFAULT_TOKENIZER)
+    return DEFAULT_TOKENIZER
+
+
 def _warn_deprecated_identity_keys(raw: dict[str, str]) -> None:
     """检测已废弃的人设配置键: 警告并忽略(人设固定为项目根 identity.md)."""
     present = [key for key in DEPRECATED_IDENTITY_KEYS if key in raw]
@@ -131,6 +210,17 @@ class Settings:
     memory_dir: Path = DEFAULT_WORKSPACE / "memory"
     memory_max_turns: int = DEFAULT_MEMORY_MAX_TURNS
     memory_max_chars: int = DEFAULT_MEMORY_MAX_CHARS
+    # 上下文 token 压缩(§8)
+    compression_enabled: bool = DEFAULT_COMPRESSION_ENABLED
+    token_budget: int = DEFAULT_TOKEN_BUDGET
+    tokenizer: str = DEFAULT_TOKENIZER
+    hf_tokenizer_path: str = ""
+    keep_recent_turns: int = DEFAULT_KEEP_RECENT_TURNS
+    summary_model: str = ""
+    summary_max_tokens: int = DEFAULT_SUMMARY_MAX_TOKENS
+    summary_timeout: float = DEFAULT_SUMMARY_TIMEOUT
+    history_log_max_bytes: int = DEFAULT_HISTORY_LOG_MAX_BYTES
+    history_log_original_chars: int = DEFAULT_HISTORY_LOG_ORIGINAL_CHARS
     source: str = str(ENV_FILE)
 
     def __repr__(self) -> str:
@@ -140,6 +230,12 @@ class Settings:
             f"workspace={str(self.workspace)!r}, max_iterations={self.max_iterations}, "
             f"memory_dir={str(self.memory_dir)!r}, memory_max_turns={self.memory_max_turns}, "
             f"memory_max_chars={self.memory_max_chars}, "
+            f"compression_enabled={self.compression_enabled}, token_budget={self.token_budget}, "
+            f"tokenizer={self.tokenizer!r}, hf_tokenizer_path={self.hf_tokenizer_path!r}, "
+            f"keep_recent_turns={self.keep_recent_turns}, summary_model={self.summary_model!r}, "
+            f"summary_max_tokens={self.summary_max_tokens}, summary_timeout={self.summary_timeout}, "
+            f"history_log_max_bytes={self.history_log_max_bytes}, "
+            f"history_log_original_chars={self.history_log_original_chars}, "
             f"api_key={masked_key}, source={self.source!r})"
         )
 
@@ -171,6 +267,40 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["memory_max_chars"]),
             DEFAULT_MEMORY_MAX_CHARS,
             "memory_max_chars",
+        ),
+        compression_enabled=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["compression_enabled"]),
+            DEFAULT_COMPRESSION_ENABLED,
+            "compression_enabled",
+        ),
+        token_budget=_resolve_token_budget(_get(raw, *_KEY_ALIASES["token_budget"])),
+        tokenizer=_resolve_tokenizer(_get(raw, *_KEY_ALIASES["tokenizer"])),
+        hf_tokenizer_path=_get(raw, *_KEY_ALIASES["hf_tokenizer_path"]) or "",
+        keep_recent_turns=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["keep_recent_turns"]),
+            DEFAULT_KEEP_RECENT_TURNS,
+            "keep_recent_turns",
+        ),
+        summary_model=_get(raw, *_KEY_ALIASES["summary_model"]) or "",
+        summary_max_tokens=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["summary_max_tokens"]),
+            DEFAULT_SUMMARY_MAX_TOKENS,
+            "summary_max_tokens",
+        ),
+        summary_timeout=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["summary_timeout"]),
+            DEFAULT_SUMMARY_TIMEOUT,
+            "summary_timeout",
+        ),
+        history_log_max_bytes=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["history_log_max_bytes"]),
+            DEFAULT_HISTORY_LOG_MAX_BYTES,
+            "history_log_max_bytes",
+        ),
+        history_log_original_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["history_log_original_chars"]),
+            DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
+            "history_log_original_chars",
         ),
         source=str(path),
     )

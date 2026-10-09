@@ -517,6 +517,8 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 
 ### 15.8 A+ 中间路线（现在可做，低成本）
 
+> 详细设计、接口、阶段与验收见 **`docs/A_PLUS_OPTIMIZATION.md`**（已确认，待实现）。
+
 1. **把装载从 O(总会话长度) 降到 O(窗口)**：JSONL 尾部读取或按 turn 维护 offset 索引，避免每次全文件解析
    ——这是 A 当前最大性能短板，修好后多数场景无需 B；
 2. **生命周期 API**：`ConversationService.close_session(key)` / `evict_idle(ttl)` / `max_cached_sessions`，
@@ -583,4 +585,5 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 ### 16.5 待后续
 
 - 真实 OneBot/NapCat/飞书/Web 适配器；`kind=push` 生产方；去重持久化；死信重放（可选）；
-- A+（会话运行时生命周期 API 与 JSONL 尾读优化）按既定约定在整体功能完成后另行排期。
+- A+（会话运行时生命周期 API 与 JSONL 尾读优化）设计已确认，实施排期见 `docs/A_PLUS_OPTIMIZATION.md`；
+  在当前文档中按既定约定于网关整体功能完成后启动。

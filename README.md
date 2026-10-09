@@ -533,6 +533,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
+- A+（会话 IO 尾读 + 运行时生命周期 + 指标）设计已确认、待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5 与多渠道网关 W1–W4 已落地(`gateway_enabled` 默认 `false`, 真实 CLI/QQ 路径已经真实 API 冒烟); 结构化长期记忆后端、QQ **OneBot/NapCat 传输适配器**、飞书/Web 适配器、流式输出与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附

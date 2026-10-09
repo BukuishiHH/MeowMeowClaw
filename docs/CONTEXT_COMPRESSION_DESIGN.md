@@ -1,6 +1,6 @@
 # MeowMeowClaw 上下文 Token 压缩设计（v1）
 
-> 状态：**设计稿；所有决策已确认，依赖与本地 tokenizer 文件已验证可用（§4.7），P1 开始实施**。本文只定义行为与边界，不改 JSONL 存储格式。
+> 状态：**设计已确认；P1（TokenCounter/配置）、P2（请求视图/L2 硬裁）、P3（摘要/滚动缓存/降级/bootstrap 接入）已实现，P4（HISTORY.md）/P5（L3/L4）待实现**。本文只定义行为与边界，不改 JSONL 存储格式。
 > 关联：`docs/MEMORY_DESIGN.md` §5.4、`meowmeowclaw/agent/loop.py`、`meowmeowclaw/conversation.py`、`meowmeowclaw/llm/openai_compat.py`。
 
 ---
@@ -258,7 +258,7 @@ compressible = turns[:-keep_recent_turns]    # 最旧的若干完整 turn
 | 项 | 规定 |
 |---|---|
 | 调用对象 | 同一 `provider`，`model = summary_model or 主 model` |
-| 参数 | `tools=None`，不传工具定义；`max_tokens=summary_max_tokens`（默认 768） |
+| 参数 | `tools=None`，不传工具定义；`max_tokens=summary_max_tokens`（默认 768；P3 为 `LLMProvider.chat` 新增可选 `max_tokens`，`OpenAICompatProvider` 透传，未传时不带该参数） |
 | 超时 | `asyncio.wait_for(..., timeout=summary_timeout)`（默认 15s；Provider 签名不变） |
 | 次数 | 每次压缩事件最多 1 次；失败不重试 |
 | 递归防护 | 直接调用 `provider.chat`，**绝不经过 AgentLoop**，因此不会再次进入压缩路径 |
@@ -417,8 +417,9 @@ response = await self.provider.chat(request_messages, tools=..., model=self.mode
 ### 9.2 `bootstrap`
 
 - `agent_factory(session_key)` 内构造 `TokenCounter`（全局共享，无状态）+ `HistoryAuditLog`（全局共享）+ `ContextCompressor(session_key=..., counter=..., provider=..., model=..., tools=..., config=...)`，注入 AgentLoop；
-- `compression_enabled=false` 时仍构造但内部短路；或直接传 `None`（推荐后者，零开销）；
-- 摘要调用复用同一个 `provider` 实例与连接池。
+- `compression_enabled=false` 时**不构造 counter/compressor，直接向 AgentLoop 传 `None`**（零开销）；
+- 摘要调用复用同一个 `provider` 实例与连接池；`summary_model` 空时复用主 model；
+- P3 已按此装配；`audit_log` 暂为 `None`，P4 注入 `HistoryAuditLog`。
 
 ### 9.3 `config.py` / `paths.py` / 文档
 

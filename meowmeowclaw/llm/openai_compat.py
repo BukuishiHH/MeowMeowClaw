@@ -86,12 +86,16 @@ class OpenAICompatProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         target_model = model or self.model
         if not target_model:
             return _error_response(ValueError("未指定模型名, 请在构造参数或 chat(model=...) 中指定"))
 
         request_kwargs: dict[str, Any] = {"model": target_model, "messages": messages}
+        if max_tokens is not None:
+            # 摘要调用等场景需要限制输出长度; 不传则沿用服务端默认
+            request_kwargs["max_tokens"] = int(max_tokens)
         if tools:
             # 仅在确有工具定义时才带 tools / tool_choice:
             # 空列表或 None 一律不传, 避免部分网关(vLLM/One-API 等)直接返回 400

@@ -8,17 +8,23 @@
 运行: pytest tests/agent/test_compression.py -v
 """
 
+import asyncio
+import copy
 import json
+import logging
 from typing import Any, Optional, Sequence
 
 import pytest
 
 from meowmeowclaw.agent.compression import (
+    DEFAULT_SUMMARY_MAX_TOKENS,
     HISTORY_OMITTED_TEMPLATE,
+    SUMMARY_HEADER,
     CompressionError,
     ContextCompressor,
     split_turns,
 )
+from meowmeowclaw.llm.base import FINISH_REASON_ERROR, FINISH_REASON_STOP, LLMResponse
 
 
 # --------------------------------------------------------------------- 测试替身
@@ -370,3 +376,323 @@ class TestConstruction:
         text = repr(make_compressor(budget=123))
         assert "budget=123" in text
         assert "keep_recent_turns=2" in text
+
+# ------------------------------------------------------------------ P3: 摘要
+
+
+class FakeSummaryProvider:
+    """脚本化摘要 Provider: 每个结果可为 str / LLMResponse / 异常实例."""
+
+    def __init__(self, *results: Any) -> None:
+        self._results = list(results)
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        self.calls.append(
+            {
+                "messages": copy.deepcopy(messages),
+                "tools": tools,
+                "model": model,
+                "max_tokens": max_tokens,
+            }
+        )
+        if not self._results:
+            raise AssertionError("摘要脚本已用尽")
+        result = self._results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        if isinstance(result, LLMResponse):
+            return result
+        return LLMResponse(content=result, finish_reason=FINISH_REASON_STOP)
+
+
+class SlowSummaryProvider:
+    """固定延迟的摘要 Provider, 用于覆盖 asyncio.wait_for 超时降级."""
+
+    def __init__(self, delay: float, content: str = "迟到摘要") -> None:
+        self.delay = delay
+        self.content = content
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        return LLMResponse(content=self.content, finish_reason=FINISH_REASON_STOP)
+
+
+class RecordingAuditSink:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def record(self, event: dict[str, Any]) -> None:
+        self.events.append(event)
+
+
+class ExplodingAuditSink:
+    async def record(self, event: dict[str, Any]) -> None:
+        raise OSError("disk full")
+
+
+def summary_compressor(provider: Any, **kwargs: Any) -> ContextCompressor:
+    """默认配置: 3 个完整旧 turn 下, keep=2 时摘要候选(约446 token)可放进 450 预算."""
+    return ContextCompressor(
+        counter=CharCounter(),
+        token_budget=450,
+        keep_recent_turns=2,
+        provider=provider,
+        model="main-model",
+        **kwargs,
+    )
+
+
+class TestSummaryCompression:
+    @pytest.mark.asyncio
+    async def test_summary_replaces_oldest_turns(self):
+        provider = FakeSummaryProvider("旧对话摘要")
+        audit = RecordingAuditSink()
+        compressor = summary_compressor(
+            provider, session="cli:session:abc", audit_log=audit
+        )
+
+        result = await compressor.prepare_request(build_conversation(turns=3))
+
+        assert result[0] == {"role": "system", "content": "SYS"}
+        assert result[1]["role"] == "system"
+        assert result[1]["content"].startswith(SUMMARY_HEADER)
+        assert "旧对话摘要" in result[1]["content"]
+        assert not any("[历史省略]" in (message.get("content") or "") for message in result)
+        contents = [message.get("content") for message in result]
+        assert "q1" + "u" * 100 not in contents
+        assert "q2" + "u" * 100 in contents
+        assert "q3" + "u" * 100 in contents
+        assert contents[-1] == "current"
+
+        outcome = compressor.last_outcome
+        assert outcome is not None
+        assert outcome.changed is True
+        assert outcome.summary_applied is True
+        assert outcome.dropped_turns == 1
+        assert outcome.still_over_budget is False
+
+        assert len(provider.calls) == 1
+        call = provider.calls[0]
+        assert call["tools"] is None
+        assert call["model"] == "main-model"
+        assert call["max_tokens"] == DEFAULT_SUMMARY_MAX_TOKENS
+        assert "用户:" in call["messages"][1]["content"]
+        assert "q1" in call["messages"][1]["content"]
+
+        assert len(audit.events) == 1
+        event = audit.events[0]
+        assert event["event"] == "summary"
+        assert event["result"] == "ok"
+        assert event["session"] == "cli:session:abc"
+        assert event["dropped_turns"] == 1
+        assert len(event["original_messages"]) == 2  # q1 + a1
+        assert event["summary"] == "旧对话摘要"
+        assert event["estimated_after"] <= event["budget"]
+
+    @pytest.mark.asyncio
+    async def test_summary_uses_configured_model_and_max_tokens(self):
+        provider = FakeSummaryProvider("摘要")
+        compressor = summary_compressor(
+            provider, summary_model="cheap-model", summary_max_tokens=64
+        )
+
+        await compressor.prepare_request(build_conversation(turns=3))
+
+        assert provider.calls[0]["model"] == "cheap-model"
+        assert provider.calls[0]["max_tokens"] == 64
+
+    @pytest.mark.asyncio
+    async def test_fact_source_is_not_mutated_by_summary(self):
+        messages = build_conversation(turns=3)
+        snapshot = json.dumps(messages, ensure_ascii=False)
+        compressor = summary_compressor(FakeSummaryProvider("摘要"))
+
+        await compressor.prepare_request(messages)
+
+        assert json.dumps(messages, ensure_ascii=False) == snapshot
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result", "reason"),
+        [
+            (RuntimeError("boom"), "provider_error"),
+            (LLMResponse(content="[LLM调用失败] x", finish_reason=FINISH_REASON_ERROR), "error_response"),
+            ("   ", "empty"),
+            ("x" * 300, "no_gain"),
+        ],
+    )
+    async def test_summary_failure_falls_back_to_hard_trim(self, result, reason):
+        provider = FakeSummaryProvider(result)
+        audit = RecordingAuditSink()
+        compressor = summary_compressor(provider, audit_log=audit)
+
+        view = await compressor.prepare_request(build_conversation(turns=3))
+
+        assert view[1]["content"].startswith("[历史省略]")
+        outcome = compressor.last_outcome
+        assert outcome is not None
+        assert outcome.summary_applied is False
+        assert outcome.changed is True
+        assert outcome.still_over_budget is False
+        assert len(provider.calls) == 1  # 不重试
+        assert audit.events[0]["event"] == "fallback_trim"
+        assert audit.events[0]["result"] == "fallback"
+        assert audit.events[0]["reason"] == reason
+
+    @pytest.mark.asyncio
+    async def test_summary_timeout_falls_back(self):
+        provider = SlowSummaryProvider(delay=0.2)
+        audit = RecordingAuditSink()
+        compressor = summary_compressor(
+            provider, summary_timeout=0.01, audit_log=audit
+        )
+
+        view = await compressor.prepare_request(build_conversation(turns=3))
+
+        assert view[1]["content"].startswith("[历史省略]")
+        assert provider.calls == 1
+        assert compressor.last_outcome is not None
+        assert compressor.last_outcome.summary_applied is False
+        assert audit.events[0]["reason"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_summary_still_over_uses_hard_trim(self):
+        summary = "这是一个较长的摘要内容"
+        provider = FakeSummaryProvider(summary)
+        audit = RecordingAuditSink()
+        counter = CharCounter()
+        messages = build_conversation(turns=3)
+        # 构造摘要候选并令预算刚好放不下它, 但放得下更小的硬裁占位候选
+        summary_content = (
+            f"{SUMMARY_HEADER} {summary}\n（此摘要覆盖最早 1 轮对话）"
+        )
+        summary_candidate = [
+            {"role": "system", "content": "SYS"},
+            {"role": "system", "content": summary_content},
+            {"role": "user", "content": "q2" + "u" * 100},
+            {"role": "assistant", "content": "a2" + "a" * 100},
+            {"role": "user", "content": "q3" + "u" * 100},
+            {"role": "assistant", "content": "a3" + "a" * 100},
+            {"role": "user", "content": "current"},
+        ]
+        budget = counter.estimate_request(summary_candidate) - 1
+        compressor = ContextCompressor(
+            counter=counter,
+            token_budget=budget,
+            keep_recent_turns=2,
+            provider=provider,
+            model="m",
+            audit_log=audit,
+        )
+
+        view = await compressor.prepare_request(messages)
+
+        assert view[1]["content"].startswith("[历史省略]")
+        outcome = compressor.last_outcome
+        assert outcome is not None
+        assert outcome.summary_applied is False
+        assert outcome.still_over_budget is False
+        assert outcome.dropped_turns == 1
+        assert audit.events[0]["reason"] == "still_over"
+
+    @pytest.mark.asyncio
+    async def test_summary_input_too_long_skips_provider(self):
+        provider = FakeSummaryProvider("摘要")
+        audit = RecordingAuditSink()
+        compressor = ContextCompressor(
+            counter=CharCounter(),
+            token_budget=1000,
+            keep_recent_turns=2,
+            provider=provider,
+            model="m",
+            audit_log=audit,
+        )
+
+        await compressor.prepare_request(build_conversation(turns=40, size=500))
+
+        assert provider.calls == []  # 输入超限: 不调用摘要模型, 直接 L2
+        assert compressor.last_outcome is not None
+        assert compressor.last_outcome.summary_applied is False
+        assert audit.events[0]["reason"] == "input_too_long"
+
+    @pytest.mark.asyncio
+    async def test_audit_sink_failure_is_fail_soft(self, caplog):
+        compressor = summary_compressor(
+            FakeSummaryProvider("摘要"), audit_log=ExplodingAuditSink()
+        )
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.agent.compression"):
+            view = await compressor.prepare_request(build_conversation(turns=3))
+
+        assert view[1]["content"].startswith(SUMMARY_HEADER)
+        assert any("审计日志记录失败" in record.message for record in caplog.records)
+
+
+class TestSummaryCache:
+    @pytest.mark.asyncio
+    async def test_same_prefix_reuses_summary_without_second_call(self):
+        provider = FakeSummaryProvider("缓存摘要")
+        compressor = summary_compressor(provider)
+        messages = build_conversation(turns=3)
+
+        first = await compressor.prepare_request(messages)
+        second = await compressor.prepare_request(messages)
+
+        assert len(provider.calls) == 1  # 第二次命中会话内缓存
+        assert first[1]["content"].startswith(SUMMARY_HEADER)
+        assert second[1]["content"].startswith(SUMMARY_HEADER)
+        assert compressor.last_outcome is not None
+        assert compressor.last_outcome.summary_applied is True
+
+    @pytest.mark.asyncio
+    async def test_history_growth_merges_previous_summary(self):
+        provider = FakeSummaryProvider("摘要一", "摘要二")
+        compressor = summary_compressor(provider)
+
+        await compressor.prepare_request(build_conversation(turns=3))
+        view = await compressor.prepare_request(build_conversation(turns=4))
+
+        assert len(provider.calls) == 2
+        merged_payload = provider.calls[1]["messages"][1]["content"]
+        assert "[已有摘要]" in merged_payload
+        assert "摘要一" in merged_payload
+        assert "q2" in merged_payload  # 新挤出 keep 窗口的那一轮
+        assert "摘要二" in view[1]["content"]
+
+
+# ------------------------------------------------------------ P3 摘要参数校验
+
+
+class TestSummaryConstruction:
+    @pytest.mark.parametrize("value", [0, -1, "10", None, True])
+    def test_invalid_summary_max_tokens(self, value):
+        with pytest.raises(CompressionError):
+            ContextCompressor(
+                counter=CharCounter(),
+                token_budget=100,
+                summary_max_tokens=value,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("value", [0, -1, "3", None, True])
+    def test_invalid_summary_timeout(self, value):
+        with pytest.raises(CompressionError):
+            ContextCompressor(
+                counter=CharCounter(),
+                token_budget=100,
+                summary_timeout=value,  # type: ignore[arg-type]
+            )

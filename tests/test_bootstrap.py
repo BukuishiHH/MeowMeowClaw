@@ -16,10 +16,12 @@ from unittest.mock import MagicMock
 import pytest
 
 import meowmeowclaw.bootstrap as bootstrap_module
+from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.bootstrap import Application, ConfigError, build_application
 from meowmeowclaw.config import Settings
 from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
+from meowmeowclaw.memory import SessionKey
 from meowmeowclaw.paths import IDENTITY_FILE, PROJECT_ROOT
 from meowmeowclaw.skills import SkillConfigError
 from meowmeowclaw.tools.registry import ToolRegistry
@@ -227,6 +229,44 @@ class TestBuildApplication:
         assert len(app.catalog) == 6
         assert "pdf" not in app.context.skills_summary
         assert app.catalog.names() == BUILTIN_SKILL_NAMES
+
+
+    def test_compression_is_wired_per_session(self, monkeypatch, tmp_path):
+        config = make_settings(
+            workspace=tmp_path,
+            compression_enabled=True,
+            token_budget=12345,
+            keep_recent_turns=3,
+            summary_model="cheap-model",
+        )
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+        app = build_application()
+
+        key = SessionKey(channel="cli", scope="session", conversation_id="abc")
+        agent = app.conversation._agent_for(key)  # noqa: SLF001 - 装配契约
+        compressor = agent.compressor
+        assert isinstance(compressor, ContextCompressor)
+        assert compressor.token_budget == 12345
+        assert compressor.keep_recent_turns == 3
+        assert compressor.summary_model == "cheap-model"
+        assert compressor.session == key.canonical
+        assert compressor.provider is app.provider
+        # 同会话复用同一个 AgentLoop/compressor, 不同会话各自实例
+        assert app.conversation._agent_for(key) is agent  # noqa: SLF001
+        other = app.conversation._agent_for(
+            SessionKey(channel="cli", scope="session", conversation_id="other")
+        )
+        assert other.compressor is not compressor
+
+    def test_compression_disabled_passes_none(self, monkeypatch, tmp_path):
+        config = make_settings(workspace=tmp_path, compression_enabled=False)
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+        app = build_application()
+
+        key = SessionKey(channel="cli", scope="session", conversation_id="abc")
+        agent = app.conversation._agent_for(key)  # noqa: SLF001
+
+        assert agent.compressor is None
 
 
 # ------------------------------------------------------- 包导入边界(无副作用)

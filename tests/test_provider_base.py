@@ -53,8 +53,11 @@ class FakeProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> LLMResponse:
-        self.calls.append({"messages": messages, "tools": tools, "model": model})
+        self.calls.append(
+            {"messages": messages, "tools": tools, "model": model, "max_tokens": max_tokens}
+        )
         return self.response
 
 
@@ -66,6 +69,7 @@ class ChatOnlyProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         return LLMResponse(content="ok")
 
@@ -190,7 +194,9 @@ class TestConsumerAgainstMockAndReal:
         assert mock_result is expected
         assert real_result is expected
         mock_provider.chat.assert_awaited_once_with(messages, tools=None, model="qwen3")
-        assert real_provider.calls == [{"messages": messages, "tools": None, "model": "qwen3"}]
+        assert real_provider.calls == [
+            {"messages": messages, "tools": None, "model": "qwen3", "max_tokens": None}
+        ]
 
     @pytest.mark.asyncio
     async def test_consumer_forwards_tool_definitions_untouched(self, messages):
@@ -210,7 +216,7 @@ class TestConsumerAgainstMockAndReal:
         mock_provider.chat.side_effect = ConnectionError("连接失败")
 
         class BoomProvider(LLMProvider):
-            async def chat(self, messages, tools=None, model=None) -> LLMResponse:
+            async def chat(self, messages, tools=None, model=None, max_tokens=None) -> LLMResponse:
                 raise ConnectionError("连接失败")
 
         for provider in (mock_provider, BoomProvider()):
@@ -483,9 +489,10 @@ class TestLLMProviderAbstract:
     def test_chat_signature_contract(self):
         params = signature(LLMProvider.chat).parameters
 
-        assert list(params) == ["self", "messages", "tools", "model"]
+        assert list(params) == ["self", "messages", "tools", "model", "max_tokens"]
         assert params["tools"].default is None
         assert params["model"].default is None
+        assert params["max_tokens"].default is None
         assert params["messages"].default is Parameter.empty
 
     @pytest.mark.asyncio

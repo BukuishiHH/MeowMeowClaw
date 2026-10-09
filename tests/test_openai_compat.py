@@ -214,6 +214,22 @@ class TestRequestContract:
         assert call_kwargs(client)["model"] == "qwen3-max"
 
     @pytest.mark.asyncio
+    async def test_max_tokens_forwarded_when_present(self, provider, client):
+        client.chat.completions.create.return_value = build_completion(content="hi")
+
+        await provider.chat(MESSAGES, max_tokens=128)
+
+        assert call_kwargs(client)["max_tokens"] == 128
+
+    @pytest.mark.asyncio
+    async def test_max_tokens_absent_by_default(self, provider, client):
+        client.chat.completions.create.return_value = build_completion(content="hi")
+
+        await provider.chat(MESSAGES)
+
+        assert "max_tokens" not in call_kwargs(client)
+
+    @pytest.mark.asyncio
     async def test_missing_model_returns_error_without_calling_api(self, client):
         provider = make_provider(client, model=None)
 

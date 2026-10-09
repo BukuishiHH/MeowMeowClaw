@@ -55,12 +55,14 @@ class LLMProvider(ABC):
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """
         :param messages: 对话消息数组, OpenAI消息格式
         :param tools: function definition数组, 来自BaseTool.to_function_definition()
         :param model: 指定模型名称
+        :param max_tokens: 可选输出上限(如上下文摘要调用); None 表示不传该参数
         :return: LLMResponse 统一封装结果
         """
         ...

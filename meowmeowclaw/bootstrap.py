@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.config import Settings, load_config
 from meowmeowclaw.conversation import ConversationService
 from meowmeowclaw.llm.base import LLMProvider
 from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
+from meowmeowclaw.llm.tokenizer import build_counter
 from meowmeowclaw.memory import JsonlSessionStore, SessionKey
 from meowmeowclaw.paths import IDENTITY_FILE
 from meowmeowclaw.skills import LoadSkillTool, SkillCatalog
@@ -116,14 +118,39 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         memory_path=config.memory_dir / "MEMORY.md",
     )
 
-    # 每个会话一个 AgentLoop: 工具调用护栏按会话隔离; 共享同一 Provider/Registry/Context
+    # token 计数器无状态, 全局构造一次即可(精确档 lazy 加载, 失败自动回退启发式);
+    # 关闭压缩时不构造, 避免无谓的可选依赖探测
+    counter = None
+    if config.compression_enabled:
+        counter = build_counter(
+            config.model,
+            tokenizer=config.tokenizer,
+            hf_tokenizer_path=config.hf_tokenizer_path,
+        )
+
+    # 每个会话一个 AgentLoop: 工具调用护栏与摘要缓存按会话隔离; 共享 Provider/Registry/Context
     def agent_factory(session_key: SessionKey) -> AgentLoop:
+        compressor = None
+        if config.compression_enabled:
+            compressor = ContextCompressor(
+                counter=counter,
+                token_budget=config.token_budget,
+                keep_recent_turns=config.keep_recent_turns,
+                provider=provider,
+                model=config.model,
+                summary_model=config.summary_model,
+                summary_max_tokens=config.summary_max_tokens,
+                summary_timeout=config.summary_timeout,
+                session=session_key.canonical,
+                # audit_log: P4 接入 HistoryAuditLog
+            )
         return AgentLoop(
             provider=provider,
             tools=registry,
             context=context,
             model=config.model,
             max_iterations=config.max_iterations,
+            compressor=compressor,
         )
 
     session_store = JsonlSessionStore(config.memory_dir)

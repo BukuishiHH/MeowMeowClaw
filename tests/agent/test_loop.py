@@ -74,9 +74,15 @@ class ScriptedProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         self.calls.append(
-            {"messages": copy.deepcopy(messages), "tools": tools, "model": model}
+            {
+                "messages": copy.deepcopy(messages),
+                "tools": tools,
+                "model": model,
+                "max_tokens": max_tokens,
+            }
         )
         if self._responses:
             return self._responses.pop(0)
@@ -822,3 +828,37 @@ class TestCompressorRequestView:
 
         assert "compressor=False" in repr(loop)
         assert provider.calls[0]["messages"][-1]["content"] == "hi"
+
+class TestCompressorSummaryIntegration:
+    """P3: 摘要调用与主请求共用 Provider, 但消息状态必须完全隔离."""
+
+    @pytest.mark.asyncio
+    async def test_summary_then_final_answer(self):
+        provider = ScriptedProvider(text_response("摘要文本"), text_response("最终回答"))
+        registry = make_registry()
+        registry.get_definitions.return_value = []
+        history: list[dict[str, Any]] = []
+        for index in range(1, 4):
+            history.append({"role": "user", "content": f"q{index}" + "u" * 100})
+            history.append({"role": "assistant", "content": f"a{index}" + "a" * 100})
+        compressor = ContextCompressor(
+            counter=_CharCounter(),
+            token_budget=450,
+            keep_recent_turns=2,
+            provider=provider,
+            model="main-model",
+        )
+        loop = make_loop(provider, registry=registry, compressor=compressor)
+
+        turn = await loop.run_turn("current", history=history)
+
+        assert turn.answer == "最终回答"
+        assert len(provider.calls) == 2
+        summary_call, main_call = provider.calls
+        assert summary_call["tools"] is None
+        assert summary_call["max_tokens"] == 768
+        assert summary_call["messages"][0]["role"] == "system"
+        assert main_call["messages"][1]["content"].startswith("[历史摘要]")
+        # 事实源: 本轮新增消息不含摘要/system
+        assert [message["role"] for message in turn.messages] == ["user", "assistant"]
+        assert turn.messages[0]["content"] == "current"

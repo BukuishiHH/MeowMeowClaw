@@ -1,7 +1,7 @@
 # MeowMeowClaw 多渠道网关设计（v1：单进程 asyncio.Queue 总线）
 
-> 状态：**设计稿，已确认决策，待实现**。本文只定义网关层行为与契约，不改 JSONL 存储格式、
-> 不改 `ConversationService` / `AgentLoop` 的内部语义。
+> 状态：**W1–W4 已实现并完成真实冒烟；`gateway_enabled` 默认保持 `false`（翻转条件见 §16.3）**。
+> 本文定义网关层行为与契约；不改 JSONL 存储格式、不改 `ConversationService` / `AgentLoop` 内部语义。
 > 关联：`docs/ARCHITECTURE.md`、`docs/MEMORY_DESIGN.md`、`docs/CONTEXT_COMPRESSION_DESIGN.md`、
 > `meowmeowclaw/channels/`、`meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`、`meowmeowclaw/cli.py`。
 
@@ -416,11 +416,15 @@ await bus.publish(outbound_queue(env.channel), reply)
 | W3 | `CliAdapter` + `CliPolicy` + `cli.py` 接入（开关控制） | CLI 交互/指令/退出对等；Ctrl+C 优雅关闭 |
 | W4 | README/.env.example/架构文档同步；死信与观测日志；评估是否翻默认开关 | 全量回归 + 手工冒烟（真实 CLI/QQ 路径） |
 
+**实现状态（2026-10-09）**：W1–W4 全部完成；全量回归 `1037 passed / 6 skipped / 2 xfailed`；
+真实 API 冒烟：CLI（`GATEWAY_ENABLED=true` + 管道 REPL）与 QQ（QqPolicy + QqAdapter + Gateway）均走通，
+详细记录与默认开关决策见 §16。
 ---
 
 ## 14. 待实现时的开放项（不阻塞设计）
 
-1. `gateway_enabled` 默认翻转为 `true` 的时机：等 W3 完成并经过一轮真实使用后再决定；
+1. `gateway_enabled` 默认翻转：**W4 决策为暂不翻转**（真实 OneBot/NapCat 传输未接入、双轨需真实使用验证）；
+   翻转触发条件见 §16.3；
 2. 去重持久化：若 QQ 平台重推成为实际问题，再加 JSONL/SQLite 去重表；
 3. `deadletter` 是否需要落盘/重放：v1 仅内存排障；
 4. 真实 OneBot/NapCat/飞书适配器：依赖对应平台 SDK，独立于本网关核心；
@@ -532,3 +536,51 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 - 决策：**采用 A + A+，B 暂不采用**；
 - 触发评估：以 §15.6 指标为准；
 - 本 ADR 只定义方向，不改动现有代码；A+ 的第 1/2 项可在网关实现稳定后作为独立优化项排期。
+
+
+---
+
+## 16. W4 收尾：观测、死信与实现状态
+
+### 16.1 死信与观测 API
+
+- `AsyncioQueueBus.publish` 背压超时 → 消息进 `deadletter` 队列 + warning；v1 仅内存排障、不自动重放；
+- `AsyncioQueueBus.queue_sizes()`：各队列积压快照；`deadletter_count`：死信条数；
+- `Gateway.stats()`：`{started, adapters, policies, inflight, queue_sizes, deadletter_count}`，用于日志/运维排查；
+- 真实冒烟样例：`{"started": true, "adapters": ["qq"], "policies": ["qq"], "inflight": 0,
+  "queue_sizes": {"inbound": 0, "outbound:qq": 0}, "deadletter_count": 0}`。
+
+### 16.2 实现文件
+
+- `meowmeowclaw/gateway/`：`envelope / bus / dedup / policy / adapter / worker / dispatcher / gateway`；
+- `meowmeowclaw/channels/`：`bridge / commands / qq_policy / qq_adapter / cli_policy / cli_adapter`
+  + `qq_private` 兼容 facade；
+- `bootstrap.build_gateway()` / `Application.gateway` / `cli._run_gateway_repl()`；
+- 配置项 `gateway_enabled` / `gateway_bus_maxsize` / `gateway_publish_timeout` / `gateway_shutdown_timeout`。
+
+### 16.3 默认开关决策：暂不翻转
+
+**保持 `gateway_enabled=false`**，理由：
+
+1. 真实 QQ 传输（OneBot/NapCat）尚未接入，QQ 网关路径目前只有注入 transport 的 `QqAdapter`；
+2. CLI 网关路径虽已真实冒烟，但需要一段真实使用验证指令/退出/并发体验；
+3. 双轨（旧直连 vs 网关）需要保持可回滚，翻转前应有回滚预案与观察指标。
+
+翻转触发条件（建议同时满足）：
+
+- `QqAdapter` 接入真实 OneBot/NapCat 传输并通过适配器契约测试；
+- CLI 网关路径经真实使用（或一周灰度）无回归；
+- `Gateway.stats()` 观测到的死信/积压/在途在可接受范围（死信 0、队列无持续积压）。
+
+### 16.4 真实冒烟记录（2026-10-09，真实 DeepSeek API）
+
+- **CLI**：`GATEWAY_ENABLED=true` + 隔离 workspace/memory，管道输入「问一句 → /help → /exit」；
+  回答与帮助均经总线输出，`/exit` 正常退出，sessions/JSONL 正常落盘；
+- **QQ**：`QqPolicy + QqAdapter + Gateway` 真实 API，私聊回复路由正确
+  （`target_channel=qq`、`correlation_id` 配对），`/help` 指令短路（不调用 Agent），`stats()` 全零健康；
+- 两次冒烟均在 `/tmp` 隔离目录完成，不影响真实 `workspace/` 与会话。
+
+### 16.5 待后续
+
+- 真实 OneBot/NapCat/飞书/Web 适配器；`kind=push` 生产方；去重持久化；死信重放（可选）；
+- A+（会话运行时生命周期 API 与 JSONL 尾读优化）按既定约定在整体功能完成后另行排期。

@@ -115,6 +115,16 @@ class AsyncioQueueBus:
         queue = self._queues.get(queue_key)
         return queue.qsize() if queue is not None else 0
 
+    def queue_sizes(self) -> dict[str, int]:
+        """当前各队列积压快照(供 Gateway.stats 观测)."""
+        return {key: queue.qsize() for key, queue in sorted(self._queues.items())}
+
+    @property
+    def deadletter_count(self) -> int:
+        """死信条数(仅排障; v1 不自动重放)."""
+        queue = self._queues.get(DEADLETTER)
+        return queue.qsize() if queue is not None else 0
+
     # ------------------------------------------------------------------ 契约
 
     async def publish(self, queue_key: str, envelope: Envelope) -> bool:

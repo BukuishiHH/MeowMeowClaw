@@ -63,6 +63,24 @@ class TestAssembly:
         assert gateway.bus is bus
 
 
+class TestObservability:
+    @pytest.mark.asyncio
+    async def test_stats_snapshot(self):
+        gateway = make_gateway()
+        adapter = LoopbackAdapter(CHANNEL)
+        await gateway.start(adapters=[adapter])
+
+        stats = gateway.stats()
+
+        assert stats["started"] is True
+        assert stats["adapters"] == [CHANNEL]
+        assert stats["policies"] == [CHANNEL]
+        assert stats["inflight"] == 0
+        assert "queue_sizes" in stats
+        assert stats["deadletter_count"] == 0
+        await gateway.stop()
+
+
 class TestLifecycle:
     @pytest.mark.asyncio
     async def test_start_stop_idempotent(self):

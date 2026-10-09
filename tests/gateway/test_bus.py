@@ -74,6 +74,26 @@ class TestBackpressureAndDeadletter:
         assert (await bus.get(DEADLETTER)).text == "2"
 
 
+class TestObservability:
+    @pytest.mark.asyncio
+    async def test_queue_sizes_and_deadletter_count(self):
+        bus = AsyncioQueueBus(maxsize=1, publish_timeout=0.01)
+
+        await bus.publish(INBOUND, env("1"))
+        await bus.publish(INBOUND, env("2"))  # 超时 -> 死信
+
+        sizes = bus.queue_sizes()
+        assert sizes[INBOUND] == 1
+        assert sizes[DEADLETTER] == 1
+        assert bus.deadletter_count == 1
+
+    def test_empty_bus_snapshot(self):
+        bus = AsyncioQueueBus()
+
+        assert bus.queue_sizes() == {}
+        assert bus.deadletter_count == 0
+
+
 class TestCloseAndJoin:
     @pytest.mark.asyncio
     async def test_publish_after_close_raises(self):

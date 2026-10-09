@@ -5,7 +5,7 @@
 
 import asyncio
 import logging
-from typing import Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from meowmeowclaw.conversation import ConversationService
 
@@ -66,6 +66,19 @@ class Gateway:
     @property
     def adapters(self) -> tuple[ChannelAdapter, ...]:
         return tuple(self._adapters.values())
+
+    def stats(self) -> dict[str, Any]:
+        """运行态观测快照: 队列积压 / 在途请求 / 死信(日志与排障用)."""
+        sizes = self.bus.queue_sizes() if hasattr(self.bus, "queue_sizes") else {}
+        deadletter = getattr(self.bus, "deadletter_count", 0)
+        return {
+            "started": self._started,
+            "adapters": sorted(self._adapters),
+            "policies": sorted(self.dispatcher.policies),
+            "inflight": self.dispatcher.inflight_count,
+            "queue_sizes": sizes,
+            "deadletter_count": deadletter,
+        }
 
     def register(self, adapter: ChannelAdapter) -> ChannelAdapter:
         """注册适配器(必须在 start 之前); 同渠道只允许一个."""

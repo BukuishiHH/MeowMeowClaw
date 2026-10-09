@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 30 个源码模块 / 约 6300 行; 测试 24 个文件 / **921 个用例**(913 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 44 个源码模块 / 约 7950 行; 测试 38 个文件 / **1045 个用例**(1037 passed + 6 skipped + 2 xfailed)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -59,6 +59,10 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `summary_timeout` | `15` | 摘要调用超时(秒) |
 | `history_log_max_bytes` | `2097152` | `HISTORY.md` 轮转阈值(字节) |
 | `history_log_original_chars` | `32000` | 单条审计记录原文 JSON 上限(字符) |
+| `gateway_enabled` | `false` | 多渠道网关总开关; `true` 时 CLI/QQ 经 asyncio.Queue 总线 |
+| `gateway_bus_maxsize` | `1000` | 每个队列(inbound/outbound:<channel>/deadletter)容量 |
+| `gateway_publish_timeout` | `5` | publish 背压等待秒数; 超时进死信并 warning |
+| `gateway_shutdown_timeout` | `10` | 优雅关闭等待秒数(排空 dispatcher/in-flight/出站队列) |
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
 
@@ -75,6 +79,23 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 - 默认装载窗口 `50 轮 / 120000 字符`: 120k 中文字符 ≈ 60k token, 叠加固定开销后可触达 48k 预算,
   让「历史摘要压缩」在默认配置下真正可用(此前 20 轮/50k 字符≈25k token, 默认预算不可达)。
 - 设计细节见 `docs/CONTEXT_COMPRESSION_DESIGN.md`。
+
+### 多渠道网关(asyncio.Queue 总线)
+
+`gateway_enabled=true` 时, CLI 与 QQ 等渠道统一经进程内消息总线:
+
+```
+ChannelAdapter → inbound → GatewayDispatcher(去重 + ChannelPolicy)
+                                → AgentWorker(ConversationService)
+ChannelAdapter ← outbound:<channel> ← 回复 Envelope
+```
+
+- **统一信封**: `Envelope`(kind/channel/scope/conversation_id/session_id/message_id/correlation_id/reply_to/target_channel/metadata);
+- **适配器契约**: `start/stop_inbound/stop/send`; 已提供 `LoopbackAdapter`(回环)、`QqAdapter`(可注入 transport, OneBot/NapCat 待接入)、`CliAdapter`(REPL);
+- **策略层**: `QqPolicy`(身份/6h 轮换/指令)、`CliPolicy`(会话/指令); Agent 不感知渠道;
+- **可靠性**: 有界队列 + publish 超时进死信; 同会话串行由 `ConversationService` 保证、跨会话并发; 关闭时按 `gateway_shutdown_timeout` 优雅排空;
+- **观测**: `Gateway.stats()` 返回队列积压/在途/死信快照; `HISTORY.md` 审计不受影响;
+- `gateway_enabled=false`(默认)时交付层行为与旧直连逐字节一致; 设计见 `docs/GATEWAY_DESIGN.md`。
 
 ### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)
 
@@ -163,15 +184,30 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
 | `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
-| `meowmeowclaw/channels/qq_private.py` | 387 | QQ 私聊: active 指针 / 6h 惰性轮换 / 最小指令集 | `QqPrivateService` / `QqPrivateActiveStore` |
-| `meowmeowclaw/bootstrap.py` | 142 | **组合根**: 配置 -> Provider -> 工具 -> 技能 -> 记忆 -> Context/Loop | `build_application()` / `Application` / `ConfigError` |
-| `meowmeowclaw/cli.py` | 313 | **交付层**: banner / 启动信息 / REPL / 会话命令 / 退出码 | `main()` / `interactive_loop()` / `_handle_command()` |
+| `meowmeowclaw/channels/bridge.py` | 29 | 平台 DTO ↔ 网关 Envelope 转换 | `incoming_to_envelope()` / `outgoing_from_envelope()` |
+| `meowmeowclaw/channels/commands.py` | 67 | 跨渠道会话指令公共逻辑(QQ/CLI 共用) | `SessionCommandHelper` |
+| `meowmeowclaw/channels/qq_policy.py` | 234 | QQ 策略: 身份过滤 / 6h 惰性轮换 / 指令 | `QqPolicy` |
+| `meowmeowclaw/channels/qq_adapter.py` | 47 | QQ 适配器(可注入 transport; OneBot/NapCat 待接入) | `QqAdapter` |
+| `meowmeowclaw/channels/qq_private.py` | 260 | QQ active 指针存储 + `QqPrivateService` 兼容 facade | `QqPrivateActiveStore` / `QqPrivateService` |
+| `meowmeowclaw/channels/cli_policy.py` | 209 | CLI 策略: 会话生命周期 + /help /new /clear /sessions /tools /skills | `CliPolicy` |
+| `meowmeowclaw/channels/cli_adapter.py` | 111 | CLI 适配器: REPL + 总线收发 + Future 配对 | `CliAdapter` |
+| `meowmeowclaw/gateway/bus.py` | 179 | asyncio.Queue 总线: inbound/outbound/deadletter、背压、关闭、观测 | `AsyncioQueueBus` / `MessageBus` |
+| `meowmeowclaw/gateway/envelope.py` | 119 | 统一信封与构造/校验 | `Envelope` / `make_inbound()` / `make_reply()` |
+| `meowmeowclaw/gateway/policy.py` | 76 | 策略契约与裁决(ignore/reply/agent) | `ChannelPolicy` / `PolicyDecision` |
+| `meowmeowclaw/gateway/dedup.py` | 47 | `(channel, message_id)` LRU 去重 | `DedupCache` |
+| `meowmeowclaw/gateway/adapter.py` | 177 | 适配器契约/基类 + Loopback | `BaseChannelAdapter` / `LoopbackAdapter` |
+| `meowmeowclaw/gateway/worker.py` | 43 | Agent 执行器(包装 ConversationService) | `AgentWorker` |
+| `meowmeowclaw/gateway/dispatcher.py` | 193 | 单任务消费 + 策略路由 + 并发派发 | `GatewayDispatcher` |
+| `meowmeowclaw/gateway/gateway.py` | 153 | 组装、优雅启停、`stats()` 观测 | `Gateway` |
+| `meowmeowclaw/bootstrap.py` | 207 | **组合根**: 配置 -> Provider/工具/技能/记忆/Context/Loop + 可选 Gateway | `build_application()` / `build_gateway()` / `Application` |
+| `meowmeowclaw/cli.py` | 332 | **交付层**: banner / REPL; 网关开启时经 CliPolicy + CliAdapter | `main()` / `interactive_loop()` / `_run_gateway_repl()` |
 
 ### 3.1 契约先行, 实现可换
 
 - **Provider 契约**: `LLMProvider.chat(messages, tools, model) -> LLMResponse`. 上层只认 `LLMResponse`, 不关心背后是 OpenAI、DeepSeek 还是本地 vLLM.
 - **工具契约**: `BaseTool` 同时是"给模型看的 JSON Schema"(`to_function_definition()`)与"给人写的可执行体"(`execute()`).
 - **消息契约**: 全链路 OpenAI 消息格式, `tool_calls.function.arguments` 是 JSON 字符串.
+- **网关契约**: `ChannelAdapter`(start/stop_inbound/stop/send) + `ChannelPolicy`(ignore/reply/agent) + `MessageBus`; 设计见 `docs/GATEWAY_DESIGN.md`.
 
 ### 3.2 统一错误策略:"异常不炸主循环"
 
@@ -353,7 +389,7 @@ RUN_NETWORK_TESTS=1 pytest tests/ -m network -q     # 真实联网用例
 | **持久化 / 断点续跑** | 无内建(`_session_history` 在内存里) | 内建 checkpointer, 可从任意节点恢复 |
 | **人工审批(HITL)** | 需自行在循环里加确认步骤 | 一等公民: 中断/恢复 API |
 | **多 Agent 编排** | 需自己写调度(子 Agent 即另一个 `AgentLoop`) | 天然支持 supervisor / swarm 等拓扑 |
-| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 921 用例) | 通常要驱动图运行时, 或按节点分别测 |
+| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 1045 用例) | 通常要驱动图运行时, 或按节点分别测 |
 | **调试体验** | 断点就在 `run()` 里, 栈短、易读易改 | 需要在框架抽象层之间跳转 |
 | **适合场景** | 单 Agent + 工具调用的主线业务; 想快速看懂/改控制流 | 复杂分支编排、长流程、需要暂停恢复与人工介入 |
 
@@ -391,7 +427,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 766 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 1037 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -403,8 +439,15 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 
 | 测试文件 | 用例 | 重点 |
 | --- | ---: | --- |
-| `test_bootstrap.py` | 12 | 装配(工具/技能/Context/Loop)、ConfigError/SkillConfigError、导入边界 |
-| `test_cli.py` | 25 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码 |
+| `test_bootstrap.py` | 16 | 装配(工具/技能/Context/Loop/网关)、ConfigError/SkillConfigError、导入边界 |
+| `test_cli.py` | 26 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码、网关分流 |
+| `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
+| `channels/test_qq_policy.py` | 11 | QQ 策略: 身份/轮换/指令/跨渠道删除 |
+| `channels/test_qq_adapter.py` | 3 | QQ 适配器: 入站转换/出站/停入站 |
+| `channels/test_cli_policy.py` | 10 | CLI 策略: 会话/指令/展示 |
+| `channels/test_cli_adapter.py` | 7 | CLI 适配器: ask/超时/pending/REPL |
+| `channels/test_qq_gateway_integration.py` | 4 | QQ 走网关端到端(轮换/指令/忽略) |
+| `channels/test_cli_gateway_integration.py` | 5 | CLI 走网关端到端 + Ctrl+C 优雅关闭 |
 | `agent/test_context.py` | 48 | 人设/时间/记忆约定、召回注入、System Prompt 稳定度排序 |
 | `agent/test_loop.py` | 41 | 消息格式、防爆阈值、run_turn 历史快照/完成态、max_iterations 注入 |
 | `skills/test_catalog.py` | 36 | frontmatter 边界、索引/摘要、坏 YAML 跳过、重名报错、内置资源可发现 |
@@ -435,7 +478,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 24 个测试文件 / 921 用例(agent/skills/tools/memory/channels/llm 分层)
+├── tests/                       # 38 个测试文件 / 1045 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -465,9 +508,24 @@ MeowMeowClaw/
     │   ├── filelock.py          # 跨进程 advisory 文件锁
     │   └── errors.py            # 记忆层错误类型
     ├── conversation.py          # ConversationService: 记忆 <-> AgentLoop 编排
-    ├── channels/                # 渠道适配层(传输无关 + QQ 私聊)
+    ├── channels/                # 渠道层: DTO / 策略 / 适配器
     │   ├── base.py              # IncomingMessage / OutgoingMessage
-    │   └── qq_private.py        # active 指针 + 6h 轮换 + 最小指令集
+    │   ├── bridge.py            # DTO <-> Envelope
+    │   ├── commands.py          # 跨渠道会话指令公共逻辑
+    │   ├── qq_policy.py         # QqPolicy(身份/轮换/指令)
+    │   ├── qq_adapter.py        # QqAdapter(可注入 transport)
+    │   ├── qq_private.py        # active 指针 + 兼容 facade
+    │   ├── cli_policy.py        # CliPolicy(会话/指令)
+    │   └── cli_adapter.py       # CliAdapter(REPL)
+    ├── gateway/                 # 单进程 asyncio 消息总线网关
+    │   ├── envelope.py          # 统一信封
+    │   ├── bus.py               # AsyncioQueueBus + 死信/观测
+    │   ├── policy.py            # ChannelPolicy / PolicyDecision
+    │   ├── adapter.py           # ChannelAdapter 契约与基类
+    │   ├── dedup.py             # 幂等去重
+    │   ├── worker.py            # AgentWorker
+    │   ├── dispatcher.py        # 消费/去重/路由/派发
+    │   └── gateway.py           # 组装与优雅启停
     └── llm/                     # LLMProvider - OpenAICompatProvider
 ```
 
@@ -475,7 +533,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 结构化长期记忆后端与 QQ **OneBot/NapCat 传输适配器**尚未接入; 无流式输出与多 Agent 编排
+- 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5 与多渠道网关 W1–W4 已落地(`gateway_enabled` 默认 `false`, 真实 CLI/QQ 路径已经真实 API 冒烟); 结构化长期记忆后端、QQ **OneBot/NapCat 传输适配器**、飞书/Web 适配器、流式输出与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
 - 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(命令黑名单绕过、抓取重定向/重绑定、provider 契约边界)

@@ -181,8 +181,9 @@ class MessageBus(Protocol):
 ```python
 class ChannelAdapter(Protocol):
     channel: str
-    async def start(self, bus: MessageBus) -> None: ...
-    async def stop(self) -> None: ...
+    async def start(self, bus: MessageBus) -> None: ...      # 先起出站消费, 再开始收入站
+    async def stop_inbound(self) -> None: ...                # 停止接收新入站(幂等)
+    async def stop(self, timeout: float = 5.0) -> None: ...  # 排空出站队列并释放资源(幂等)
     async def send(self, envelope: Envelope) -> None: ...
 ```
 
@@ -190,7 +191,9 @@ class ChannelAdapter(Protocol):
   异常只 warning（单条失败不杀循环）；
 - 入站辅助：`make_inbound(...)` 生成 Envelope 并 `await bus.publish(INBOUND, env)`；
 - 适配器只做协议转换与收发，**不做会话策略**（策略在 Policy 层）；
-- 生命周期：`start` 幂等；`stop` 取消出站任务并等待结束；不得在 `send` 中做无超时阻塞。
+- 生命周期分两段：`stop_inbound()` 先停入站，等 dispatcher/in-flight 排空后由 Gateway 调用 `stop()`，
+  后者排空本渠道出站队列（超时丢弃 + warning）再取消出站消费任务；`start/stop_inbound/stop` 均幂等；
+  不得在 `send` 中做无超时阻塞。
 
 ### 5.1 CLI 适配器（G9）
 

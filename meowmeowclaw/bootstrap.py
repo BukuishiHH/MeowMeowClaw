@@ -8,7 +8,7 @@
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Union
 
@@ -18,6 +18,7 @@ from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.config import Settings, load_config
 from meowmeowclaw.conversation import ConversationService
+from meowmeowclaw.gateway import Gateway
 from meowmeowclaw.llm.base import LLMProvider
 from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
 from meowmeowclaw.llm.tokenizer import build_counter
@@ -44,9 +45,12 @@ class Application:
     context: ContextBuilder
     session_store: JsonlSessionStore
     conversation: ConversationService
+    gateway: Optional[Gateway] = None
 
     async def close(self) -> None:
-        """释放会话缓存与存储资源(交付层退出时调用)."""
+        """释放网关/会话缓存与存储资源(交付层退出时调用)."""
+        if self.gateway is not None:
+            await self.gateway.stop()
         await self.conversation.close()
         await self.session_store.close()
 
@@ -79,6 +83,24 @@ def ensure_workspace(workspace: Path) -> bool:
     except OSError as exc:
         logger.warning("创建工作目录失败: %s (%r)", workspace, exc)
         return False
+
+
+def build_gateway(application: Application) -> Optional[Gateway]:
+    """按配置构造 Gateway(不启动, 需在事件循环中 ``await gateway.start()``).
+
+    - ``application.gateway`` 已存在时直接复用;
+    - ``gateway_enabled=false`` 时返回 None, 交付层行为与旧直连路径一致。
+    """
+    if application.gateway is not None:
+        return application.gateway
+    if not application.config.gateway_enabled:
+        return None
+    return Gateway(
+        conversation=application.conversation,
+        bus_maxsize=application.config.gateway_bus_maxsize,
+        publish_timeout=application.config.gateway_publish_timeout,
+        shutdown_timeout=application.config.gateway_shutdown_timeout,
+    )
 
 
 def build_application(env_file: Optional[Union[str, Path]] = None) -> Application:
@@ -170,7 +192,7 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         max_chars=config.memory_max_chars,
     )
 
-    return Application(
+    application = Application(
         config=config,
         provider=provider,
         registry=registry,
@@ -179,3 +201,7 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         session_store=session_store,
         conversation=conversation,
     )
+    gateway = build_gateway(application)
+    if gateway is not None:
+        application = replace(application, gateway=gateway)
+    return application

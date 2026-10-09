@@ -19,7 +19,13 @@ import meowmeowclaw.bootstrap as bootstrap_module
 from meowmeowclaw.agent.audit import HistoryAuditLog
 from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
-from meowmeowclaw.bootstrap import Application, ConfigError, build_application
+from meowmeowclaw.bootstrap import (
+    Application,
+    ConfigError,
+    build_application,
+    build_gateway,
+)
+from meowmeowclaw.gateway import Gateway
 from meowmeowclaw.config import Settings
 from meowmeowclaw.llm.openai_compat import OpenAICompatProvider
 from meowmeowclaw.memory import SessionKey
@@ -171,6 +177,8 @@ class TestBuildApplication:
         assert app.context.memory_path == config.memory_dir / "MEMORY.md"
         assert app.conversation.max_turns == config.memory_max_turns
         assert app.conversation.max_chars == config.memory_max_chars
+        # 默认关闭网关: 不构造, 行为与旧直连一致
+        assert app.gateway is None
 
     def test_load_config_is_called_once(self, monkeypatch):
         loader = MagicMock(return_value=make_settings())
@@ -272,6 +280,33 @@ class TestBuildApplication:
 
         assert agent.compressor is None
         assert not (config.memory_dir / "HISTORY.md").exists()
+
+
+    def test_gateway_enabled_builds_instance(self, monkeypatch, tmp_path):
+        config = make_settings(
+            workspace=tmp_path,
+            gateway_enabled=True,
+            gateway_bus_maxsize=7,
+            gateway_publish_timeout=0.5,
+            gateway_shutdown_timeout=3,
+        )
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+
+        app = build_application()
+
+        assert isinstance(app.gateway, Gateway)
+        assert app.gateway.bus.maxsize == 7
+        assert app.gateway.shutdown_timeout == 3.0
+        # 已构造的 gateway 复用, 不重复创建
+        assert build_gateway(app) is app.gateway
+
+    @pytest.mark.asyncio
+    async def test_gateway_close_is_safe_before_start(self, monkeypatch, tmp_path):
+        config = make_settings(workspace=tmp_path, gateway_enabled=True)
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+        app = build_application()
+
+        await app.close()  # 未 start 的 gateway stop 应为 no-op
 
 
 # ------------------------------------------------------- 包导入边界(无副作用)

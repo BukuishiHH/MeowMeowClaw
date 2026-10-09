@@ -18,6 +18,10 @@ import pytest
 from meowmeowclaw.config import (
     DEFAULT_BASE_URL,
     DEFAULT_COMPRESSION_ENABLED,
+    DEFAULT_GATEWAY_BUS_MAXSIZE,
+    DEFAULT_GATEWAY_ENABLED,
+    DEFAULT_GATEWAY_PUBLISH_TIMEOUT,
+    DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT,
     DEFAULT_HISTORY_LOG_MAX_BYTES,
     DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
     DEFAULT_KEEP_RECENT_TURNS,
@@ -77,6 +81,10 @@ ENV_KEYS = (
     "SUMMARY_TIMEOUT",
     "HISTORY_LOG_MAX_BYTES",
     "HISTORY_LOG_ORIGINAL_CHARS",
+    "GATEWAY_ENABLED",
+    "GATEWAY_BUS_MAXSIZE",
+    "GATEWAY_PUBLISH_TIMEOUT",
+    "GATEWAY_SHUTDOWN_TIMEOUT",
 )
 
 
@@ -484,6 +492,67 @@ class TestCompressionSettings:
             "summary_timeout": DEFAULT_SUMMARY_TIMEOUT,
             "history_log_max_bytes": DEFAULT_HISTORY_LOG_MAX_BYTES,
             "history_log_original_chars": DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
+        }
+        assert getattr(s, name) == defaults[name]
+        assert any(name in record.message for record in caplog.records)
+
+
+# ------------------------------------------------------------ 网关配置
+
+
+class TestGatewaySettings:
+    def test_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.gateway_enabled is DEFAULT_GATEWAY_ENABLED
+        assert s.gateway_bus_maxsize == DEFAULT_GATEWAY_BUS_MAXSIZE
+        assert s.gateway_publish_timeout == DEFAULT_GATEWAY_PUBLISH_TIMEOUT
+        assert s.gateway_shutdown_timeout == DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT
+
+    def test_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "gateway_enabled=true\n"
+            "gateway_bus_maxsize=7\n"
+            "gateway_publish_timeout=0.5\n"
+            "gateway_shutdown_timeout=3\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.gateway_enabled is True
+        assert s.gateway_bus_maxsize == 7
+        assert s.gateway_publish_timeout == 0.5
+        assert s.gateway_shutdown_timeout == 3.0
+
+    def test_invalid_bool_falls_back(self, tmp_path, caplog):
+        env = write_env(tmp_path, "gateway_enabled=maybe\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.gateway_enabled is DEFAULT_GATEWAY_ENABLED
+        assert any("gateway_enabled" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "gateway_bus_maxsize=0\n",
+            "gateway_publish_timeout=-1\n",
+            "gateway_shutdown_timeout=abc\n",
+        ],
+    )
+    def test_invalid_positive_values_fall_back(self, tmp_path, caplog, line):
+        env = write_env(tmp_path, line)
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        name = line.split("=")[0]
+        defaults = {
+            "gateway_bus_maxsize": DEFAULT_GATEWAY_BUS_MAXSIZE,
+            "gateway_publish_timeout": DEFAULT_GATEWAY_PUBLISH_TIMEOUT,
+            "gateway_shutdown_timeout": DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT,
         }
         assert getattr(s, name) == defaults[name]
         assert any(name in record.message for record in caplog.records)

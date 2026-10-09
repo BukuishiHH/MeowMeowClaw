@@ -49,6 +49,12 @@ DEFAULT_SUMMARY_TIMEOUT = 15.0
 DEFAULT_HISTORY_LOG_MAX_BYTES = 2_097_152
 DEFAULT_HISTORY_LOG_ORIGINAL_CHARS = 32_000
 
+# 多渠道网关默认值(设计见 docs/GATEWAY_DESIGN.md §10)
+DEFAULT_GATEWAY_ENABLED = False
+DEFAULT_GATEWAY_BUS_MAXSIZE = 1000
+DEFAULT_GATEWAY_PUBLISH_TIMEOUT = 5.0
+DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT = 10.0
+
 # 键别名映射
 _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "model": ("model", "model_name"),
@@ -69,6 +75,10 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "summary_timeout": ("summary_timeout",),
     "history_log_max_bytes": ("history_log_max_bytes",),
     "history_log_original_chars": ("history_log_original_chars",),
+    "gateway_enabled": ("gateway_enabled",),
+    "gateway_bus_maxsize": ("gateway_bus_maxsize",),
+    "gateway_publish_timeout": ("gateway_publish_timeout",),
+    "gateway_shutdown_timeout": ("gateway_shutdown_timeout",),
 }
 
 # 已废弃配置键: 人设已固定为 <项目根>/identity.md, 出现时警告并忽略
@@ -223,6 +233,11 @@ class Settings:
     summary_timeout: float = DEFAULT_SUMMARY_TIMEOUT
     history_log_max_bytes: int = DEFAULT_HISTORY_LOG_MAX_BYTES
     history_log_original_chars: int = DEFAULT_HISTORY_LOG_ORIGINAL_CHARS
+    # 多渠道网关(§10)
+    gateway_enabled: bool = DEFAULT_GATEWAY_ENABLED
+    gateway_bus_maxsize: int = DEFAULT_GATEWAY_BUS_MAXSIZE
+    gateway_publish_timeout: float = DEFAULT_GATEWAY_PUBLISH_TIMEOUT
+    gateway_shutdown_timeout: float = DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT
     source: str = str(ENV_FILE)
 
     def __repr__(self) -> str:
@@ -238,6 +253,10 @@ class Settings:
             f"summary_max_tokens={self.summary_max_tokens}, summary_timeout={self.summary_timeout}, "
             f"history_log_max_bytes={self.history_log_max_bytes}, "
             f"history_log_original_chars={self.history_log_original_chars}, "
+            f"gateway_enabled={self.gateway_enabled}, "
+            f"gateway_bus_maxsize={self.gateway_bus_maxsize}, "
+            f"gateway_publish_timeout={self.gateway_publish_timeout}, "
+            f"gateway_shutdown_timeout={self.gateway_shutdown_timeout}, "
             f"api_key={masked_key}, source={self.source!r})"
         )
 
@@ -303,6 +322,26 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["history_log_original_chars"]),
             DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
             "history_log_original_chars",
+        ),
+        gateway_enabled=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["gateway_enabled"]),
+            DEFAULT_GATEWAY_ENABLED,
+            "gateway_enabled",
+        ),
+        gateway_bus_maxsize=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["gateway_bus_maxsize"]),
+            DEFAULT_GATEWAY_BUS_MAXSIZE,
+            "gateway_bus_maxsize",
+        ),
+        gateway_publish_timeout=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["gateway_publish_timeout"]),
+            DEFAULT_GATEWAY_PUBLISH_TIMEOUT,
+            "gateway_publish_timeout",
+        ),
+        gateway_shutdown_timeout=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["gateway_shutdown_timeout"]),
+            DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT,
+            "gateway_shutdown_timeout",
         ),
         source=str(path),
     )

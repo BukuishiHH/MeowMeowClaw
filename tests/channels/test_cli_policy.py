@@ -190,3 +190,54 @@ class TestCommands:
         policy, _ = make_policy(tmp_path, ScriptedProvider())
         decision = await policy.resolve(envelope("/clear a b"))
         assert "未知命令或参数" in decision.replies[0].text
+
+
+class TestRuntimeLifecycleHooks:
+    """A4: /new /clear 切走当前会话时必须释放其运行时(agent + lock)."""
+
+    @pytest.mark.asyncio
+    async def test_new_releases_old_runtime(self, tmp_path):
+        provider = ScriptedProvider(["答1"])
+        policy, conversation = make_policy(tmp_path, provider)
+        first = policy.current_session
+        decision = await policy.resolve(envelope("你好"))
+        await conversation.handle_message(decision.session_key, decision.text, meta=decision.meta)
+        assert conversation.stats()["cached_agents"] == 1
+
+        switched = await policy.resolve(envelope("/new"))
+
+        assert switched.action == ACTION_REPLY
+        assert policy.current_session != first
+        assert conversation.stats()["cached_agents"] == 0
+        assert conversation.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_current_releases_old_runtime(self, tmp_path):
+        provider = ScriptedProvider(["答1"])
+        policy, conversation = make_policy(tmp_path, provider)
+        decision = await policy.resolve(envelope("你好"))
+        await conversation.handle_message(decision.session_key, decision.text, meta=decision.meta)
+        first = policy.current_session
+
+        cleared = await policy.resolve(envelope("/clear"))
+
+        assert "已归档会话" in cleared.replies[0].text
+        assert policy.current_session != first
+        assert conversation.stats()["cached_agents"] == 0
+        assert conversation.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_empty_session_releases_empty_runtime(self, tmp_path):
+        provider = ScriptedProvider()
+        policy, conversation = make_policy(tmp_path, provider)
+        current = policy.current_session
+        # 先建出运行时, 再移除落盘文件模拟"store 中不存在的空会话"
+        await conversation.handle_message(current, "仅内存中的一轮")
+        path = conversation.store.sessions_dir / f"{current.storage_id}.jsonl"
+        path.unlink(missing_ok=True)
+
+        switched = await policy.resolve(envelope("/clear"))
+
+        assert "当前会话为空" in switched.replies[0].text
+        assert policy.current_session != current
+        assert conversation.stats()["cached_agents"] == 0

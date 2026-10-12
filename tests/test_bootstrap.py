@@ -252,23 +252,30 @@ class TestBuildApplication:
         app = build_application()
 
         key = SessionKey(channel="cli", scope="session", conversation_id="abc")
-        agent = app.conversation._agent_for(key)  # noqa: SLF001 - 装配契约
-        compressor = agent.compressor
-        assert isinstance(compressor, ContextCompressor)
-        assert compressor.token_budget == 12345
-        assert compressor.keep_recent_turns == 3
-        assert compressor.summary_model == "cheap-model"
-        assert compressor.session == key.canonical
-        assert compressor.provider is app.provider
-        assert compressor.storage_id == key.storage_id
-        assert isinstance(compressor.audit_log, HistoryAuditLog)
-        assert compressor.audit_log.path == config.memory_dir / "HISTORY.md"
-        # 同会话复用同一个 AgentLoop/compressor, 不同会话各自实例
-        assert app.conversation._agent_for(key) is agent  # noqa: SLF001
-        other = app.conversation._agent_for(
-            SessionKey(channel="cli", scope="session", conversation_id="other")
-        )
-        assert other.compressor is not compressor
+        runtime = app.conversation._acquire(key)  # noqa: SLF001 - 装配契约
+        other_key = SessionKey(channel="cli", scope="session", conversation_id="other")
+        try:
+            agent = runtime.agent
+            compressor = agent.compressor
+            assert isinstance(compressor, ContextCompressor)
+            assert compressor.token_budget == 12345
+            assert compressor.keep_recent_turns == 3
+            assert compressor.summary_model == "cheap-model"
+            assert compressor.session == key.canonical
+            assert compressor.provider is app.provider
+            assert compressor.storage_id == key.storage_id
+            assert isinstance(compressor.audit_log, HistoryAuditLog)
+            assert compressor.audit_log.path == config.memory_dir / "HISTORY.md"
+            # 同会话复用同一个 AgentLoop/compressor, 不同会话各自实例
+            assert app.conversation._acquire(key) is runtime  # noqa: SLF001
+            other = app.conversation._acquire(other_key)  # noqa: SLF001
+            try:
+                assert other.agent.compressor is not compressor
+            finally:
+                app.conversation._release(other_key, other)  # noqa: SLF001
+        finally:
+            app.conversation._release(key, runtime)  # noqa: SLF001 - 配对第二次
+            app.conversation._release(key, runtime)  # noqa: SLF001 - 配对第一次
 
     def test_compression_disabled_passes_none(self, monkeypatch, tmp_path):
         config = make_settings(workspace=tmp_path, compression_enabled=False)
@@ -276,9 +283,12 @@ class TestBuildApplication:
         app = build_application()
 
         key = SessionKey(channel="cli", scope="session", conversation_id="abc")
-        agent = app.conversation._agent_for(key)  # noqa: SLF001
-
-        assert agent.compressor is None
+        runtime = app.conversation._acquire(key)  # noqa: SLF001
+        try:
+            agent = runtime.agent
+            assert agent.compressor is None
+        finally:
+            app.conversation._release(key, runtime)  # noqa: SLF001
         assert not (config.memory_dir / "HISTORY.md").exists()
 
 

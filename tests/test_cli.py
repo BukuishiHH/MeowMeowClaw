@@ -271,6 +271,9 @@ class TestInteractiveLoop:
         assert {summary.turn_count for summary in summaries} == {1}
         assert {summary.session_key for summary in summaries} >= {first}
         assert any(summary.session_key != first for summary in summaries)
+        stats = app.conversation.stats()
+        assert stats["cached_agents"] == 1  # 新会话仍在缓存
+        assert stats["evictions"] == 1      # /new 已释放旧会话运行时
 
     @pytest.mark.asyncio
     async def test_clear_archives_current_and_rotates(self, tmp_path, feed_input, capsys):
@@ -292,6 +295,9 @@ class TestInteractiveLoop:
         summaries = await app.conversation.list_sessions()
         assert len(summaries) == 2  # 归档的旧会话 + 新会话
         assert {summary.archived for summary in summaries} == {True, False}
+        stats = app.conversation.stats()
+        assert stats["cached_agents"] == 1  # 新会话仍在缓存
+        assert stats["evictions"] == 1      # /clear 已释放旧会话运行时
 
     @pytest.mark.asyncio
     async def test_clear_specific_session_by_short_id(self, tmp_path, feed_input, capsys):

@@ -66,9 +66,11 @@ class CliPolicy:
     def current_session(self) -> SessionKey:
         return self._current
 
-    def new_session(self) -> SessionKey:
-        """切换到一个全新会话(旧会话保持原状)."""
+    async def new_session(self) -> SessionKey:
+        """切换到一个全新会话; 旧会话数据保留, 但其进程内运行时立即释放(A4)."""
+        previous = self._current
         self._current = self._session_factory()
+        await self.conversation.close_session(previous)
         return self._current
 
     # ------------------------------------------------------------------ 入口
@@ -111,7 +113,7 @@ class CliPolicy:
         if name == "/new":
             if args:
                 return [make_reply(request, self._usage_error(command))]
-            new_session = self.new_session()
+            new_session = await self.new_session()
             return [
                 make_reply(
                     request,
@@ -149,7 +151,7 @@ class CliPolicy:
 
             if target is None:
                 # 当前会话尚未写入任何消息(空会话): 直接切换新会话即可
-                new_session = self.new_session()
+                new_session = await self.new_session()
                 return [
                     make_reply(
                         request,
@@ -159,7 +161,7 @@ class CliPolicy:
 
             action = await self._commands.archive_or_purge(target, purge=purge)
             if target.storage_id == self._current.storage_id:
-                new_session = self.new_session()
+                new_session = await self.new_session()
                 return [
                     make_reply(
                         request,

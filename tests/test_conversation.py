@@ -192,8 +192,8 @@ class TestConversationService:
         await service.handle_message(key, "第一问")
         await service.handle_message(key, "第二问")
 
-        # 直接取服务缓存的 agent 校验: run_turn(history=...) 不写实例历史
-        cached_agent = service._agents[key.storage_id]  # noqa: SLF001 - 契约测试
+        # 直接取服务缓存的 runtime 校验: run_turn(history=...) 不写实例历史
+        cached_agent = service._runtimes[key.storage_id].agent  # noqa: SLF001 - 契约测试
         assert cached_agent._session_history == []      # noqa: SLF001
 
     @pytest.mark.asyncio
@@ -482,3 +482,321 @@ class TestConversationStats:
 
         assert stats["store"] == {}
         assert set(stats) == {"cached_agents", "locks", "evictions", "store", "rss_mb"}
+
+
+# --------------------------------------------------------- A+ A4 运行时生命周期
+
+
+class GatedProvider(LLMProvider):
+    """进入 chat 后阻塞, 用于制造"在途 turn"并观察 refcount/淘汰时序."""
+
+    def __init__(self, answer: str = "答") -> None:
+        self.answer = answer
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def chat(self, messages, tools=None, model=None) -> LLMResponse:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return LLMResponse(content=self.answer, finish_reason=FINISH_REASON_STOP)
+
+
+async def wait_until(predicate, *, timeout: float = 2.0) -> None:
+    """轮询等待条件成立(仅测试用, 避免依赖固定 sleep)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("等待条件超时")
+        await asyncio.sleep(0)
+
+
+class TestRuntimeLifecycle:
+    @pytest.mark.asyncio
+    async def test_runtime_holds_agent_lock_and_refcount_returns_to_zero(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider(["答"]))
+        )
+        key = cli_key()
+
+        await service.handle_message(key, "问题")
+
+        runtime = service._runtimes[key.storage_id]  # noqa: SLF001 - 生命周期契约
+        assert runtime.refcount == 0
+        assert isinstance(runtime.lock, asyncio.Lock)
+        assert runtime.last_used_ms > 0
+        assert runtime.evict_pending is False
+        assert service.stats()["cached_agents"] == 1
+        assert service.stats()["locks"] == 1
+
+    @pytest.mark.asyncio
+    async def test_close_session_idle_releases_and_unknown_is_false(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider(["答"]))
+        )
+        key = cli_key()
+        await service.handle_message(key, "问题")
+
+        assert await service.close_session(key) is True
+
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["evictions"] == 1
+        assert await service.close_session(key) is False
+        assert service.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_close_session_busy_marks_pending_and_finishes_on_release(self, tmp_path):
+        provider = GatedProvider()
+        factory = AgentFactory(provider)
+        service = ConversationService(JsonlSessionStore(tmp_path / "memory"), factory)
+        key = cli_key()
+
+        task = asyncio.create_task(service.handle_message(key, "问题"))
+        await wait_until(lambda: provider.started.is_set())
+        runtime = service._runtimes[key.storage_id]  # noqa: SLF001
+        assert runtime.refcount == 1
+
+        assert await service.close_session(key) is False  # busy: 标记 pending
+
+        assert runtime.evict_pending is True
+        assert service._runtimes[key.storage_id] is runtime  # noqa: SLF001 - 未替换锁
+        assert service.stats()["cached_agents"] == 1
+
+        provider.release.set()
+        result = await task
+
+        assert result.answer == "答"
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["evictions"] == 1
+        assert factory.calls == [key]  # 在途期间未重建 agent/锁
+
+    @pytest.mark.asyncio
+    async def test_refcount_counts_queued_waiter_and_keeps_lock_identity(self, tmp_path):
+        provider = GatedProvider()
+        factory = AgentFactory(provider)
+        service = ConversationService(JsonlSessionStore(tmp_path / "memory"), factory)
+        key = cli_key()
+
+        first = asyncio.create_task(service.handle_message(key, "第一问"))
+        await wait_until(lambda: provider.started.is_set())
+        second = asyncio.create_task(service.handle_message(key, "第二问"))
+        runtime = service._runtimes[key.storage_id]  # noqa: SLF001
+
+        await wait_until(lambda: runtime.refcount == 2)  # 1 执行 + 1 排队
+        assert provider.calls == 1  # 第二个请求确实在等锁
+
+        provider.release.set()
+        results = await asyncio.gather(first, second)
+
+        assert [result.answer for result in results] == ["答", "答"]
+        assert provider.calls == 2
+        assert runtime.refcount == 0
+        assert factory.calls == [key]
+
+    @pytest.mark.asyncio
+    async def test_evict_idle_with_zero_ttl_is_explicit_full_cleanup(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider())
+        )
+        await service.handle_message(cli_key("c1"), "一")
+        await service.handle_message(cli_key("c2"), "二")
+
+        assert await service.evict_idle() == 2
+
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["evictions"] == 2
+
+    @pytest.mark.asyncio
+    async def test_evict_idle_none_uses_constructor_ttl(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"),
+            AgentFactory(ScriptedProvider()),
+            cache_idle_seconds=3600.0,
+        )
+        key = cli_key()
+        await service.handle_message(key, "一")
+
+        assert await service.evict_idle() == 0  # 新运行时未超过 TTL
+
+        service._runtimes[key.storage_id].last_used_ms -= 3_601_000  # noqa: SLF001
+        assert await service.evict_idle() == 1
+        assert service.stats()["cached_agents"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cache_idle_seconds_evicts_expired_idle_automatically(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"),
+            AgentFactory(ScriptedProvider()),
+            cache_idle_seconds=3600.0,
+        )
+        first, second = cli_key("c1"), cli_key("c2")
+        await service.handle_message(first, "一")
+        service._runtimes[first.storage_id].last_used_ms -= 3_601_000  # noqa: SLF001
+
+        await service.handle_message(second, "二")  # 新消息触发自动 TTL 清理
+
+        assert first.storage_id not in service._runtimes  # noqa: SLF001
+        assert second.storage_id in service._runtimes  # noqa: SLF001
+        assert service.stats()["cached_agents"] == 1
+        assert service.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_idle_seconds_recreates_runtime_on_expired_reuse(self, tmp_path):
+        factory = AgentFactory(ScriptedProvider())
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), factory, cache_idle_seconds=3600.0
+        )
+        key = cli_key()
+        await service.handle_message(key, "一")
+        expired = service._runtimes[key.storage_id]  # noqa: SLF001
+        expired.last_used_ms -= 3_601_000  # noqa: SLF001
+
+        await service.handle_message(key, "二")
+
+        assert service._runtimes[key.storage_id] is not expired  # noqa: SLF001
+        assert factory.calls == [key, key]
+        assert service.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_evict_idle_never_touches_inflight_runtime(self, tmp_path):
+        provider = GatedProvider()
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(provider)
+        )
+        key = cli_key()
+
+        task = asyncio.create_task(service.handle_message(key, "问题"))
+        await wait_until(lambda: provider.started.is_set())
+
+        assert await service.evict_idle(ttl_seconds=0) == 0
+        assert service.stats()["cached_agents"] == 1
+
+        provider.release.set()
+        await task
+
+        assert await service.evict_idle(ttl_seconds=0) == 1
+
+    @pytest.mark.asyncio
+    async def test_lru_capacity_evicts_oldest_idle_runtime(self, tmp_path):
+        factory = AgentFactory(ScriptedProvider())
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), factory, max_cached_sessions=2
+        )
+        first, second, third = cli_key("c1"), cli_key("c2"), cli_key("c3")
+
+        await service.handle_message(first, "一")
+        await service.handle_message(second, "二")
+        await service.handle_message(third, "三")
+
+        assert service.stats()["cached_agents"] == 2
+        assert service.stats()["evictions"] == 1
+        assert first.storage_id not in service._runtimes  # noqa: SLF001
+        assert second.storage_id in service._runtimes  # noqa: SLF001
+
+        await service.handle_message(first, "再访问最旧的会话")
+
+        assert factory.calls == [first, second, third, first]
+        assert service.stats()["cached_agents"] == 2
+        assert service.stats()["evictions"] == 2
+        assert second.storage_id not in service._runtimes  # noqa: SLF001 - LRU 淘汰
+
+    @pytest.mark.asyncio
+    async def test_max_cached_sessions_non_positive_means_unlimited(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"),
+            AgentFactory(ScriptedProvider()),
+            max_cached_sessions=0,
+        )
+        for index in range(5):
+            await service.handle_message(cli_key(f"c-{index}"), "问题")
+
+        assert service.stats()["cached_agents"] == 5
+        assert service.stats()["evictions"] == 0
+
+    @pytest.mark.asyncio
+    async def test_archive_and_purge_release_runtime(self, tmp_path):
+        store = JsonlSessionStore(tmp_path / "memory")
+        service = ConversationService(store, AgentFactory(ScriptedProvider()))
+        key = cli_key()
+
+        await service.handle_message(key, "问题")
+        await service.archive_session(key)
+
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["evictions"] == 1
+
+        await service.handle_message(key, "归档后重新写入")
+        await service.purge_session(key)
+
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["evictions"] == 2
+
+    @pytest.mark.asyncio
+    async def test_archive_while_turn_inflight_marks_pending(self, tmp_path):
+        provider = GatedProvider()
+        factory = AgentFactory(provider)
+        service = ConversationService(JsonlSessionStore(tmp_path / "memory"), factory)
+        key = cli_key()
+
+        task = asyncio.create_task(service.handle_message(key, "问题"))
+        await wait_until(lambda: provider.started.is_set())
+        runtime = service._runtimes[key.storage_id]  # noqa: SLF001
+
+        await service.archive_session(key)  # 在途: 先标记 pending, 不换锁
+
+        assert runtime.evict_pending is True
+        assert service._runtimes[key.storage_id] is runtime  # noqa: SLF001
+
+        provider.release.set()
+        result = await task
+
+        assert result.completed is True
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["evictions"] == 1
+        assert factory.calls == [key]
+
+    @pytest.mark.asyncio
+    async def test_close_clears_all_runtimes(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider())
+        )
+        await service.handle_message(cli_key("c1"), "一")
+        await service.handle_message(cli_key("c2"), "二")
+        assert service.stats()["cached_agents"] == 2
+
+        await service.close()
+
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["locks"] == 0
+        await service.close()  # 幂等
+
+    @pytest.mark.asyncio
+    async def test_close_during_inflight_turn_is_safe(self, tmp_path):
+        provider = GatedProvider()
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(provider)
+        )
+        key = cli_key()
+
+        task = asyncio.create_task(service.handle_message(key, "问题"))
+        await wait_until(lambda: provider.started.is_set())
+
+        await service.close()  # 关停清空缓存; 在途 turn 正常结束且 finally 不抛错
+        assert service.stats()["cached_agents"] == 0
+
+        provider.release.set()
+        result = await task
+
+        assert result.answer == "答"
+        assert service.stats()["cached_agents"] == 0
+
+    @pytest.mark.asyncio
+    async def test_close_session_rejects_non_key(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider())
+        )
+
+        with pytest.raises(TypeError):
+            await service.close_session("not-a-key")  # type: ignore[arg-type]

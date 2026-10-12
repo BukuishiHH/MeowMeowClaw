@@ -102,12 +102,16 @@ class QqPolicy:
     async def _rotate(
         self, contact: SessionKey, now_ms: int, *, archive_old: bool
     ) -> SessionKey:
-        """归档旧会话(可选)并创建/激活新会话实例."""
+        """归档旧会话(可选)并创建/激活新会话实例; 旧会话运行时随切走释放(A4)."""
         active = await self.active_store.load(contact)
-        if active is not None and archive_old:
-            await self._archive_if_present(contact.with_session(active.session_id))
+        old_session = contact.with_session(active.session_id) if active is not None else None
+        if old_session is not None and archive_old:
+            await self._archive_if_present(old_session)
         new_session = contact.with_session(uuid.uuid4().hex)
         await self.active_store.activate(contact, new_session.session_id, now_ms)
+        if old_session is not None:
+            # 空会话也能释放(store 无文件, 但 agent 护栏/锁可能已缓存)
+            await self.conversation.close_session(old_session)
         return new_session
 
     async def _resolve_active_session(

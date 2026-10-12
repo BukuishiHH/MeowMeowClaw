@@ -147,6 +147,7 @@ async def _handle_command(command: str, app: Application, current: SessionKey) -
         if args:
             _usage_error(command)
             return CommandOutcome(exit_requested=False, session=current)
+        await app.conversation.close_session(current)
         new_session = new_cli_session()
         print(f"已开始新会话: {session_short_id(new_session)} ({new_session.canonical})")
         return CommandOutcome(exit_requested=False, session=new_session)
@@ -183,6 +184,7 @@ async def _handle_command(command: str, app: Application, current: SessionKey) -
 
         if target is None:
             # 当前会话尚未写入任何消息(空会话): 直接切换新会话即可
+            await app.conversation.close_session(current)
             new_session = new_cli_session()
             print(f"当前会话为空, 已开始新会话: {session_short_id(new_session)}")
             return CommandOutcome(exit_requested=False, session=new_session)
@@ -199,6 +201,7 @@ async def _handle_command(command: str, app: Application, current: SessionKey) -
                 print(f"已归档会话: {label}")
 
         if target.storage_id == current.storage_id:
+            await app.conversation.close_session(current)
             new_session = new_cli_session()
             print(f"已开始新会话: {session_short_id(new_session)} ({new_session.canonical})")
             return CommandOutcome(exit_requested=False, session=new_session)

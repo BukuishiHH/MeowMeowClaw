@@ -223,3 +223,53 @@ class TestCommands:
         assert session_key.storage_id[:8] in text
         assert "[active]" in text
         assert "<- 当前" in text
+
+
+class TestRuntimeLifecycleHooks:
+    """A4: QQ 轮换(/new /clear / 超时)切走旧会话时释放其运行时."""
+
+    @pytest.mark.asyncio
+    async def test_new_releases_old_runtime(self, tmp_path):
+        clock = Clock()
+        stack = build_policy_stack(tmp_path, ScriptedProvider(["答1"]), clock)
+        first = await stack.policy.resolve(_envelope(qq_message("第一问", received_at_ms=clock.now)))
+        await run_agent(stack.conversation, first)
+        assert stack.conversation.stats()["cached_agents"] == 1
+
+        decision = await stack.policy.resolve(_envelope(qq_message("/new")))
+
+        assert decision.action == ACTION_REPLY
+        assert stack.conversation.stats()["cached_agents"] == 0
+        assert stack.conversation.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_releases_old_runtime(self, tmp_path):
+        clock = Clock()
+        stack = build_policy_stack(tmp_path, ScriptedProvider(["答1"]), clock)
+        first = await stack.policy.resolve(_envelope(qq_message("第一问", received_at_ms=clock.now)))
+        await run_agent(stack.conversation, first)
+        assert stack.conversation.stats()["cached_agents"] == 1
+
+        decision = await stack.policy.resolve(_envelope(qq_message("/clear")))
+
+        assert "已归档当前会话" in decision.replies[0].text
+        assert stack.conversation.stats()["cached_agents"] == 0
+        assert stack.conversation.stats()["evictions"] == 1
+
+    @pytest.mark.asyncio
+    async def test_timeout_rotation_releases_old_runtime(self, tmp_path):
+        clock = Clock()
+        stack = build_policy_stack(tmp_path, ScriptedProvider(["答1", "答2"]), clock)
+        first = await stack.policy.resolve(_envelope(qq_message("第一问", received_at_ms=clock.now)))
+        await run_agent(stack.conversation, first)
+        assert stack.conversation.stats()["cached_agents"] == 1
+
+        clock.advance(6 * 60 * 60 * 1000 + 1)
+        second = await stack.policy.resolve(
+            _envelope(qq_message("第二问", received_at_ms=clock.now))
+        )
+
+        assert [reply.text for reply in second.pre_replies] == ["已开始新对话"]
+        assert second.session_key != first.session_key
+        assert stack.conversation.stats()["cached_agents"] == 0
+        assert stack.conversation.stats()["evictions"] == 1

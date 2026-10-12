@@ -1,7 +1,7 @@
 # MeowMeowClaw A+ 优化设计：会话 IO 尾读与运行时生命周期（v1）
 
-> 状态：**A1–A3 已完成（2026-10-12），A4–A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
-> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1–§8.3。
+> 状态：**A1–A4 已完成（2026-10-12），A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
+> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1–§8.4。
 > 关联：`docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5、`meowmeowclaw/memory/jsonl.py`、
 > `meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`。
 
@@ -297,7 +297,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 - [x] A1：`stats()` 可用；基准脚本输出与 §2.1 一致（实测偏差 ≤11%，见 §8.1）；
 - [x] A2：`get_meta/append_turn/list_sessions` 尾读路径通过全部契约与崩溃恢复用例（实测 O(1)，见 §8.2）；
 - [x] A3：2000 轮 `load_recent` p95 ≤3ms 且平坦；差分测试通过（实测 p95 1.57ms、50→2000 差值 0.09ms，见 §8.3）；
-- [ ] A4：`close_session/evict_idle/max_cached_sessions` 可用；归档/轮换/关停可释放；无并发回归；
+- [x] A4：`close_session/evict_idle/max_cached_sessions` 可用；归档/轮换/关停可释放；无并发回归（实测生命周期用例全绿，见 §8.4）；
 - [ ] A5：配置/README/ADR 同步；全量回归 + 真实 CLI/QQ 冒烟通过；
 - [ ] 更新 `docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5 与本文"实现记录"。
 
@@ -310,7 +310,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 | A1 | 已完成 | `4f4d0bc` | metrics + `stats()` + 基准脚本；新增 28 用例；实测偏差 ≤11% |
 | A2 | 已完成 | `2fd8cd1` | 尾读工具 + 三路径改造；新增 37 用例；2000 轮 `get_meta` p95 0.53ms |
 | A3 | 已完成 | `bf90797` | `load_recent` 反向块读 + 窗口裁剪；新增 212 用例；2000 轮 p95 1.57ms、50→2000 差值 0.09ms |
-| A4 | 待实现 | — | 依赖 A1（可与 A2/A3 并行） |
+| A4 | 已完成 | 待回填 | `_SessionRuntime` + refcount + 生命周期 API；新增 22 用例；归档/轮换/关停均释放 |
 | A5 | 待实现 | — | 依赖 A3+A4 |
 
 ### 8.1 A1 实现记录（2026-10-12）
@@ -415,3 +415,34 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 - **G1 达标**：2000 轮 `load_recent` p95 1.57ms（≤3ms）；50→2000 轮 p95 差值 0.09ms、avg 差值 0.06ms（验收 ≤2ms），文件大小增长已不影响窗口读取；
 - 全量回归 **1521 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；既有崩溃恢复、双实例并发、归档/删除用例全绿；
 - 复现命令：`python scripts/bench_session_store.py`（可用 `--sizes/--samples/--keep` 调整）。
+
+### 8.4 A4 实现记录（2026-10-12）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/conversation.py` | 新增 `_SessionRuntime`（agent + lock + refcount + last_used_ms + evict_pending）与 `OrderedDict` LRU；`_acquire / _release / _evict_runtime / _enforce_capacity / _sweep_expired`；新增 `close_session / evict_idle`；`archive_session / purge_session / close` 同步释放运行时；`stats()` 改按运行时统计 |
+| `meowmeowclaw/channels/cli_policy.py` | `new_session()` 改为 async，切走旧会话时 `close_session(old)` |
+| `meowmeowclaw/channels/qq_policy.py` | `_rotate()` 创建/激活新会话后 `close_session(old)`（空会话也能释放） |
+| `meowmeowclaw/cli.py` | 网关关闭时的 legacy 路径：`/new`、`/clear` 切新前释放当前运行时（与 CliPolicy 对齐） |
+| `tests/test_conversation.py` | 新增 16 个生命周期用例（idle/busy close、refcount 排队、evict_idle、自动 TTL、LRU 容量、归档/删除/在途归档、在途 close、无限容量、非法 key） |
+| `tests/channels/test_cli_policy.py` / `test_qq_policy.py` | 新增 6 个渠道钩子用例（`/new`、`/clear`、QQ 超时轮换均释放运行时） |
+| `tests/test_bootstrap.py` / `test_cli.py` | 适配 `_runtimes`/`_acquire` 内部访问，并断言 `/new`、`/clear` 释放旧运行时 |
+
+**实现要点**
+
+1. **agent + lock 同生命周期**：每个 `_SessionRuntime` 持有一把锁，淘汰整个 runtime，不再存在"锁被替换但旧 agent 仍在执行"的并发窗口；
+2. **refcount 协议**：`_acquire()` 同步 +1（含排队任务），`handle_message` 的 `try/finally` 保证 `_release()` -1；淘汰只处理 `refcount == 0` 的运行时；
+3. **`close_session()`**：空闲立即淘汰并返回 `True`；在途置 `evict_pending` 并返回 `False`，由最后一次 `_release` 完成淘汰（幂等，运行时不存在返回 `False`）；
+4. **LRU 容量**：`_runtimes` 按 `last_used` 排序（`_acquire` 时 `move_to_end`），`_enforce_capacity` 在 acquire/release 两处按"最久未使用且空闲"淘汰；`max_cached_sessions <= 0` = 不限制；
+5. **TTL**：`cache_idle_seconds > 0` 时在 acquire/release 顺带清理过期空闲运行时；命中的旧运行时若已过期则先淘汰重建；默认 `0` 关闭自动 TTL，显式 `evict_idle(ttl<=0)` 清理全部空闲；
+6. **钩子**：`archive_session / purge_session / ConversationService.close`、`CliPolicy.new_session`、`QqPolicy._rotate`、legacy CLI `/new`/`/clear` 均触发释放；`_evictions` 随实际淘汰递增并出现在 `stats()`；
+7. **兼容**：`stats()` 字段形状不变（`cached_agents / locks` 取自运行时数量，默认每条 runtime 一把锁）；全量回归、同会话串行与在途场景无回归。
+
+**验证**
+
+- 全量回归 **1543 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 生命周期用例覆盖：`close_session`（idle/busy/重复）、refcount 排队不变量、`evict_idle`（显式 0/TTL/在途跳过）、自动 TTL、LRU 容量与无限容量、归档/删除/在途归档/关停释放、非法输入；
+- 渠道钩子用例覆盖 CLI `/new`/`/clear`、QQ `/new`/`/clear`/超时轮换，切走后 `cached_agents` 归零；
+- A5 待办：`memory_max_cached_sessions` / `memory_cache_idle_seconds` 配置键透传 bootstrap、README/ADR 同步与真实 CLI/QQ 冒烟。

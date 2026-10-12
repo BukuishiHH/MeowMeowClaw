@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 49 个源码模块 / 约 10800 行; 测试 52 个文件 / **1529 个用例**(1521 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 49 个源码模块 / 约 11000 行; 测试 52 个文件 / **1551 个用例**(1543 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -272,17 +272,17 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/memory/filelock.py` | 110 | 跨进程 advisory 文件锁(flock/msvcrt) | `FileLock` / `async_file_lock` |
 | `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 459 | **控制流**: 多轮往返、防爆护栏、历史快照、流式增量与工具轮前导抑制 | `AgentLoop.run_turn(on_delta=...)` / `AgentTurn` / `run()` / `clear_history()` |
-| `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
+| `meowmeowclaw/conversation.py` | 375 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行; A4 `_SessionRuntime` + refcount/LRU/TTL 生命周期 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/qq.py` | 223 | **QQ 渠道进程入口**: 配置校验/`--check`/装配/信号与优雅关闭/周期状态日志 | `main()` / `run_qq()` / `qq_config_problems()` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
 | `meowmeowclaw/channels/bridge.py` | 29 | 平台 DTO ↔ 网关 Envelope 转换 | `incoming_to_envelope()` / `outgoing_from_envelope()` |
 | `meowmeowclaw/channels/commands.py` | 67 | 跨渠道会话指令公共逻辑(QQ/CLI 共用) | `SessionCommandHelper` |
-| `meowmeowclaw/channels/qq_policy.py` | 234 | QQ 策略: 身份过滤 / 6h 惰性轮换 / 指令 | `QqPolicy` |
+| `meowmeowclaw/channels/qq_policy.py` | 238 | QQ 策略: 身份过滤 / 6h 惰性轮换 / 指令; A4 轮换释放旧运行时 | `QqPolicy` |
 | `meowmeowclaw/channels/qq_adapter.py` | 47 | QQ 适配器(可注入 transport; 传输见 `onebot11.py`) | `QqAdapter` |
 | `meowmeowclaw/channels/onebot11.py` | 826 | **OneBot 11(NapCat)传输**: 反向服务端/正向客户端、token 鉴权、消息段↔文本、`send_private_msg`、分片、重连、`set_input_status`、block 分段呈现 | `OneBot11Transport` / `OneBot11Adapter` |
 | `meowmeowclaw/channels/streaming.py` | 438 | **流式渲染基础件**: 水位线/前缀补发、语义分块(`BlockSegmenter`)、收尾均分(`split_evenly`)、"正在输入"续期(`TypingKeepAlive`) | `StreamAssembler` / `BlockSegmenter` / `split_evenly` |
 | `meowmeowclaw/channels/qq_private.py` | 260 | QQ active 指针存储 + `QqPrivateService` 兼容 facade | `QqPrivateActiveStore` / `QqPrivateService` |
-| `meowmeowclaw/channels/cli_policy.py` | 209 | CLI 策略: 会话生命周期 + /help /new /clear /sessions /tools /skills | `CliPolicy` |
+| `meowmeowclaw/channels/cli_policy.py` | 211 | CLI 策略: 会话生命周期(切走释放运行时) + /help /new /clear /sessions /tools /skills | `CliPolicy` |
 | `meowmeowclaw/channels/cli_adapter.py` | 111 | CLI 适配器: REPL + 总线收发 + Future 配对 | `CliAdapter` |
 | `meowmeowclaw/gateway/bus.py` | 179 | asyncio.Queue 总线: inbound/outbound/deadletter、背压、关闭、观测 | `AsyncioQueueBus` / `MessageBus` |
 | `meowmeowclaw/gateway/envelope.py` | 119 | 统一信封与构造/校验 | `Envelope` / `make_inbound()` / `make_reply()` |
@@ -293,7 +293,7 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/gateway/dispatcher.py` | 193 | 单任务消费 + 策略路由 + 并发派发 | `GatewayDispatcher` |
 | `meowmeowclaw/gateway/gateway.py` | 153 | 组装、优雅启停、`stats()` 观测 | `Gateway` |
 | `meowmeowclaw/bootstrap.py` | 207 | **组合根**: 配置 -> Provider/工具/技能/记忆/Context/Loop + 可选 Gateway | `build_application()` / `build_gateway()` / `Application` |
-| `meowmeowclaw/cli.py` | 332 | **交付层**: banner / REPL; 网关开启时经 CliPolicy + CliAdapter | `main()` / `interactive_loop()` / `_run_gateway_repl()` |
+| `meowmeowclaw/cli.py` | 338 | **交付层**: banner / REPL; 网关开启时经 CliPolicy + CliAdapter; legacy 路径 /new /clear 同步释放运行时 | `main()` / `interactive_loop()` / `_run_gateway_repl()` |
 
 ### 3.1 契约先行, 实现可换
 
@@ -535,7 +535,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `test_bootstrap.py` | 16 | 装配(工具/技能/Context/Loop/网关)、ConfigError/SkillConfigError、导入边界 |
 | `test_cli.py` | 26 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码、网关分流 |
 | `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
-| `channels/test_qq_policy.py` | 11 | QQ 策略: 身份/轮换/指令/跨渠道删除 |
+| `channels/test_qq_policy.py` | 14 | QQ 策略: 身份/轮换/指令/跨渠道删除/A4 轮换释放运行时 |
 | `channels/test_qq_adapter.py` | 3 | QQ 适配器: 入站转换/出站/停入站 |
 | `memory/test_tail.py` | 27 | A+ A2 尾读工具: 反向块读/UTF-8 跨块/超大行/上限/与全量等价 |
 | `memory/test_jsonl_tail_path.py` | 10 | A+ A2 存储层: 打桩证明不走全量、回退路径、A+1 累计口径、归档回退 |
@@ -547,7 +547,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `channels/test_onebot11.py` | 32 | OneBot11: 文本/CQ 码提取、事件过滤、反向鉴权、正向重连、分片、stop_inbound 契约 |
 | `channels/test_qq_napcat_integration.py` | 7 | 假 NapCat 客户端 ↔ Agent 反向 WS 端到端(往返/忽略/指令/轮换/重连) |
 | `test_qq_entry.py` | 8 | QQ 入口: 配置校验、--check 输出、生命周期(启动→信号→优雅关闭) |
-| `channels/test_cli_policy.py` | 10 | CLI 策略: 会话/指令/展示 |
+| `channels/test_cli_policy.py` | 13 | CLI 策略: 会话/指令/展示/A4 切会话释放运行时 |
 | `channels/test_cli_adapter.py` | 7 | CLI 适配器: ask/超时/pending/REPL |
 | `channels/test_qq_gateway_integration.py` | 4 | QQ 走网关端到端(轮换/指令/忽略) |
 | `channels/test_cli_gateway_integration.py` | 5 | CLI 走网关端到端 + Ctrl+C 优雅关闭 |
@@ -559,7 +559,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `memory/test_jsonl_store.py` | 29 | SessionStore 契约 + JSONL 布局/损坏行/归档/短 ID/并发与崩溃恢复 |
 | `memory/test_long_term.py` | 13 | MemoryRecord 校验、LongTermStore 协议、Noop 空实现 |
 | `memory/test_filelock.py` | 4 | FileLock 争用/释放/异步上下文 |
-| `test_conversation.py` | 13 | ConversationService 编排、窗口、fail-soft、同会话串行、agent 缓存 |
+| `test_conversation.py` | 36 | ConversationService 编排、窗口、fail-soft、同会话串行、agent 缓存、A4 运行时生命周期 |
 | `channels/test_qq_private.py` | 15 | QQ active 指针/6h 轮换/重启恢复/命令/跨渠道删除 |
 | `tools/test_base.py` | 3 | 工具基类抽象约束 |
 | `tools/test_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
@@ -583,7 +583,7 @@ MeowMeowClaw/
 │   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 52 个测试文件 / 1529 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 52 个测试文件 / 1551 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -615,7 +615,7 @@ MeowMeowClaw/
     │   ├── noop.py              # NoopLongTermStore(v1 占位)
     │   ├── filelock.py          # 跨进程 advisory 文件锁
     │   └── errors.py            # 记忆层错误类型
-    ├── conversation.py          # ConversationService: 记忆 <-> AgentLoop 编排
+    ├── conversation.py          # ConversationService: 记忆 <-> AgentLoop 编排(A4: 运行时 refcount/LRU/TTL)
     ├── channels/                # 渠道层: DTO / 策略 / 适配器
     │   ├── base.py              # IncomingMessage / OutgoingMessage
     │   ├── bridge.py            # DTO <-> Envelope
@@ -643,7 +643,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- A+（会话 IO 尾读 + 运行时生命周期 + 指标）已落地 **A1–A3**（指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口）；**A4–A5**（运行时生命周期、配置与集成验收）待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
+- A+（会话 IO 尾读 + 运行时生命周期 + 指标）已落地 **A1–A4**（指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口 / `_SessionRuntime` refcount·LRU·TTL 生命周期）；**A5**（配置透传、README/ADR 同步与真实冒烟）待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
 - 流式输出已落地 **S1–S5.1**（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式，`stream_enabled` 默认 `false`）；里程碑、实测数据与验收见 `docs/STREAMING_DESIGN.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现

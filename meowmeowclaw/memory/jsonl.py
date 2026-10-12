@@ -26,6 +26,7 @@ from typing import Any, Optional, Sequence, Union
 from .errors import InvalidSessionKeyError, SessionStoreError
 from .filelock import async_file_lock
 from .metrics import StoreMetrics, measure
+from .tail import read_header, read_last_valid_turn
 from .models import (
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     MIN_SHORT_ID_LENGTH,
@@ -154,8 +155,44 @@ class JsonlSessionStore:
     # ------------------------------------------------------------------ 读取
 
     @classmethod
+    def _read_tail_state(cls, path: Path) -> Optional[_FileState]:
+        """尾读版 ``_read_file``(A+ A2): 首行 header + 反向找末条有效 turn.
+
+        - 正常文件: O(1) 定位(不解析整个文件);
+        - 计数据 A+1: ``turn_count = last_turn["seq"]``、``message_count = last_turn["message_total"]``
+          (正常情况下与全量扫描完全一致; 中间行损坏时是**累计口径**, 见设计文档 §1/A+1);
+        - 以下情况**回退** ``_read_file`` 全量扫描(行为与旧实现一致):
+          文件不存在、首行不是合法 header、末轮缺少合法 ``seq/message_total``、读/解码异常。
+        """
+        if not path.is_file():
+            return None
+        try:
+            header = read_header(path)
+            if header is not None and header.get("type") == HEADER_TYPE:
+                last_turn = read_last_valid_turn(path)
+                if last_turn is None:
+                    return _FileState(header=header, last_turn=None, turn_count=0, message_count=0)
+                seq = last_turn.get("seq")
+                total = last_turn.get("message_total")
+                if (
+                    isinstance(seq, int)
+                    and not isinstance(seq, bool)
+                    and isinstance(total, int)
+                    and not isinstance(total, bool)
+                ):
+                    return _FileState(
+                        header=header,
+                        last_turn=last_turn,
+                        turn_count=seq,
+                        message_count=total,
+                    )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            logger.warning("会话文件尾读失败, 回退全量扫描: %s (%r)", path, exc)
+        return cls._read_file(path)
+
+    @classmethod
     def _read_file(cls, path: Path) -> Optional[_FileState]:
-        """读取文件头与末轮统计; 文件不存在/无 header 返回 None."""
+        """读取文件头与末轮统计; 文件不存在/无 header 返回 None(全量扫描, 兜底路径)."""
         if not path.is_file():
             return None
         header: Optional[dict[str, Any]] = None
@@ -300,7 +337,7 @@ class JsonlSessionStore:
 
         async with self._session_guard(key.storage_id):
             path = self._active_path(key)
-            state = await asyncio.to_thread(self._read_file, path)
+            state = await asyncio.to_thread(self._read_tail_state, path)
             now = utc_now_ms()
             created_at_ms = int(state.header.get("created_at_ms", now)) if state else now
             previous_seq = int(state.last_turn.get("seq", 0)) if state and state.last_turn else 0
@@ -444,9 +481,9 @@ class JsonlSessionStore:
         if not isinstance(key, SessionKey):
             raise SessionStoreError("key 必须是 SessionKey")
         archived = False
-        state = await asyncio.to_thread(self._read_file, self._active_path(key))
+        state = await asyncio.to_thread(self._read_tail_state, self._active_path(key))
         if state is None:
-            state = await asyncio.to_thread(self._read_file, self._archive_path(key))
+            state = await asyncio.to_thread(self._read_tail_state, self._archive_path(key))
             archived = state is not None
         if state is None:
             return None
@@ -474,7 +511,7 @@ class JsonlSessionStore:
 
         entries: dict[str, _SessionEntry] = {}
         for path in paths:
-            state = await asyncio.to_thread(self._read_file, path)
+            state = await asyncio.to_thread(self._read_tail_state, path)
             if state is None:
                 continue
             storage_id = str(state.header.get("storage_id") or path.stem)

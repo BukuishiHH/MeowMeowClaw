@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 48 个源码模块 / 约 10570 行; 测试 49 个文件 / **1280 个用例**(1272 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 49 个源码模块 / 约 10720 行; 测试 51 个文件 / **1317 个用例**(1309 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -265,8 +265,9 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/skills/tool.py` | 85 | `load_skill` 工具(技能子系统对 Agent 的唯一出口) | `LoadSkillTool` |
 | `meowmeowclaw/memory/models.py` | 381 | 会话数据模型 + `MemoryRecord`(结构化长期记忆) | `SessionKey` / `SessionMessage` / `MemoryRecord` / `new_memory_record` |
 | `meowmeowclaw/memory/store.py` | 96 | 仓储抽象: `SessionStore` + `LongTermStore`(async Protocol) | `SessionStore` / `LongTermStore` |
-| `meowmeowclaw/memory/jsonl.py` | 615 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行; A1 加三项主路径计时与 `stats()` | `JsonlSessionStore` |
+| `meowmeowclaw/memory/jsonl.py` | 652 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行; A1 计时与 `stats()`; A2 三路径尾读 | `JsonlSessionStore` |
 | `meowmeowclaw/memory/metrics.py` | 126 | **A+ A1 指标**: 有界延迟样本(count/avg/p50/p95)、三项主路径、`measure()` 计时 | `LatencyStats` / `StoreMetrics` |
+| `meowmeowclaw/memory/tail.py` | 114 | **A+ A2 尾读**: 反向块读完整行、惰性生成器命中即停、首行 header / 末条有效 turn | `read_header` / `read_last_lines` / `read_last_valid_turn` |
 | `meowmeowclaw/memory/noop.py` | 42 | 长期记忆占位实现(v1 由 MEMORY.md 承担) | `NoopLongTermStore` |
 | `meowmeowclaw/memory/filelock.py` | 110 | 跨进程 advisory 文件锁(flock/msvcrt) | `FileLock` / `async_file_lock` |
 | `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
@@ -536,6 +537,8 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
 | `channels/test_qq_policy.py` | 11 | QQ 策略: 身份/轮换/指令/跨渠道删除 |
 | `channels/test_qq_adapter.py` | 3 | QQ 适配器: 入站转换/出站/停入站 |
+| `memory/test_tail.py` | 27 | A+ A2 尾读工具: 反向块读/UTF-8 跨块/超大行/上限/与全量等价 |
+| `memory/test_jsonl_tail_path.py` | 10 | A+ A2 存储层: 打桩证明不走全量、回退路径、A+1 累计口径、归档回退 |
 | `channels/test_streaming.py` | 29 | 流式基础件: 语义分块窗口/边界优先级/围栏保护/收尾均分/输入状态续期 |
 | `channels/test_block_uniformity.py` | 10 | **S5.1 回归**: 用实测原文验证 722/288 字分块均匀、内容一致、条数封顶 |
 | `tests/test_stream_llm.py` | 17 | 流式 Provider 契约: 默认回退/tool_calls 分片/空流回退/中断保文本/400 重试 |
@@ -579,7 +582,7 @@ MeowMeowClaw/
 │   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 49 个测试文件 / 1280 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 51 个测试文件 / 1317 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -604,6 +607,7 @@ MeowMeowClaw/
     │   └── builtin/             # 6 个内置技能(每子目录一个 SKILL.md, 随包发布)
     ├── memory/                  # 短期记忆(v1: SessionStore + JSONL)
     │   ├── metrics.py           # A+ A1: 会话 IO 延迟指标(有界样本/分位) + 计时上下文
+    │   ├── tail.py              # A+ A2: JSONL 反向块读(尾读 header/末条有效 turn)
     │   ├── models.py            # SessionKey / SessionMessage / MemoryRecord
     │   ├── store.py             # SessionStore + LongTermStore 抽象接口
     │   ├── jsonl.py             # JsonlSessionStore 实现

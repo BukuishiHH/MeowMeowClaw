@@ -1,6 +1,6 @@
 # MeowMeowClaw A+ 优化设计：会话 IO 尾读与运行时生命周期（v1）
 
-> 状态：**A1 已完成（2026-10-12），A2–A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
+> 状态：**A1–A2 已完成（2026-10-12），A3–A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
 > **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1。
 > 关联：`docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5、`meowmeowclaw/memory/jsonl.py`、
 > `meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`。
@@ -295,7 +295,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 ## 7. 验收清单
 
 - [x] A1：`stats()` 可用；基准脚本输出与 §2.1 一致（实测偏差 ≤11%，见 §8.1）；
-- [ ] A2：`get_meta/append_turn/list_sessions` 尾读路径通过全部契约与崩溃恢复用例；
+- [x] A2：`get_meta/append_turn/list_sessions` 尾读路径通过全部契约与崩溃恢复用例（实测 O(1)，见 §8.2）；
 - [ ] A3：2000 轮 `load_recent` p95 ≤3ms 且平坦；差分测试通过；
 - [ ] A4：`close_session/evict_idle/max_cached_sessions` 可用；归档/轮换/关停可释放；无并发回归；
 - [ ] A5：配置/README/ADR 同步；全量回归 + 真实 CLI/QQ 冒烟通过；
@@ -308,8 +308,8 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 | 阶段 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | A1 | 已完成 | `4f4d0bc` | metrics + `stats()` + 基准脚本；新增 28 用例；实测偏差 ≤11% |
-| A2 | 待实现 | — | 依赖 A1 |
-| A3 | 待实现 | — | 依赖 A2 |
+| A2 | 已完成 | 待回填 | 尾读工具 + 三路径改造；新增 37 用例；2000 轮 `get_meta` p95 0.53ms |
+| A3 | 待实现 | — | 依赖 A2（`load_recent` 仍为 O(总长度)，见 §8.2 基准） |
 | A4 | 待实现 | — | 依赖 A1（可与 A2/A3 并行） |
 | A5 | 待实现 | — | 依赖 A3+A4 |
 
@@ -341,3 +341,43 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 - 复现命令：`python scripts/bench_session_store.py`（可用 `--sizes/--samples/--keep` 调整）；
 - 观测入口：`JsonlSessionStore.stats()` 与 `ConversationService.stats()`（纯观测，取值失败自动降级为空/None）；
 - **行为零变化**：A1 只加计时与快照，未改任何读写路径、schema 与语义；全量回归通过。
+
+### 8.2 A2 实现记录（2026-10-12）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/memory/tail.py`（新增） | 反向块读工具：`read_header` / `read_last_lines(max_lines,max_bytes)` / `read_last_valid_turn`；内部 `_iter_last_lines` 惰性生成器（命中即停） |
+| `meowmeowclaw/memory/jsonl.py` | 新增 `_read_tail_state()`（首行 header + 末条有效 turn；异常回退全量）；`get_meta / append_turn / list_sessions` 改走尾读 |
+| `meowmeowclaw/memory/__init__.py` | 导出三个尾读函数 |
+| `scripts/bench_session_store.py` | 增加 `list_sessions` 采样列（A2 验收项） |
+| `tests/memory/test_tail.py` / `test_jsonl_tail_path.py` | 新增 37 用例（27 尾读工具 + 10 存储层：打桩证明不走全量、回退路径、A+1 口径、归档回退） |
+
+**实现要点**
+
+1. 二进制反向块读（64KB/块），按 `b"\n"` 切分后**只在整行上解码** → 不会截断 UTF-8 多字节；
+2. 末尾无换行的那一段作为**候选行**（写全缺尾换行 / 崩溃半行都交给 JSON 解析判定），
+   与全量路径行为逐字节一致（§4 的差分约束）；
+3. `read_last_valid_turn` 用惰性生成器**命中即停** → 正常文件只读末尾一个块，与文件总长度无关
+   （首版实现忘了这点，被基准暴露：`get_meta` 仍是 O(文件)，已修复）；
+4. 回退条件（保持旧行为）：文件不存在、首行不是合法 header、末轮缺 `seq/message_total`、
+   `OSError/UnicodeDecodeError/ValueError`；
+5. A+1 口径：`turn_count = last_turn["seq"]`、`message_count = last_turn["message_total"]`
+   （正常文件与全量扫描一致；中间行损坏时为累计口径，已在文档与用例中注明）。
+
+**基准复测（同机、20 次采样；A1 = A2 前，A2 = 本次）**
+
+| 轮数 | `get_meta` avg/p95 (ms) | `append_turn` avg/p95 (ms) | `list_sessions` avg/p95 (ms) | `load_recent` avg/p95 (ms) |
+|---:|---:|---:|---:|---:|
+| 50 | 1.00/1.28 → **0.37/0.52** | 1.77/2.08 → **0.91/1.16** | 0.90/1.22 → **0.35/0.43** | 1.31/1.67 → 1.34/1.92（A3 待改） |
+| 200 | 3.23/3.92 → **0.39/0.62** | 4.21/4.71 → **0.94/1.11** | 1.91/2.20 → **0.37/0.48** | 4.15/5.00 → 4.12/5.00 |
+| 500 | 7.20/7.79 → **0.36/0.43** | 8.72/10.82 → **0.91/1.26** | 5.86/7.15 → **0.33/0.39** | 9.21/10.18 → 9.55/11.64 |
+| 1000 | 14.89/17.23 → **0.41/0.55** | 15.56/17.85 → **0.92/1.03** | 7.33/8.00 → **0.28/0.37** | 17.96/19.37 → 22.51/32.98（机器波动） |
+| 2000 | 27.74/29.13 → **0.48/0.53** | 31.70/39.55 → **0.96/1.19** | 14.21/15.41 → **0.34/0.44** | 35.64/42.09 → 35.27/41.80 |
+
+- **G2（`get_meta`/`append_turn` O(1)，p95 ≤ ~1ms）达标**：2000 轮 p95 分别为 0.53ms / 1.19ms；
+- **G3（`list_sessions` 不再全量扫描）达标**：2000 轮 p95 0.44ms；
+- 顺带收益：批量生成（`append_turn` × 2000）从 30.9s 降到 2.1s；
+- `load_recent` 本轮未改（35.27ms @2000，仍 O(总长度)）→ **A3 的目标**；
+  1000 轮那一行的偏高属同机波动（同一代码路径两次采样 17.96ms / 22.51ms）。

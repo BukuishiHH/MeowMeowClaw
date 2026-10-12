@@ -21,6 +21,7 @@ from .models import (
 )
 from .metrics import DEFAULT_MAX_SAMPLES, LatencyStats, StoreMetrics
 from .noop import NoopLongTermStore
+from .tail import read_header, read_last_lines, read_last_valid_turn
 from .store import LongTermStore, SessionStore
 
 __all__ = [
@@ -44,5 +45,8 @@ __all__ = [
     "StoreMetrics",
     "ms_to_iso",
     "new_memory_record",
+    "read_header",
+    "read_last_lines",
+    "read_last_valid_turn",
     "utc_now_ms",
 ]

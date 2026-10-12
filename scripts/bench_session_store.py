@@ -12,7 +12,8 @@
 - 每轮 user + assistant 各约 1200 字符(中文 UTF-8 约 3 字节/字符 → 2000 轮 ≈ 15MB);
 - ``load_recent(max_turns=50, max_chars=120000)`` 后再做一次 ``to_llm_message()`` 投影
   (与 ``ConversationService._load_history`` 同口径);
-- 每个指标采样 ``--samples`` 次(默认 20), 输出 avg / p95(ms), 并与 §2.1 基线对照。
+- 每个指标采样 ``--samples`` 次(默认 20), 输出 avg / p95(ms), 并与 §2.1 基线对照;
+- 额外测量 ``list_sessions``(A2 验收项: 每会话只读 header + 末条有效 turn)。
 
 实现说明: 生成阶段用 ``append_turn`` 逐轮写入(与真实路径同 schema);
 测量阶段换一个**全新 store 实例**(指标从零开始, 不含生成阶段噪声)。
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from meowmeowclaw.memory import JsonlSessionStore, SessionKey, SessionMessage
+from meowmeowclaw.memory.metrics import LatencyStats, measure as measure_latency
 
 # §2.1 基线: 轮数 -> (load_recent avg_ms, p95_ms)
 BASELINE_LOAD_RECENT: dict[int, tuple[float, float]] = {
@@ -84,7 +86,14 @@ async def measure(
             await store.get_meta(key)
         for _ in range(samples):
             await store.append_turn(key, build_turn(0))
-        return dict(store.stats()["metrics"])
+        metrics = dict(store.stats()["metrics"])
+        # list_sessions 不在 store.metrics 的三项主路径里, 单独采样(A2 验收项)
+        list_stats = LatencyStats()
+        for _ in range(samples):
+            with measure_latency(list_stats):
+                await store.list_sessions(include_archived=True)
+        metrics["list_sessions"] = list_stats.snapshot()
+        return metrics
     finally:
         await store.close()
 
@@ -120,7 +129,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     header = (
         f"{'轮数':>6}  {'文件':>9}  {'生成':>7}  "
         f"{'load_recent avg/p95':>21}  {'get_meta avg/p95':>18}  "
-        f"{'append_turn avg/p95':>21}  {'§2.1 基线':>13}  {'偏差':>8}"
+        f"{'append_turn avg/p95':>21}  {'list_sessions avg/p95':>22}  "
+        f"{'§2.1 基线':>13}  {'偏差':>8}"
     )
     print(header)
     print("-" * len(header))
@@ -157,6 +167,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"{format_cell(metrics['load_recent']):>21}  "
             f"{format_cell(metrics['get_meta']):>18}  "
             f"{format_cell(metrics['append_turn']):>21}  "
+            f"{format_cell(metrics['list_sessions']):>22}  "
             f"{baseline_text:>13}  {deviation_text:>8}"
         )
 

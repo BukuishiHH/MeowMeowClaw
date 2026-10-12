@@ -9,7 +9,7 @@ from meowmeowclaw.memory import SessionKey
 
 
 class StubConversation:
-    """替代 ConversationService: 记录调用并返回可控结果(可延迟/抛错)."""
+    """替代 ConversationService: 记录调用并返回可控结果(可延迟/抛错/吐流式增量)."""
 
     def __init__(
         self,
@@ -19,16 +19,29 @@ class StubConversation:
         error: Optional[BaseException] = None,
         completed: bool = True,
         persisted: bool = True,
+        deltas: Optional[list[str]] = None,
     ) -> None:
         self.answer = answer
         self.delay = delay
         self.error = error
         self.completed = completed
         self.persisted = persisted
+        # None 表示"把整段回答作为单个增量"; [] 表示不吐任何增量
+        self.deltas = [answer] if deltas is None else list(deltas)
         self.calls: list[dict[str, Any]] = []
 
-    async def handle_message(self, key: SessionKey, text: str, *, meta: Optional[dict] = None):
-        self.calls.append({"key": key, "text": text, "meta": meta})
+    async def handle_message(
+        self,
+        key: SessionKey,
+        text: str,
+        *,
+        meta: Optional[dict] = None,
+        on_delta: Optional[Any] = None,
+    ):
+        self.calls.append({"key": key, "text": text, "meta": meta, "on_delta": on_delta})
+        if on_delta is not None:
+            for part in self.deltas:
+                await on_delta(part)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error is not None:

@@ -37,12 +37,13 @@ from meowmeowclaw.gateway import Envelope, MessageBus
 
 from .base import IncomingMessage
 from .qq_adapter import QqAdapter
+from .streaming import DEFAULT_MAX_TEXT_CHARS, chunk_text
 
 logger = logging.getLogger(__name__)
 
 POST_TYPE_MESSAGE = "message"
 MESSAGE_TYPE_PRIVATE = "private"
-DEFAULT_MAX_TEXT_CHARS = 3000
+# DEFAULT_MAX_TEXT_CHARS 由 channels/streaming.py 唯一定义并在此再导出
 DEFAULT_ACTION_TIMEOUT = 10.0
 DEFAULT_RECONNECT_MIN = 1.0
 DEFAULT_RECONNECT_MAX = 30.0
@@ -166,15 +167,6 @@ def event_to_incoming(
         message_id=None if message_id is None else str(message_id),
         received_at_ms=_to_ms(payload.get("time")),
     )
-
-
-def chunk_text(text: str, max_chars: int = DEFAULT_MAX_TEXT_CHARS) -> list[str]:
-    """按字符数切分长文本(超长回复分片发送); ``max_chars<=0`` 时不切分."""
-    if not text:
-        return []
-    if max_chars <= 0 or len(text) <= max_chars:
-        return [text]
-    return [text[start : start + max_chars] for start in range(0, len(text), max_chars)]
 
 
 class OneBot11Transport:

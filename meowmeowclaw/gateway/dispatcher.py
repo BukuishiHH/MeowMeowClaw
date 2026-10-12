@@ -8,11 +8,17 @@
 import asyncio
 import contextlib
 import logging
-from typing import Mapping, Optional
+from typing import Awaitable, Callable, Mapping, Optional
 
 from .bus import INBOUND, GatewayClosedError, MessageBus, outbound_queue
 from .dedup import DedupCache
-from .envelope import Envelope
+from .envelope import (
+    STREAM_PHASE_DELTA,
+    STREAM_PHASE_END,
+    STREAM_PHASE_START,
+    Envelope,
+    make_stream_event,
+)
 from .policy import ACTION_AGENT, ACTION_IGNORE, ACTION_REPLY, ChannelPolicy, PolicyDecision
 from .worker import AgentWorker
 
@@ -33,6 +39,7 @@ class GatewayDispatcher:
         dedup: Optional[DedupCache] = None,
         max_inflight: int = GATEWAY_MAX_INFLIGHT,
         shutdown_timeout: float = 10.0,
+        stream_enabled: bool = False,
     ) -> None:
         if not isinstance(max_inflight, int) or isinstance(max_inflight, bool) or max_inflight <= 0:
             raise ValueError(f"max_inflight 必须是正整数: {max_inflight!r}")
@@ -47,6 +54,8 @@ class GatewayDispatcher:
         self.dedup = dedup or DedupCache()
         self.max_inflight = max_inflight
         self.shutdown_timeout = float(shutdown_timeout)
+        # 流式总开关: false 时不产生任何 KIND_STREAM 信封, 也不给 worker 传 on_delta(零回归)
+        self.stream_enabled = bool(stream_enabled)
         self._semaphore = asyncio.Semaphore(max_inflight)
         self._inflight: set[asyncio.Task] = set()
         self._task: Optional[asyncio.Task] = None
@@ -55,7 +64,8 @@ class GatewayDispatcher:
     def __repr__(self) -> str:
         return (
             f"<GatewayDispatcher policies={sorted(self.policies)} "
-            f"inflight={len(self._inflight)} running={self._task is not None}>"
+            f"inflight={len(self._inflight)} running={self._task is not None} "
+            f"stream={self.stream_enabled}>"
         )
 
     @property
@@ -167,27 +177,80 @@ class GatewayDispatcher:
         target = envelope.target_channel or envelope.channel
         await self.bus.publish(outbound_queue(target), envelope)
 
+    # ------------------------------------------------------------------ 流式(S2)
+
     async def _spawn_agent(self, request: Envelope, decision: PolicyDecision) -> None:
         await self._semaphore.acquire()
+        on_delta: Optional[Callable[[str], Awaitable[None]]] = None
+        if self.stream_enabled:
+            # start 只是"即将开始生成"的提示(如 QQ 正在输入), 失败不影响本轮
+            await self._publish_stream_safe(request, STREAM_PHASE_START)
+            on_delta = self._make_delta_sink(request)
         task = asyncio.create_task(
-            self._handle_agent(request, decision),
+            self._handle_agent(request, decision, on_delta=on_delta),
             name=f"gateway-agent-{request.channel}-{request.message_id[:8]}",
         )
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
 
-    async def _handle_agent(self, request: Envelope, decision: PolicyDecision) -> None:
+    def _make_delta_sink(self, request: Envelope) -> Callable[[str], Awaitable[None]]:
+        """构造 per-request 的增量回调(带单调 seq, 便于排障与乱序断言)."""
+        seq = 0
+
+        async def on_delta(text: str) -> None:
+            nonlocal seq
+            seq += 1
+            await self._publish_delta(request, text, seq)
+
+        return on_delta
+
+    async def _publish_delta(self, request: Envelope, text: str, seq: int) -> None:
+        """delta 走 best-effort: 队列满/总线关闭直接丢弃, 不写死信, 不影响本轮."""
+        envelope = make_stream_event(request, phase=STREAM_PHASE_DELTA, text=text, seq=seq)
+        target = outbound_queue(envelope.target_channel or envelope.channel)
         try:
-            reply = await self.worker.handle(request, decision)
-            await self._publish_outbound(reply)
-        except asyncio.CancelledError:
-            raise
-        # G10: 内部异常只日志, 不回错误文案
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Agent 处理失败(仅日志, 不回错误文案): channel=%s id=%s",
-                request.channel,
-                request.message_id,
-            )
+            publish_best_effort = getattr(self.bus, "publish_best_effort", None)
+            if publish_best_effort is not None:
+                await publish_best_effort(target, envelope)
+            else:  # 自定义总线未实现 best-effort 时退化为普通发布
+                await self.bus.publish(target, envelope)
+        except GatewayClosedError:
+            logger.debug("总线已关闭, 丢弃流式增量: correlation=%s", envelope.correlation_id)
+
+    async def _publish_stream(self, request: Envelope, phase: str) -> None:
+        """start/end 相位: 与 reply 同级别的强语义."""
+        await self._publish_outbound(make_stream_event(request, phase=phase))
+
+    async def _publish_stream_safe(self, request: Envelope, phase: str) -> None:
+        try:
+            await self._publish_stream(request, phase)
+        except Exception:  # noqa: BLE001 控制相位失败只告警, 不能影响 reply
+            logger.exception("流式 %s 相位发布失败(已忽略): id=%s", phase, request.message_id)
+
+    async def _handle_agent(
+        self,
+        request: Envelope,
+        decision: PolicyDecision,
+        *,
+        on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
+    ) -> None:
+        try:
+            reply: Optional[Envelope] = None
+            try:
+                reply = await self.worker.handle(request, decision, on_delta=on_delta)
+            except asyncio.CancelledError:
+                raise
+            # G10: 内部异常只日志, 不回错误文案
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Agent 处理失败(仅日志, 不回错误文案): channel=%s id=%s",
+                    request.channel,
+                    request.message_id,
+                )
+            if self.stream_enabled:
+                # end 必须在 reply 之前: 渠道据此停止"正在输入"等状态
+                await self._publish_stream_safe(request, STREAM_PHASE_END)
+            if reply is not None:
+                await self._publish_outbound(reply)
         finally:
             self._semaphore.release()

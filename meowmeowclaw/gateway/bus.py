@@ -37,6 +37,15 @@ class MessageBus(Protocol):
         """入队; 背压超时返回 False(消息进死信)."""
         ...
 
+    async def publish_best_effort(
+        self, queue_key: str, envelope: Envelope, timeout: float = 0.5
+    ) -> bool:
+        """尽力投递(流式 delta 专用): 超时/关闭直接丢弃, **不写死信**.
+
+        队列满时宁可丢 delta 也不阻塞 Agent 主循环, 也从根上避免流式把死信队列刷爆。
+        """
+        ...
+
     async def get(self, queue_key: str) -> Envelope:
         """阻塞取出一条消息; 总线关闭时抛 :class:`GatewayClosedError`."""
         ...
@@ -149,6 +158,28 @@ class AsyncioQueueBus:
             if item is _CLOSE:
                 raise GatewayClosedError("消息总线已关闭")
             return item
+
+    async def publish_best_effort(
+        self, queue_key: str, envelope: Envelope, timeout: float = 0.5
+    ) -> bool:
+        """流式 delta 的尽力投递: 超时丢弃且**不进死信**(见 docs/STREAMING_DESIGN.md §4.5)."""
+        if self._closed:
+            return False
+        try:
+            queue = self._queue(queue_key)
+        except GatewayClosedError:  # pragma: no cover - 与上一行的竞态兜底
+            return False
+        try:
+            await asyncio.wait_for(queue.put(envelope), timeout=float(timeout))
+        except asyncio.TimeoutError:
+            logger.debug(
+                "流式 delta 背压超时(%.1fs), 已丢弃: queue=%s seq=%s",
+                timeout,
+                queue_key,
+                envelope.delta_seq,
+            )
+            return False
+        return True
 
     def task_done(self, queue_key: str) -> None:
         queue = self._queues.get(queue_key)

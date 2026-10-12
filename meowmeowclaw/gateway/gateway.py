@@ -34,6 +34,7 @@ class Gateway:
         shutdown_timeout: float = 10.0,
         max_inflight: int = GATEWAY_MAX_INFLIGHT,
         deadletter_max_keep: int = 128,
+        stream_enabled: bool = False,
     ) -> None:
         self.shutdown_timeout = float(shutdown_timeout)
         self.bus: MessageBus = bus or AsyncioQueueBus(
@@ -49,6 +50,7 @@ class Gateway:
             dedup=dedup,
             max_inflight=max_inflight,
             shutdown_timeout=self.shutdown_timeout,
+            stream_enabled=stream_enabled,
         )
         self._adapters: dict[str, ChannelAdapter] = {}
         self._started = False
@@ -78,6 +80,7 @@ class Gateway:
             "inflight": self.dispatcher.inflight_count,
             "queue_sizes": sizes,
             "deadletter_count": deadletter,
+            "stream_enabled": self.dispatcher.stream_enabled,
         }
 
     def register(self, adapter: ChannelAdapter) -> ChannelAdapter:

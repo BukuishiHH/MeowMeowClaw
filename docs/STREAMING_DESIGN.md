@@ -425,7 +425,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 
 | 里程碑 | 状态 | 提交 | 完成日期 | 备注 |
 |---|---|---|---|---|
-| S1 流式地基 | 未开始 | — | — | — |
+| S1 流式地基 | 已完成 | 待回填 | 2026-10-12 | 新增 31 用例；全量 1127 passed |
 | S2 网关流式通道 | 未开始 | — | — | — |
 | S3 CLI 流式 | 未开始 | — | — | — |
 | S4 QQ typing | 未开始 | — | — | 依赖真机验证 `event_type` |
@@ -531,7 +531,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 
 | 里程碑 | 提交 | 日期 | 关键变更 | 回归 |
 |---|---|---|---|---|
-| S1 | — | — | — | — |
+| S1 | 待回填 | 2026-10-12 | `llm/base.py` 流式事件与默认回退；`openai_compat.chat_stream`（tool_calls 分片/usage/空流回退/中断保文本/400 重试）；`AgentLoop.run_turn(on_delta)` + 工具轮前导抑制；`ConversationService` 透传；新增 `tests/test_stream_llm.py`(17) / `tests/agent/test_loop_stream.py`(11) / `tests/test_conversation.py`(3) | ruff 通过；1127 passed / 6 skipped / 2 xfailed（基线 1096） |
 | S2 | — | — | — | — |
 | S3 | — | — | — | — |
 | S4 | — | — | — | — |

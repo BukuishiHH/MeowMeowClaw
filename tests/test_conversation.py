@@ -17,7 +17,14 @@ from unittest.mock import MagicMock
 from meowmeowclaw.agent.context import ContextBuilder
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.conversation import ConversationService
-from meowmeowclaw.llm.base import FINISH_REASON_ERROR, FINISH_REASON_STOP, LLMProvider, LLMResponse
+from meowmeowclaw.llm.base import (
+    FINISH_REASON_ERROR,
+    FINISH_REASON_STOP,
+    LLMProvider,
+    LLMResponse,
+    StreamFinal,
+    StreamTextDelta,
+)
 from meowmeowclaw.memory import JsonlSessionStore, SessionKey, SessionStoreError
 from meowmeowclaw.tools.registry import ToolRegistry
 
@@ -333,3 +340,87 @@ class TestPassthrough:
         )
 
         assert "ConversationService" in repr(service)
+
+
+# ------------------------------------------------------------ 流式回调透传(S1)
+
+
+class StreamingScriptedProvider(LLMProvider):
+    """只实现流式接口的替身: 证明 on_delta 确实穿透到 AgentLoop 的流式路径."""
+
+    def __init__(self, parts: list[str]) -> None:
+        self.parts = parts
+        self.stream_calls = 0
+        self.chat_calls = 0
+
+    async def chat(self, messages, tools=None, model=None, max_tokens=None) -> LLMResponse:
+        self.chat_calls += 1
+        raise AssertionError("传了 on_delta 时不应走非流式 chat()")
+
+    async def chat_stream(self, messages, tools=None, model=None, max_tokens=None):
+        self.stream_calls += 1
+        for part in self.parts:
+            yield StreamTextDelta(part)
+        yield StreamFinal(
+            LLMResponse(content="".join(self.parts), finish_reason=FINISH_REASON_STOP)
+        )
+
+
+class DualScriptedProvider(StreamingScriptedProvider):
+    """两条路径都实现: 用于断言 on_delta=None 时绝不走流式."""
+
+    async def chat(self, messages, tools=None, model=None, max_tokens=None) -> LLMResponse:
+        self.chat_calls += 1
+        return LLMResponse(content="".join(self.parts), finish_reason=FINISH_REASON_STOP)
+
+
+class TestStreamingPassthrough:
+    @pytest.mark.asyncio
+    async def test_on_delta_receives_streamed_answer_and_turn_persists(self, tmp_path):
+        provider = StreamingScriptedProvider(["流式", "回答"])
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(provider)
+        )
+        chunks: list[str] = []
+
+        async def on_delta(text: str) -> None:
+            chunks.append(text)
+
+        result = await service.handle_message(cli_key(), "问题", on_delta=on_delta)
+
+        assert provider.stream_calls == 1
+        assert result.answer == "流式回答"
+        assert result.completed is True
+        assert result.persisted is True
+        # 宽限内结束的短回答: 结束时一次性补发, 且是最终文本的前缀
+        assert chunks == ["流式回答"]
+        assert result.answer.startswith("".join(chunks))
+
+    @pytest.mark.asyncio
+    async def test_on_delta_none_keeps_non_streaming_path(self, tmp_path):
+        provider = DualScriptedProvider(["非流式回答"])
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(provider)
+        )
+
+        result = await service.handle_message(cli_key(), "问题")
+
+        assert result.answer == "非流式回答"
+        assert provider.chat_calls == 1
+        assert provider.stream_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_on_delta_failure_does_not_break_result(self, tmp_path):
+        provider = StreamingScriptedProvider(["照常回答"])
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(provider)
+        )
+
+        async def broken_on_delta(text: str) -> None:
+            raise RuntimeError("渲染层故障")
+
+        result = await service.handle_message(cli_key(), "问题", on_delta=broken_on_delta)
+
+        assert result.answer == "照常回答"
+        assert result.completed is True
+        assert result.persisted is True

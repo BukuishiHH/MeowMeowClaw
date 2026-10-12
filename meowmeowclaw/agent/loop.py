@@ -14,10 +14,11 @@
     print(await loop.run("帮我看下 README"))
 """
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from meowmeowclaw.agent.compression import ContextCompressor
 from meowmeowclaw.agent.context import ContextBuilder
@@ -26,10 +27,20 @@ from meowmeowclaw.llm.base import (
     FINISH_REASON_STOP,
     LLMProvider,
     LLMResponse,
+    StreamFinal,
+    StreamTextDelta,
 )
 from meowmeowclaw.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# 流式增量回调: 渲染层实现(CLI 打印 / QQ 分段); 失败只告警, 不影响本轮结果
+DeltaCallback = Callable[[str], Awaitable[None]]
+
+# 工具轮"前导文本"抑制宽限(见 docs/STREAMING_DESIGN.md §4.3):
+# 缓冲达到任一阈值且未发现 tool_calls 才放行, 避免"我先查一下…"之类旁白变成气泡
+DEFAULT_PREAMBLE_GRACE_MS = 1500
+DEFAULT_PREAMBLE_GRACE_CHARS = 40
 
 # 未显式注入时的兜底迭代上限(生产路径由装配层传入 config.max_iterations)
 DEFAULT_MAX_ITERATIONS = 32
@@ -103,6 +114,10 @@ class AgentLoop:
         model: Optional[str] = None,
         max_iterations: Optional[int] = None,
         compressor: Optional[ContextCompressor] = None,
+        *,
+        stream_preamble_grace_ms: int = DEFAULT_PREAMBLE_GRACE_MS,
+        stream_preamble_grace_chars: int = DEFAULT_PREAMBLE_GRACE_CHARS,
+        suppress_tool_preamble: bool = True,
     ) -> None:
         self.provider = provider
         self.tools = tools
@@ -110,6 +125,10 @@ class AgentLoop:
         self.model = model
         # 可选: 每次 provider.chat 前把事实源投影成压缩后的请求视图; None 表示不压缩
         self.compressor = compressor
+        # 流式前导抑制参数(见 docs/STREAMING_DESIGN.md §4.3)
+        self.stream_preamble_grace_ms = max(0, int(stream_preamble_grace_ms))
+        self.stream_preamble_grace_chars = max(0, int(stream_preamble_grace_chars))
+        self.suppress_tool_preamble = bool(suppress_tool_preamble)
         # 未显式注入时使用模块兜底值; 生产路径由 bootstrap.build_application 传入配置值
         self.max_iterations = (
             DEFAULT_MAX_ITERATIONS if max_iterations is None else max_iterations
@@ -141,6 +160,7 @@ class AgentLoop:
         user_message: str,
         *,
         history: Optional[list[dict[str, Any]]] = None,
+        on_delta: Optional[DeltaCallback] = None,
     ) -> AgentTurn:
         """
         跑完一轮对话, 返回 :class:`AgentTurn`
@@ -149,6 +169,9 @@ class AgentLoop:
         :param history: 外部历史快照(OpenAI messages, 不含 system);
             None 表示使用并更新实例内 ``_session_history``(兼容旧用法);
             传入列表时不修改入参, 也不写入实例历史(由调用方负责持久化)
+        :param on_delta: 可选的流式增量回调; None(默认)时**完全走非流式路径**,
+            行为与现状逐字节一致; 传入时该轮改用 ``provider.chat_stream()``,
+            并把"最终回答"的文本增量交给回调(工具轮旁白按 §4.3 策略抑制)
         :return: 完整轮次结果; 出错/熔断/超限时 ``completed=False``
         """
         use_internal_history = history is None
@@ -186,8 +209,10 @@ class AgentLoop:
                         iterations=iterations,
                         completed=False,
                     )
-            response = await self.provider.chat(
-                request_messages, tools=tool_defs, model=self.model
+            response = (
+                await self.provider.chat(request_messages, tools=tool_defs, model=self.model)
+                if on_delta is None
+                else await self._chat_streaming(request_messages, tool_defs, on_delta)
             )
 
             # Provider 层已把异常包装成 finish_reason="error" 的响应
@@ -256,6 +281,90 @@ class AgentLoop:
             iterations=iterations,
             completed=False,
         )
+
+    # ------------------------------------------------------------------ 流式
+
+    async def _chat_streaming(
+        self,
+        messages: list[dict[str, Any]],
+        tool_defs: list[dict[str, Any]],
+        on_delta: DeltaCallback,
+    ) -> LLMResponse:
+        """走 Provider 流式接口, 只把"最终回答"的增量外发(工具轮旁白按策略抑制).
+
+        见 docs/STREAMING_DESIGN.md §4.3:
+        - 文本增量先进入缓冲, 达到宽限(字符数或时间)且未发现 tool_calls 才放行;
+        - 一旦发现 tool_calls, 未放行的缓冲直接丢弃; 已放行的保留(QQ 无法编辑, 记为已知残余风险);
+        - 短回答在宽限内就结束: 结束时一次性补发;
+        - 回调异常不影响本轮结果(渲染层失败不允许炸穿 Agent).
+        """
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        buffer: list[str] = []
+        released = False
+        tool_seen = False
+        response: Optional[LLMResponse] = None
+
+        try:
+            stream = self.provider.chat_stream(messages, tools=tool_defs, model=self.model)
+            async for event in stream:
+                if isinstance(event, StreamTextDelta):
+                    if tool_seen:
+                        continue
+                    if released:
+                        await self._emit(on_delta, event.text)
+                        continue
+                    buffer.append(event.text)
+                    pending = "".join(buffer)
+                    grace_over = (
+                        len(pending) >= self.stream_preamble_grace_chars
+                        or (loop.time() - started_at) * 1000 >= self.stream_preamble_grace_ms
+                    )
+                    if not self.suppress_tool_preamble or grace_over:
+                        released = True
+                        buffer.clear()
+                        await self._emit(on_delta, pending)
+                    continue
+                if isinstance(event, StreamFinal):
+                    response = event.response
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 流式实现抛异常: 回退非流式, 保证本轮可用
+            logger.warning("流式调用失败, 回退非流式: %r", exc)
+            return await self.provider.chat(messages, tools=tool_defs, model=self.model)
+
+        if response is None:  # pragma: no cover - Provider 契约保证最终必出 StreamFinal
+            logger.warning("流式调用未返回最终结果, 回退非流式")
+            return await self.provider.chat(messages, tools=tool_defs, model=self.model)
+
+        if response.has_tool_calls:
+            if released:
+                logger.warning(
+                    "流式前导文本已外发后才出现工具调用(QQ 侧无法编辑, 属已知残余风险): chars=%d",
+                    len(response.content or ""),
+                )
+            else:
+                buffer.clear()  # 未外发的旁白丢弃
+        elif not released and buffer:
+            # 宽限期内就结束的短回答: 此时补发, 保证内容不丢
+            pending = "".join(buffer)
+            buffer.clear()
+            released = True
+            await self._emit(on_delta, pending)
+
+        return response
+
+    @staticmethod
+    async def _emit(on_delta: DeltaCallback, text: str) -> None:
+        """外发一段增量; 渲染侧任何异常只告警(不允许影响本轮结果)."""
+        if not text:
+            return
+        try:
+            await on_delta(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("流式增量外发失败(已忽略): chars=%d", len(text))
 
     # ------------------------------------------------------------------ 防爆检测
 

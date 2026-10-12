@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional, Union
 
 # finish_reason 取值约定: 前四个与 OpenAI Chat Completions 协议保持字面一致,
 # Provider 层因此可以原样透传上游返回值, 上层统一引用下列常量而不是硬编码字符串
@@ -44,6 +44,24 @@ class LLMResponse:
         """是否存在工具调用"""
         return len(self.tool_calls) > 0
 
+
+@dataclass(frozen=True)
+class StreamTextDelta:
+    """流式文本增量(仅 content; reasoning_content 永不出现在这里, 见设计 §5 I6)."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamFinal:
+    """流式结束: 复用非流式的 LLMResponse(含 tool_calls / finish_reason / usage)."""
+
+    response: LLMResponse
+
+
+StreamEvent = Union[StreamTextDelta, StreamFinal]
+
+
 class LLMProvider(ABC):
     """
     LLM提供者抽象基类
@@ -66,3 +84,22 @@ class LLMProvider(ABC):
         :return: LLMResponse 统一封装结果
         """
         ...
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        流式对话(可选能力): 逐条产出 :class:`StreamTextDelta`, 结束时产出一个 :class:`StreamFinal`.
+
+        默认实现直接调用 :meth:`chat`, 只吐一个 final ——
+        未覆写本方法的 Provider(含测试替身)自动降级为"非流式", 契约不破坏.
+        ``max_tokens=None`` 时不传该参数, 兼容只实现三参数旧签名的自定义 Provider。
+        """
+        kwargs: dict[str, Any] = {"tools": tools, "model": model}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        yield StreamFinal(await self.chat(messages, **kwargs))

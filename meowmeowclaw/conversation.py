@@ -12,7 +12,7 @@ SessionManager; 本服务只接受已经解析好的 ``SessionKey``。
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from meowmeowclaw.agent.loop import AgentLoop, AgentTurn
 from meowmeowclaw.memory import (
@@ -111,6 +111,7 @@ class ConversationService:
         user_message: str,
         *,
         meta: Optional[dict] = None,
+        on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> ConversationResult:
         """
         处理一条用户消息: 装载历史 → 跑一轮 → 完整则回写.
@@ -118,6 +119,8 @@ class ConversationService:
         :param key: 已解析好的会话键
         :param user_message: 用户输入(非空字符串)
         :param meta: 追加到 turn 的元数据(如 channel/sender_id)
+        :param on_delta: 可选的流式增量回调, 透传给 ``AgentLoop.run_turn``;
+            None(默认)时完全走非流式路径, 行为与现状一致
         :return: ConversationResult; 记忆故障时 ``persisted=False`` 但仍返回回答
         """
         if not isinstance(key, SessionKey):
@@ -128,7 +131,7 @@ class ConversationService:
         async with self._lock_for(key.storage_id):
             history = await self._load_history(key)
             agent = self._agent_for(key)
-            turn = await agent.run_turn(user_message, history=history)
+            turn = await agent.run_turn(user_message, history=history, on_delta=on_delta)
 
             persisted = False
             if turn.completed and turn.messages:

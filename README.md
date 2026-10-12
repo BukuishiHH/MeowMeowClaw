@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 47 个源码模块 / 约 10310 行; 测试 47 个文件 / **1252 个用例**(1244 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 48 个源码模块 / 约 10570 行; 测试 49 个文件 / **1280 个用例**(1272 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -265,7 +265,8 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/skills/tool.py` | 85 | `load_skill` 工具(技能子系统对 Agent 的唯一出口) | `LoadSkillTool` |
 | `meowmeowclaw/memory/models.py` | 381 | 会话数据模型 + `MemoryRecord`(结构化长期记忆) | `SessionKey` / `SessionMessage` / `MemoryRecord` / `new_memory_record` |
 | `meowmeowclaw/memory/store.py` | 96 | 仓储抽象: `SessionStore` + `LongTermStore`(async Protocol) | `SessionStore` / `LongTermStore` |
-| `meowmeowclaw/memory/jsonl.py` | 535 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行 | `JsonlSessionStore` |
+| `meowmeowclaw/memory/jsonl.py` | 615 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行; A1 加三项主路径计时与 `stats()` | `JsonlSessionStore` |
+| `meowmeowclaw/memory/metrics.py` | 126 | **A+ A1 指标**: 有界延迟样本(count/avg/p50/p95)、三项主路径、`measure()` 计时 | `LatencyStats` / `StoreMetrics` |
 | `meowmeowclaw/memory/noop.py` | 42 | 长期记忆占位实现(v1 由 MEMORY.md 承担) | `NoopLongTermStore` |
 | `meowmeowclaw/memory/filelock.py` | 110 | 跨进程 advisory 文件锁(flock/msvcrt) | `FileLock` / `async_file_lock` |
 | `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
@@ -574,9 +575,11 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 MeowMeowClaw/
 ├── .env / .env.example          # 配置与模板(密钥不入库)
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
+├── scripts/                     # 人工验收脚本(不进 CI)
+│   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 47 个测试文件 / 1252 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 49 个测试文件 / 1280 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -600,6 +603,7 @@ MeowMeowClaw/
     │   ├── tool.py              # load_skill 工具(子系统唯一出口)
     │   └── builtin/             # 6 个内置技能(每子目录一个 SKILL.md, 随包发布)
     ├── memory/                  # 短期记忆(v1: SessionStore + JSONL)
+    │   ├── metrics.py           # A+ A1: 会话 IO 延迟指标(有界样本/分位) + 计时上下文
     │   ├── models.py            # SessionKey / SessionMessage / MemoryRecord
     │   ├── store.py             # SessionStore + LongTermStore 抽象接口
     │   ├── jsonl.py             # JsonlSessionStore 实现

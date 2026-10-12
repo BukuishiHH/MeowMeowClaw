@@ -19,15 +19,18 @@ from .models import (
     new_memory_record,
     utc_now_ms,
 )
+from .metrics import DEFAULT_MAX_SAMPLES, LatencyStats, StoreMetrics
 from .noop import NoopLongTermStore
 from .store import LongTermStore, SessionStore
 
 __all__ = [
+    "DEFAULT_MAX_SAMPLES",
     "DEFAULT_MAX_TOOL_RESULT_CHARS",
     "MIN_SHORT_ID_LENGTH",
     "TOOL_RESULT_TRUNCATE_NOTICE",
     "InvalidSessionKeyError",
     "JsonlSessionStore",
+    "LatencyStats",
     "LongTermStore",
     "MemoryRecord",
     "MemoryStoreError",
@@ -38,6 +41,7 @@ __all__ = [
     "SessionStore",
     "SessionStoreError",
     "SessionSummary",
+    "StoreMetrics",
     "ms_to_iso",
     "new_memory_record",
     "utc_now_ms",

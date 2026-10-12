@@ -1,7 +1,7 @@
 # MeowMeowClaw A+ 优化设计：会话 IO 尾读与运行时生命周期（v1）
 
-> 状态：**设计已确认（全部默认），待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
-> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进。
+> 状态：**A1 已完成（2026-10-12），A2–A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
+> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1。
 > 关联：`docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5、`meowmeowclaw/memory/jsonl.py`、
 > `meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`。
 
@@ -294,7 +294,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 
 ## 7. 验收清单
 
-- [ ] A1：`stats()` 可用；基准脚本输出与 §2.1 一致；
+- [x] A1：`stats()` 可用；基准脚本输出与 §2.1 一致（实测偏差 ≤11%，见 §8.1）；
 - [ ] A2：`get_meta/append_turn/list_sessions` 尾读路径通过全部契约与崩溃恢复用例；
 - [ ] A3：2000 轮 `load_recent` p95 ≤3ms 且平坦；差分测试通过；
 - [ ] A4：`close_session/evict_idle/max_cached_sessions` 可用；归档/轮换/关停可释放；无并发回归；
@@ -307,8 +307,37 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 
 | 阶段 | 状态 | 提交 | 备注 |
 |---|---|---|---|
-| A1 | 待实现 | — | — |
-| A2 | 待实现 | — | — |
-| A3 | 待实现 | — | — |
-| A4 | 待实现 | — | — |
-| A5 | 待实现 | — | — |
+| A1 | 已完成 | 待回填 | metrics + `stats()` + 基准脚本；新增 22 用例；实测偏差 ≤11% |
+| A2 | 待实现 | — | 依赖 A1 |
+| A3 | 待实现 | — | 依赖 A2 |
+| A4 | 待实现 | — | 依赖 A1（可与 A2/A3 并行） |
+| A5 | 待实现 | — | 依赖 A3+A4 |
+
+### 8.1 A1 实现记录（2026-10-12）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/memory/metrics.py` | 新增：`LatencyStats`（有界样本 count/last/avg/p50/p95，最近秩分位）、`StoreMetrics`（三项主路径）、`measure()` 计时上下文管理器 |
+| `meowmeowclaw/memory/jsonl.py` | `load_recent / get_meta / append_turn` 拆为"公开计时 wrapper + 私有实现"；新增 `stats()`（指标快照 + `active_file_count` + `last_file_size_bytes`） |
+| `meowmeowclaw/memory/__init__.py` | 导出 `LatencyStats / StoreMetrics / DEFAULT_MAX_SAMPLES` |
+| `meowmeowclaw/conversation.py` | 新增 `ConversationService.stats()`（`cached_agents / locks / evictions / store / rss_mb`）与 `current_rss_mb()` |
+| `scripts/bench_session_store.py` | 新增：50/200/500/1000/2000 轮基准脚本（生成 + 三项主路径 avg/p95，输出与 §2.1 对照），不进 CI |
+| `tests/memory/test_metrics.py` / `test_jsonl_store_stats.py` / `tests/test_conversation.py` | 新增 22 用例（分位/有界/异常也记录/stats 契约/观测降级） |
+
+**基准复测（本机 WSL2 / Python 3.11 / 20 次采样）**
+
+| 轮数 | 文件 | `load_recent` avg/p95 (ms) | `get_meta` avg/p95 | `append_turn` avg/p95 | §2.1 基线 avg/p95 | 偏差 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 0.36 MB | 1.31 / 1.67 | 1.00 / 1.28 | 1.77 / 2.08 | 1.32 / 1.64 | **-1%** |
+| 200 | 1.42 MB | 4.15 / 5.00 | 3.23 / 3.92 | 4.21 / 4.71 | 3.99 / 4.40 | +4% |
+| 500 | 3.56 MB | 9.21 / 10.18 | 7.20 / 7.79 | 8.72 / 10.82 | 9.39 / 10.53 | -2% |
+| 1000 | 7.12 MB | 17.96 / 19.37 | 14.89 / 17.23 | 15.56 / 17.85 | 18.12 / 20.70 | -1% |
+| 2000 | 14.23 MB | 35.64 / 42.09 | 27.74 / 29.13 | 31.70 / 39.55 | 39.83 / 44.64 | **-11%** |
+
+- **结论**：全部落在 §2.1 基线的 ±20% 内，且再次印证 A+ 的目标 G1 —— `load_recent` 成本随总轮数线性增长
+  （50 轮 1.31ms → 2000 轮 35.64ms），A2/A3 之后应降到"与总长度解耦"；
+- 复现命令：`python scripts/bench_session_store.py`（可用 `--sizes/--samples/--keep` 调整）；
+- 观测入口：`JsonlSessionStore.stats()` 与 `ConversationService.stats()`（纯观测，取值失败自动降级为空/None）；
+- **行为零变化**：A1 只加计时与快照，未改任何读写路径、schema 与语义；全量回归通过。

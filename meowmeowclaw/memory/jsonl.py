@@ -25,6 +25,7 @@ from typing import Any, Optional, Sequence, Union
 
 from .errors import InvalidSessionKeyError, SessionStoreError
 from .filelock import async_file_lock
+from .metrics import StoreMetrics, measure
 from .models import (
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     MIN_SHORT_ID_LENGTH,
@@ -84,6 +85,9 @@ class JsonlSessionStore:
         self.lock_timeout = float(lock_timeout)
         self._locks: dict[str, asyncio.Lock] = {}
         self._closed = False
+        # A1: 三项主路径的延迟指标(纯观测, 见 memory/metrics.py)
+        self.metrics = StoreMetrics()
+        self._last_file_size_bytes: Optional[int] = None
         self._ensure_dirs()
 
     def __repr__(self) -> str:
@@ -270,6 +274,23 @@ class JsonlSessionStore:
         turn_id: Optional[str] = None,
         meta: Optional[dict] = None,
     ) -> SessionMeta:
+        """写入一轮会话(A1: 耗时记入 ``self.metrics``, 见 :meth:`stats`)."""
+        with measure(self.metrics.append_turn):
+            try:
+                return await self._append_turn_impl(
+                    key, messages, turn_id=turn_id, meta=meta
+                )
+            finally:
+                self._last_file_size_bytes = self._session_file_size(key)
+
+    async def _append_turn_impl(
+        self,
+        key: SessionKey,
+        messages: Sequence[SessionMessage],
+        *,
+        turn_id: Optional[str] = None,
+        meta: Optional[dict] = None,
+    ) -> SessionMeta:
         self._check_open()
         if not isinstance(key, SessionKey):
             raise SessionStoreError("key 必须是 SessionKey")
@@ -342,6 +363,22 @@ class JsonlSessionStore:
         max_turns: Optional[int] = None,
         max_chars: Optional[int] = None,
     ) -> list[SessionMessage]:
+        """装载最近窗口(A1: 耗时记入 ``self.metrics``, 见 :meth:`stats`)."""
+        with measure(self.metrics.load_recent):
+            try:
+                return await self._load_recent_impl(
+                    key, max_turns=max_turns, max_chars=max_chars
+                )
+            finally:
+                self._last_file_size_bytes = self._session_file_size(key)
+
+    async def _load_recent_impl(
+        self,
+        key: SessionKey,
+        *,
+        max_turns: Optional[int] = None,
+        max_chars: Optional[int] = None,
+    ) -> list[SessionMessage]:
         self._check_open()
         if not isinstance(key, SessionKey):
             raise SessionStoreError("key 必须是 SessionKey")
@@ -395,6 +432,14 @@ class JsonlSessionStore:
         return selected
 
     async def get_meta(self, key: SessionKey) -> Optional[SessionMeta]:
+        """读取会话元数据(A1: 耗时记入 ``self.metrics``, 见 :meth:`stats`)."""
+        with measure(self.metrics.get_meta):
+            try:
+                return await self._get_meta_impl(key)
+            finally:
+                self._last_file_size_bytes = self._session_file_size(key)
+
+    async def _get_meta_impl(self, key: SessionKey) -> Optional[SessionMeta]:
         self._check_open()
         if not isinstance(key, SessionKey):
             raise SessionStoreError("key 必须是 SessionKey")
@@ -529,6 +574,41 @@ class JsonlSessionStore:
                 await asyncio.to_thread(_purge)
             except OSError as exc:
                 raise SessionStoreError(f"删除会话失败: {key.canonical} ({exc!r})") from exc
+
+    def stats(self) -> dict[str, Any]:
+        """存储层观测快照(A1, 见 docs/A_PLUS_OPTIMIZATION.md §3.1).
+
+        ``{"metrics": {load_recent/get_meta/append_turn: {count,last,avg,p50,p95}},
+        "active_file_count": int, "last_file_size_bytes": int | None}``
+        """
+        return {
+            "metrics": self.metrics.snapshot(),
+            "active_file_count": self._count_active_files(),
+            "last_file_size_bytes": self._last_file_size_bytes,
+        }
+
+    def _count_active_files(self) -> int:
+        try:
+            return sum(1 for _ in self.sessions_dir.glob("*.jsonl"))
+        except OSError:  # pragma: no cover - 目录不可读时只影响观测
+            return 0
+
+    @staticmethod
+    def _file_size(path: Path) -> Optional[int]:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return None
+
+    def _session_file_size(self, key: Any) -> Optional[int]:
+        """最近一次读写命中的文件大小(活跃优先, 其次归档; 均不存在则 None)."""
+        if not isinstance(key, SessionKey):
+            return None
+        for path in (self._active_path(key), self._archive_path(key)):
+            size = self._file_size(path)
+            if size is not None:
+                return size
+        return None
 
     async def close(self) -> None:
         self._closed = True

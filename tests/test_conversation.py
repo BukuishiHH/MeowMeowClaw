@@ -424,3 +424,61 @@ class TestStreamingPassthrough:
         assert result.answer == "照常回答"
         assert result.completed is True
         assert result.persisted is True
+
+
+# ------------------------------------------------------------ A+ A1 观测
+
+
+class BrokenStatsStore(RecordingStore):
+    """store.stats() 抛异常: 观测失败必须降级, 不能影响主流程."""
+
+    def stats(self):
+        raise RuntimeError("stats boom")
+
+
+class TestConversationStats:
+    @pytest.mark.asyncio
+    async def test_stats_exposes_runtime_and_store(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider(["答"]))
+        )
+
+        await service.handle_message(cli_key(), "问题")
+        stats = service.stats()
+
+        assert stats["cached_agents"] == 1
+        assert stats["locks"] == 1
+        assert stats["evictions"] == 0
+        assert stats["store"]["metrics"]["load_recent"]["count"] == 1
+        assert stats["store"]["metrics"]["append_turn"]["count"] == 1
+        assert stats["store"]["active_file_count"] == 1
+        # RSS 只在支持的平台给值(Windows 为 None)
+        assert stats["rss_mb"] is None or stats["rss_mb"] > 0
+
+    @pytest.mark.asyncio
+    async def test_stats_counts_reset_after_close(self, tmp_path):
+        service = ConversationService(
+            JsonlSessionStore(tmp_path / "memory"), AgentFactory(ScriptedProvider(["答"]))
+        )
+        await service.handle_message(cli_key(), "问题")
+
+        await service.close()
+
+        assert service.stats()["cached_agents"] == 0
+        assert service.stats()["locks"] == 0
+
+    def test_stats_degrades_when_store_has_no_stats(self):
+        service = ConversationService(RecordingStore(), AgentFactory(ScriptedProvider()))
+
+        stats = service.stats()
+
+        assert stats["store"] == {}
+        assert stats["cached_agents"] == 0
+
+    def test_stats_degrades_when_store_stats_raises(self):
+        service = ConversationService(BrokenStatsStore(), AgentFactory(ScriptedProvider()))
+
+        stats = service.stats()
+
+        assert stats["store"] == {}
+        assert set(stats) == {"cached_agents", "locks", "evictions", "store", "rss_mb"}

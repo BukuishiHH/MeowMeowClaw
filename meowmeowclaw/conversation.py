@@ -11,8 +11,9 @@ SessionManager; 本服务只接受已经解析好的 ``SessionKey``。
 
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from meowmeowclaw.agent.loop import AgentLoop, AgentTurn
 from meowmeowclaw.memory import (
@@ -28,6 +29,25 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 50
 DEFAULT_MAX_CHARS = 120_000
+
+
+def current_rss_mb() -> Optional[float]:
+    """当前进程常驻内存峰值(MB); 平台不支持(如 Windows 无 ``resource``)时返回 None.
+
+    - Linux: ``ru_maxrss`` 单位 KB; macOS: 单位字节(见 ``sys.platform`` 分支);
+    - 只用于观测, 失败一律不影响主流程。
+    """
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows 无 resource 模块
+        return None
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:  # noqa: BLE001 观测失败不影响主流程
+        return None
+    if sys.platform == "darwin":
+        return round(value / (1024 * 1024), 2)
+    return round(value / 1024, 2)
 
 
 @dataclass(frozen=True)
@@ -69,6 +89,8 @@ class ConversationService:
         self._agents: dict[str, AgentLoop] = {}
         # storage_id -> 串行锁(装历史/跑模型/回写整段互斥)
         self._locks: dict[str, asyncio.Lock] = {}
+        # A1 观测: 会话运行时被淘汰的次数(A4 的生命周期 API 会递增)
+        self._evictions = 0
 
     def __repr__(self) -> str:
         return (
@@ -175,6 +197,29 @@ class ConversationService:
     async def purge_session(self, key: SessionKey) -> None:
         """``/clear --purge`` 对应的永久删除."""
         await self.store.purge(key)
+
+    def stats(self) -> dict[str, Any]:
+        """运行时观测快照(A1, 见 docs/A_PLUS_OPTIMIZATION.md §3.1).
+
+        ``{"cached_agents": int, "locks": int, "evictions": int,
+        "store": <SessionStore.stats() 或 {}>, "rss_mb": float | None}``
+
+        纯观测: 任何取值失败都只降级为 ``{}`` / ``None``, 不影响会话主流程。
+        """
+        store_stats: dict[str, Any] = {}
+        store_stats_fn = getattr(self.store, "stats", None)
+        if callable(store_stats_fn):
+            try:
+                store_stats = dict(store_stats_fn())
+            except Exception:  # noqa: BLE001 观测失败不影响主流程
+                logger.warning("读取 store.stats() 失败(已忽略)", exc_info=True)
+        return {
+            "cached_agents": len(self._agents),
+            "locks": len(self._locks),
+            "evictions": self._evictions,
+            "store": store_stats,
+            "rss_mb": current_rss_mb(),
+        }
 
     async def close(self) -> None:
         """释放会话缓存; store 的生命周期由调用方(组合根)负责."""

@@ -425,10 +425,10 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 
 | 里程碑 | 状态 | 提交 | 完成日期 | 备注 |
 |---|---|---|---|---|
-| S1 流式地基 | 已完成 | 待回填 | 2026-10-12 | 新增 31 用例；全量 1127 passed |
-| S2 网关流式通道 | 已完成 | 待回填 | 2026-10-12 | 新增 26 用例；全量 1153 passed |
-| S3 CLI 流式 | 已完成 | 待回填 | 2026-10-12 | 新增 15 用例；全量 1168 passed；管道冒烟通过 |
-| S4 QQ typing | 已完成 | 待回填 | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
+| S1 流式地基 | 已完成 | `1949b36` | 2026-10-12 | 新增 31 用例；全量 1127 passed |
+| S2 网关流式通道 | 已完成 | `4ee4f19` | 2026-10-12 | 新增 26 用例；全量 1153 passed |
+| S3 CLI 流式 | 已完成 | `740b673` | 2026-10-12 | 新增 15 用例；全量 1168 passed；管道冒烟通过 |
+| S4 QQ typing | 已完成 | `e87ed37` | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
 | S5 QQ block | 待排期 | — | — | S1–S4 真机验证通过后决定 |
 | S6 收尾 | 待排期 | — | — | 文档/冒烟随 S1–S4 增量同步 |
 
@@ -531,10 +531,10 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 
 | 里程碑 | 提交 | 日期 | 关键变更 | 回归 |
 |---|---|---|---|---|
-| S1 | 待回填 | 2026-10-12 | `llm/base.py` 流式事件与默认回退；`openai_compat.chat_stream`（tool_calls 分片/usage/空流回退/中断保文本/400 重试）；`AgentLoop.run_turn(on_delta)` + 工具轮前导抑制；`ConversationService` 透传；新增 `tests/test_stream_llm.py`(17) / `tests/agent/test_loop_stream.py`(11) / `tests/test_conversation.py`(3) | ruff 通过；1127 passed / 6 skipped / 2 xfailed（基线 1096） |
-| S2 | 待回填 | 2026-10-12 | `gateway/envelope` 新增 `KIND_STREAM`+`delta_seq`+`make_stream_event`；`AsyncioQueueBus.publish_best_effort`(丢弃不写死信)；dispatcher 三相位(start/delta/end)+on_delta 注入；`channels/streaming.py::StreamAssembler`(水位线/前缀补发)；新增 `tests/gateway/test_stream_channel.py`(26) | ruff 通过；1153 passed / 6 skipped / 2 xfailed（S1 基线 1127） |
-| S3 | 待回填 | 2026-10-12 | `config` 新增 `stream_enabled/cli_stream/stream_preamble_grace_*`；`bootstrap` 透传网关与 Agent；`CliAdapter(stream=...)` delta 逐字写出 + 最终只补后缀(水位线)；`cli.py` 启动信息展示流式状态；新增 `tests/channels/test_cli_stream.py`(9) + `test_config.py`(6) | ruff 通过；1168 passed / 6 skipped / 2 xfailed（S2 基线 1153）；真实管道 REPL 冒烟：回答恰好输出一次 |
-| S4 | 待回填 | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
+| S1 | `1949b36` | 2026-10-12 | `llm/base.py` 流式事件与默认回退；`openai_compat.chat_stream`（tool_calls 分片/usage/空流回退/中断保文本/400 重试）；`AgentLoop.run_turn(on_delta)` + 工具轮前导抑制；`ConversationService` 透传；新增 `tests/test_stream_llm.py`(17) / `tests/agent/test_loop_stream.py`(11) / `tests/test_conversation.py`(3) | ruff 通过；1127 passed / 6 skipped / 2 xfailed（基线 1096） |
+| S2 | `4ee4f19` | 2026-10-12 | `gateway/envelope` 新增 `KIND_STREAM`+`delta_seq`+`make_stream_event`；`AsyncioQueueBus.publish_best_effort`(丢弃不写死信)；dispatcher 三相位(start/delta/end)+on_delta 注入；`channels/streaming.py::StreamAssembler`(水位线/前缀补发)；新增 `tests/gateway/test_stream_channel.py`(26) | ruff 通过；1153 passed / 6 skipped / 2 xfailed（S1 基线 1127） |
+| S3 | `740b673` | 2026-10-12 | `config` 新增 `stream_enabled/cli_stream/stream_preamble_grace_*`；`bootstrap` 透传网关与 Agent；`CliAdapter(stream=...)` delta 逐字写出 + 最终只补后缀(水位线)；`cli.py` 启动信息展示流式状态；新增 `tests/channels/test_cli_stream.py`(9) + `test_config.py`(6) | ruff 通过；1168 passed / 6 skipped / 2 xfailed（S2 基线 1153）；真实管道 REPL 冒烟：回答恰好输出一次 |
+| S4 | `e87ed37` | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
 | S5 | — | — | — | — |
 | S6 | — | — | — | — |
 

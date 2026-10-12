@@ -453,7 +453,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S4 QQ typing | 已完成 | `e87ed37` | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
 | S5 QQ block | 已完成 | `1ab8193` | 2026-10-12 | 新增 30 用例；修复 TypingKeepAlive 无限等待缺陷 |
 | S5.1 block 均匀性 | 已完成 | `a731860` | 2026-10-12 | 用户实测反馈: 首块 22 字 + 尾块 700 字；新增 39 用例 |
-| S6 收尾 | 已完成 | 待回填 | 2026-10-12 | README/网关文档同步；`stats()` 流式计数；真机记录回填 |
+| S6 收尾 | 已完成 | `6ad1b8a` | 2026-10-12 | README/网关文档同步；`stats()` 流式计数；真机记录回填 |
 
 状态取值：`待确认 → 未开始 → 进行中 → 已完成 / 已放弃（附原因）`；每个里程碑**独立提交**，提交前必须满足：
 ① `ruff check` 通过；② 全量回归不低于基线；③ 该里程碑新增测试全绿；④ 回填本表与 §12。
@@ -560,7 +560,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S4 | `e87ed37` | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
 | S5 | `1ab8193` | 2026-10-12 | `BlockSegmenter`(段落/换行/句末/逗号/硬切 + 代码围栏保护)；`OneBot11Adapter` block 模式(首块阈值 + 最小间隔 + 条数封顶 + 水位线补发)；`qq_stream_first_chars/min_chars/min_interval/max_messages/hard_chars` 配置；`TypingKeepAlive` 改协作式停止(修复无限等待)；新增 test_streaming(+16)/test_onebot11(+6)/QQ 集成(+2)/config(+6) | ruff 通过；全量回归；端到端: 气泡拼接 == 完整回答、条数 ≤ max+1、无重复 |
 | S5.1 | `a731860` | 2026-10-12 | `BlockSegmenter` 改为窗口内取"最贴 target"边界；触发门槛改为首块 `max(first,min)` / 后续 `target`；中间气泡预留收尾槽位；`split_evenly` 收尾均分 + `flush_interval`；新增 `qq_stream_target_chars/max_block_chars/flush_interval`，`hard_chars` 降级为别名；新增 `tests/channels/test_block_uniformity.py`(10) + 分段/适配器/配置用例更新 | ruff 通过；全量回归；用用户原文实测 722 字 → 5 条极差 34、288 字 → 2 条极差 2 |
-| S6 | 待回填 | 2026-10-12 | README 新增「流式输出」章节 + 配置表 12 项 + 目录结构/模块表更新；`GATEWAY_DESIGN.md` 补 `KIND_STREAM`/`delta_seq`/best-effort 语义与 §16.6 接入小结；`Gateway.stats()` 新增 `stream_deltas_published/dropped`；§12 真机与参数标定回填 | ruff 通过；全量回归 1244 passed |
+| S6 | `6ad1b8a` | 2026-10-12 | README 新增「流式输出」章节 + 配置表 12 项 + 目录结构/模块表更新；`GATEWAY_DESIGN.md` 补 `KIND_STREAM`/`delta_seq`/best-effort 语义与 §16.6 接入小结；`Gateway.stats()` 新增 `stream_deltas_published/dropped`；§12 真机与参数标定回填 | ruff 通过；全量回归 1244 passed |
 
 ### 12.2 真机实测结论
 

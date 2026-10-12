@@ -4,8 +4,9 @@
 
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
-- **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 44 个源码模块 / 约 7950 行; 测试 38 个文件 / **1045 个用例**(1037 passed + 6 skipped + 2 xfailed)
+- **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
+- **代码规模**: 46 个源码模块 / 约 8830 行; 测试 41 个文件 / **1104 个用例**(1096 passed + 6 skipped + 2 xfailed)
+- **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -59,10 +60,18 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `summary_timeout` | `15` | 摘要调用超时(秒) |
 | `history_log_max_bytes` | `2097152` | `HISTORY.md` 轮转阈值(字节) |
 | `history_log_original_chars` | `32000` | 单条审计记录原文 JSON 上限(字符) |
-| `gateway_enabled` | `false` | 多渠道网关总开关; `true` 时 CLI/QQ 经 asyncio.Queue 总线 |
+| `gateway_enabled` | `false` | 多渠道网关总开关; `true` 时 CLI/QQ 经 asyncio.Queue 总线(**QQ 渠道必须为 `true`**) |
 | `gateway_bus_maxsize` | `1000` | 每个队列(inbound/outbound:<channel>/deadletter)容量 |
 | `gateway_publish_timeout` | `5` | publish 背压等待秒数; 超时进死信并 warning |
 | `gateway_shutdown_timeout` | `10` | 优雅关闭等待秒数(排空 dispatcher/in-flight/出站队列) |
+| `qq_owner_id` | 空 | 主人 QQ 号; **仅该号私聊**会被响应, 其他人/群聊忽略 |
+| `qq_ws_mode` | `reverse` | `reverse`=本进程监听, NapCat 连入; `forward`=本进程连接 NapCat |
+| `qq_ws_host` | `127.0.0.1` | reverse=监听地址; forward=NapCat 地址 |
+| `qq_ws_port` | `3100` | reverse=监听端口; forward=NapCat「WebSocket 服务器」端口 |
+| `qq_ws_path` | `/onebot/v11/ws` | WebSocket 路径(缺前导 `/` 自动补齐) |
+| `qq_token` | 空 | 与 NapCat 网络配置里的 Token 一致; 留空不校验(reverse 下不建议) |
+| `qq_action_timeout` | `10` | 单次 OneBot 动作(发消息)等待响应秒数 |
+| `qq_message_chunk_chars` | `3000` | 单条 QQ 消息字符上限, 超长回复自动分片 |
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
 
@@ -91,11 +100,51 @@ ChannelAdapter ← outbound:<channel> ← 回复 Envelope
 ```
 
 - **统一信封**: `Envelope`(kind/channel/scope/conversation_id/session_id/message_id/correlation_id/reply_to/target_channel/metadata);
-- **适配器契约**: `start/stop_inbound/stop/send`; 已提供 `LoopbackAdapter`(回环)、`QqAdapter`(可注入 transport, OneBot/NapCat 待接入)、`CliAdapter`(REPL);
+- **适配器契约**: `start/stop_inbound/stop/send`; 已提供 `LoopbackAdapter`(回环)、`QqAdapter` + `OneBot11Adapter`(**NapCat 反向/正向 WebSocket**)、`CliAdapter`(REPL);
 - **策略层**: `QqPolicy`(身份/6h 轮换/指令)、`CliPolicy`(会话/指令); Agent 不感知渠道;
 - **可靠性**: 有界队列 + publish 超时进死信; 同会话串行由 `ConversationService` 保证、跨会话并发; 关闭时按 `gateway_shutdown_timeout` 优雅排空;
-- **观测**: `Gateway.stats()` 返回队列积压/在途/死信快照; `HISTORY.md` 审计不受影响;
+- **观测**: `Gateway.stats()` 返回队列积压/在途/死信快照; 长跑时每 5 分钟写入一条状态日志; `HISTORY.md` 审计不受影响;
 - `gateway_enabled=false`(默认)时交付层行为与旧直连逐字节一致; 设计见 `docs/GATEWAY_DESIGN.md`。
+
+### 接入 QQ(NapCat / OneBot 11)
+
+QQ 渠道独立进程运行, 与 CLI 互不干扰; 采用**反向 WebSocket**: 本进程监听, NapCat 作为客户端连入并自动重连。
+
+**第一步: NapCat 侧(WebUI 一次配置)**
+
+1. 登录 NapCat WebUI(`http://127.0.0.1:6099/webui`), 确认机器人 QQ 已登录;
+2. 进入「网络配置 → OneBot 11」, 新增一条 **WebSocket 客户端**:
+
+   | 字段 | 值 |
+   | --- | --- |
+   | 名称 | `meowmeowclaw` |
+   | URL | `ws://127.0.0.1:3100/onebot/v11/ws` |
+   | Token | 与 `.env` 的 `qq_token` 一致(示例 `meowclaw-3100`) |
+   | 消息格式 | `array`(推荐) |
+   | 启用 | ✅ |
+
+3. 保存启用; NapCat 会按自身重连间隔(默认 30s)连入 Agent。
+
+**第二步: Agent 侧**
+
+```bash
+conda activate AI_chat
+pip install -e ".[dev]"          # 依赖新增 websockets
+# .env: gateway_enabled=true, qq_owner_id=<主人QQ>, qq_token=<与 NapCat 一致>
+python -m meowmeowclaw.qq --check    # 只校验配置并打印参数(不连 NapCat)
+python -m meowmeowclaw.qq            # 启动 QQ 渠道(等价入口: meowmeowclaw-qq)
+```
+
+启动后看到 `NapCat 已连接` 即接入成功; 用主人 QQ 私聊机器人即可对话。
+`/help` `/new` `/clear` `/sessions` 走策略直回、不消耗模型调用; 6 小时无活动自动轮换会话并先发「已开始新对话」。
+
+**边界与语义**
+
+- 仅响应 `qq_owner_id` 的**私聊**; 其他人、群聊、心跳/生命周期事件一律忽略;
+- 出站用 `send_private_msg` + **消息段数组**发送(避免模型输出被当作 CQ 码执行); 超长回复按 `qq_message_chunk_chars` 分片;
+- 入站按 `(channel, message_id)` 去重(NapCat 重推不会产生重复轮次); 断线期间 Agent 回复会丢弃并记 warning(fail-soft);
+- 图片/语音等非文本段转 `[图片]` `[语音]` 等占位符进入上下文, v1 不支持多模态回复;
+- 安全: 反向模式在服务端校验 Token; `stop_inbound()` 只停收新消息、保留连接, 保证优雅关闭时在途回复仍能送达。
 
 ### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)
 
@@ -183,11 +232,13 @@ ChannelAdapter ← outbound:<channel> ← 回复 Envelope
 | `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
 | `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
 | `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
+| `meowmeowclaw/qq.py` | 223 | **QQ 渠道进程入口**: 配置校验/`--check`/装配/信号与优雅关闭/周期状态日志 | `main()` / `run_qq()` / `qq_config_problems()` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
 | `meowmeowclaw/channels/bridge.py` | 29 | 平台 DTO ↔ 网关 Envelope 转换 | `incoming_to_envelope()` / `outgoing_from_envelope()` |
 | `meowmeowclaw/channels/commands.py` | 67 | 跨渠道会话指令公共逻辑(QQ/CLI 共用) | `SessionCommandHelper` |
 | `meowmeowclaw/channels/qq_policy.py` | 234 | QQ 策略: 身份过滤 / 6h 惰性轮换 / 指令 | `QqPolicy` |
-| `meowmeowclaw/channels/qq_adapter.py` | 47 | QQ 适配器(可注入 transport; OneBot/NapCat 待接入) | `QqAdapter` |
+| `meowmeowclaw/channels/qq_adapter.py` | 47 | QQ 适配器(可注入 transport; 传输见 `onebot11.py`) | `QqAdapter` |
+| `meowmeowclaw/channels/onebot11.py` | 565 | **OneBot 11(NapCat)传输**: 反向服务端/正向客户端、token 鉴权、消息段↔文本、`send_private_msg`、分片、重连 | `OneBot11Transport` / `OneBot11Adapter` / `event_to_incoming()` |
 | `meowmeowclaw/channels/qq_private.py` | 260 | QQ active 指针存储 + `QqPrivateService` 兼容 facade | `QqPrivateActiveStore` / `QqPrivateService` |
 | `meowmeowclaw/channels/cli_policy.py` | 209 | CLI 策略: 会话生命周期 + /help /new /clear /sessions /tools /skills | `CliPolicy` |
 | `meowmeowclaw/channels/cli_adapter.py` | 111 | CLI 适配器: REPL + 总线收发 + Future 配对 | `CliAdapter` |
@@ -444,6 +495,9 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
 | `channels/test_qq_policy.py` | 11 | QQ 策略: 身份/轮换/指令/跨渠道删除 |
 | `channels/test_qq_adapter.py` | 3 | QQ 适配器: 入站转换/出站/停入站 |
+| `channels/test_onebot11.py` | 32 | OneBot11: 文本/CQ 码提取、事件过滤、反向鉴权、正向重连、分片、stop_inbound 契约 |
+| `channels/test_qq_napcat_integration.py` | 7 | 假 NapCat 客户端 ↔ Agent 反向 WS 端到端(往返/忽略/指令/轮换/重连) |
+| `test_qq_entry.py` | 8 | QQ 入口: 配置校验、--check 输出、生命周期(启动→信号→优雅关闭) |
 | `channels/test_cli_policy.py` | 10 | CLI 策略: 会话/指令/展示 |
 | `channels/test_cli_adapter.py` | 7 | CLI 适配器: ask/超时/pending/REPL |
 | `channels/test_qq_gateway_integration.py` | 4 | QQ 走网关端到端(轮换/指令/忽略) |
@@ -478,12 +532,13 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 38 个测试文件 / 1045 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 41 个测试文件 / 1104 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
     ├── bootstrap.py             # 组合根: 装配 Application(不 print)
     ├── cli.py                   # 交付层: banner / REPL / 会话命令 / 退出码
+    ├── qq.py                    # QQ 渠道进程入口: python -m meowmeowclaw.qq / meowmeowclaw-qq
     ├── __main__.py              # python -m meowmeowclaw -> cli.main()
     ├── agent/
     │   ├── context.py           # System Prompt(含长期记忆维护约定)
@@ -514,6 +569,7 @@ MeowMeowClaw/
     │   ├── commands.py          # 跨渠道会话指令公共逻辑
     │   ├── qq_policy.py         # QqPolicy(身份/轮换/指令)
     │   ├── qq_adapter.py        # QqAdapter(可注入 transport)
+    │   ├── onebot11.py          # OneBot11 传输(NapCat 反向/正向 WS) + OneBot11Adapter
     │   ├── qq_private.py        # active 指针 + 兼容 facade
     │   ├── cli_policy.py        # CliPolicy(会话/指令)
     │   └── cli_adapter.py       # CliAdapter(REPL)
@@ -534,7 +590,7 @@ MeowMeowClaw/
 ## 11. 已知限制与 Roadmap
 
 - A+（会话 IO 尾读 + 运行时生命周期 + 指标）设计已确认、待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
-- 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5 与多渠道网关 W1–W4 已落地(`gateway_enabled` 默认 `false`, 真实 CLI/QQ 路径已经真实 API 冒烟); 结构化长期记忆后端、QQ **OneBot/NapCat 传输适配器**、飞书/Web 适配器、流式输出与多 Agent 编排尚未接入
+- 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略、流式输出与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附
 - 安全侧的已知缺口见 [5.5](#55-已知缺口与局限诚实清单)(命令黑名单绕过、抓取重定向/重绑定、provider 契约边界)

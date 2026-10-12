@@ -1,6 +1,6 @@
 # MeowMeowClaw 多渠道网关设计（v1：单进程 asyncio.Queue 总线）
 
-> 状态：**W1–W4 已实现并完成真实冒烟；`gateway_enabled` 默认保持 `false`（翻转条件见 §16.3）**。
+> 状态：**W1–W5 已实现；QQ 真实传输（OneBot 11 / NapCat 反向 WS）已接入并完成真机冒烟；`gateway_enabled` 代码默认仍为 `false`（翻转条件见 §16.3）**。
 > 本文定义网关层行为与契约；不改 JSONL 存储格式、不改 `ConversationService` / `AgentLoop` 内部语义。
 > 关联：`docs/ARCHITECTURE.md`、`docs/MEMORY_DESIGN.md`、`docs/CONTEXT_COMPRESSION_DESIGN.md`、
 > `meowmeowclaw/channels/`、`meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`、`meowmeowclaw/cli.py`。
@@ -39,7 +39,7 @@
 - 队列持久化、exactly-once、跨重启消息恢复；
 - 流式分片、媒体附件（图片/语音/文件）、多租户配额；
 - 主动推送的**生产方**（`kind=push` 与出站路由预留，v1 不产生）；
-- 真实 OneBot/NapCat/飞书 SDK 传输实现（本阶段只做契约与 Fake/CLI 适配器）。
+- 真实 OneBot/NapCat/飞书 SDK 传输实现（v1 阶段只做契约与 Fake/CLI 适配器；**W5 已补齐 NapCat 真实传输**）。
 
 ---
 
@@ -103,7 +103,8 @@ meowmeowclaw/gateway/
 └── gateway.py          # Gateway 生命周期与组装
 ```
 
-`channels/` 侧新增/改造：`channels/cli_policy.py`、`channels/cli_adapter.py`、`channels/qq_policy.py`；
+`channels/` 侧新增/改造：`channels/cli_policy.py`、`channels/cli_adapter.py`、`channels/qq_policy.py`、
+`channels/onebot11.py`（W5）；进程入口 `meowmeowclaw/qq.py`（W5）；
 `QqPrivateService` 保留为兼容 facade（见 §9）。
 
 ---
@@ -222,11 +223,24 @@ CliAdapter.start()
 - banner / 启动信息仍由交付层 `cli.py` 在 `gateway.start()` 前打印；
 - Ctrl+C：`cli.py` 捕获后调用 `await gateway.stop()`，取消 pending future。
 
-### 5.2 QQ / 飞书适配器（后续）
+### 5.2 QQ / 飞书适配器
 
-- `QqAdapter`：真实 OneBot/NapCat 传输适配（本阶段先留接口与 Fake 实现）；
-- `FeishuAdapter`：webhook/长连接事件 → Envelope；回复需要 `message_id/reply_to` 与租户 token，属适配器细节；
-- 所有适配器必须能通过同一份 **Adapter 契约测试**（FakeAdapter 先跑通）。
+- `QqAdapter`：平台 DTO 适配器（可注入 transport）；
+- **OneBot 11 / NapCat 传输（W5 已实现）**：`meowmeowclaw/channels/onebot11.py`
+  - `OneBot11Transport`：`mode=reverse` 时本进程监听 `ws://qq_ws_host:qq_ws_port + qq_ws_path`，
+    NapCat 作为 WS 客户端连入并自动重连；`mode=forward` 时本进程作为客户端连接 NapCat，
+    内置指数退避重连。两种模式共用报文解析/发送逻辑；
+  - 入站只接受 `post_type=message` + `message_type=private`；心跳/生命周期/群聊事件忽略；
+    消息段数组或 CQ 码字符串统一转纯文本（图片/语音等转占位符）；
+  - 出站固定 `send_private_msg`，文本以**消息段数组**发送（避免模型输出被当作 CQ 码执行），
+    超长按 `qq_message_chunk_chars` 分片；`echo` 与动作响应配对，单条失败只 warning；
+  - 鉴权：反向模式服务端校验 `?access_token=` 或 `Authorization: Bearer`（`hmac.compare_digest`）；
+  - 生命周期：`OneBot11Adapter` 在出站消费启动后再建立平台连接；
+    `stop_inbound()` 只拒绝新连接/新事件而**保留既有连接**，保证优雅关闭期间在途回复仍可送达，
+    连接关闭放在 `stop()`；
+  - 进程入口：`meowmeowclaw/qq.py`（`python -m meowmeowclaw.qq` / `meowmeowclaw-qq`）；
+- `FeishuAdapter`：webhook/长连接事件 → Envelope；回复需要 `message_id/reply_to` 与租户 token，属适配器细节（未实现）；
+- 所有适配器必须能通过同一份 **Adapter 契约测试**。
 
 ---
 
@@ -336,7 +350,7 @@ await bus.publish(outbound_queue(env.channel), reply)
 | 现有 | 目标 | 备注 |
 |---|---|---|
 | `channels/base.py::IncomingMessage/OutgoingMessage` | **保留** | 适配器边界 DTO；与 Envelope 互转 |
-| `channels/qq_private.py::QqPrivateService` | `QqPolicy` + `QqAdapter`（后续）+ 兼容 facade | 现有 15 个 QQ 测试保持全绿；facade 走老直连路径 |
+| `channels/qq_private.py::QqPrivateService` | `QqPolicy` + `QqAdapter` + `OneBot11Adapter`(W5) + 兼容 facade | 现有 QQ 测试保持全绿；facade 走老直连路径 |
 | `channels/qq_private.py::QqPrivateActiveStore` | `QqPolicy` 内部继续使用 | v1 不抽象通用 ChannelStateStore |
 | `cli.py` REPL / `_handle_command` | `CliAdapter`（输入输出）+ `CliPolicy`（会话与指令） | `/exit /quit` 留在适配器；banner 留在 `cli.py` |
 | `cli.py::new_cli_session()` | `CliPolicy` 初始会话 | 进程启动新会话语义不变 |
@@ -354,10 +368,18 @@ await bus.publish(outbound_queue(env.channel), reply)
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `gateway_enabled` | `false` | 总开关；false 时完全不构造 Gateway（现状行为） |
+| `gateway_enabled` | `false` | 总开关；false 时完全不构造 Gateway（现状行为）；**QQ 渠道要求 `true`** |
 | `gateway_bus_maxsize` | `1000` | 每个队列（inbound / 每渠道 outbound / deadletter）容量 |
 | `gateway_publish_timeout` | `5` | publish 等待秒数；超时进死信并 warning |
 | `gateway_shutdown_timeout` | `10` | 优雅关闭等待 in-flight 的秒数 |
+| `qq_owner_id` | 空 | 主人 QQ 号；仅该号私聊被响应 |
+| `qq_ws_mode` | `reverse` | `reverse`（本进程监听，NapCat 连入）/ `forward`（本进程连 NapCat） |
+| `qq_ws_host` | `127.0.0.1` | reverse=监听地址；forward=NapCat 地址 |
+| `qq_ws_port` | `3100` | reverse=监听端口；forward=NapCat WS 服务端端口 |
+| `qq_ws_path` | `/onebot/v11/ws` | WebSocket 路径 |
+| `qq_token` | 空 | 与 NapCat 网络配置 Token 一致；反向模式服务端校验 |
+| `qq_action_timeout` | `10` | 单次 OneBot 动作等待响应秒数 |
+| `qq_message_chunk_chars` | `3000` | 单条 QQ 消息字符上限，超长自动分片 |
 
 模块常量（暂不配置）：`GATEWAY_MAX_INFLIGHT=64`、`DEDUP_MAXSIZE=4096`、`DEADLETTER_MAX_KEEP=128`。
 解析与校验沿用 `config.py` 的"系统环境变量 > .env > 默认值 + 非法回退 + warning"模式；
@@ -415,20 +437,24 @@ await bus.publish(outbound_queue(env.channel), reply)
 | W2 | QQ 策略抽取（`QqPolicy` + facade）+ `QqAdapter`(Fake 传输) + 公共命令 helper | QQ 既有 15 用例全绿；网关路径对等测试通过 |
 | W3 | `CliAdapter` + `CliPolicy` + `cli.py` 接入（开关控制） | CLI 交互/指令/退出对等；Ctrl+C 优雅关闭 |
 | W4 | README/.env.example/架构文档同步；死信与观测日志；评估是否翻默认开关 | 全量回归 + 手工冒烟（真实 CLI/QQ 路径） |
+| W5 | **QQ 真实传输**：`channels/onebot11.py`(反向服务端/正向客户端 + token 鉴权 + 消息段/分片/重连) + `qq.py` 进程入口 + `qq_*` 配置 | OneBot11 单测 + 假 NapCat 端到端 + 配置/入口测试；全量回归；**真实 NapCat 连入冒烟** |
 
-**实现状态（2026-10-09）**：W1–W4 全部完成；全量回归 `1037 passed / 6 skipped / 2 xfailed`；
-真实 API 冒烟：CLI（`GATEWAY_ENABLED=true` + 管道 REPL）与 QQ（QqPolicy + QqAdapter + Gateway）均走通，
+**实现状态（2026-10-12）**：W1–W5 全部完成；全量回归 `1096 passed / 6 skipped / 2 xfailed`；
+真实 API 冒烟：CLI（`GATEWAY_ENABLED=true` + 管道 REPL）与 QQ（QqPolicy + QqAdapter + Gateway）均走通；
+**W5 真机冒烟**：NapCat（Windows，`D:\NapCat.Shell`）经反向 WS `ws://127.0.0.1:3100/onebot/v11/ws`
+自动连入 WSL2 内的 Agent，token 校验、`/help` 指令短路、动作 ack、SIGINT 优雅关闭全部通过；
 详细记录与默认开关决策见 §16。
 ---
 
 ## 14. 待实现时的开放项（不阻塞设计）
 
-1. `gateway_enabled` 默认翻转：**W4 决策为暂不翻转**（真实 OneBot/NapCat 传输未接入、双轨需真实使用验证）；
+1. `gateway_enabled` 默认翻转：**仍暂不翻转**（QQ 真实传输已接入并完成真机冒烟，但双轨仍需一段真实使用验证）；
    翻转触发条件见 §16.3；
 2. 去重持久化：若 QQ 平台重推成为实际问题，再加 JSONL/SQLite 去重表；
 3. `deadletter` 是否需要落盘/重放：v1 仅内存排障；
-4. 真实 OneBot/NapCat/飞书适配器：依赖对应平台 SDK，独立于本网关核心；
-5. 主动推送（`kind=push`）的权限与限流：实现时补 Policy 校验与配额。
+4. 真实 OneBot/NapCat 适配器：**W5 已实现**（见 §5.2）；飞书/Web 适配器仍未接入；
+5. 主动推送（`kind=push`）的权限与限流：实现时补 Policy 校验与配额；
+6. 群聊策略（群内 @ 触发/白名单）与多模态（图片理解/语音转写）：v1 仅主人私聊、仅文本。
 
 
 ---
@@ -542,7 +568,7 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 
 ---
 
-## 16. W4 收尾：观测、死信与实现状态
+## 16. W4/W5 收尾：观测、死信与实现状态
 
 ### 16.1 死信与观测 API
 
@@ -555,26 +581,29 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 ### 16.2 实现文件
 
 - `meowmeowclaw/gateway/`：`envelope / bus / dedup / policy / adapter / worker / dispatcher / gateway`；
-- `meowmeowclaw/channels/`：`bridge / commands / qq_policy / qq_adapter / cli_policy / cli_adapter`
+- `meowmeowclaw/channels/`：`bridge / commands / qq_policy / qq_adapter / onebot11 / cli_policy / cli_adapter`
   + `qq_private` 兼容 facade；
+- `meowmeowclaw/qq.py`：QQ 渠道进程入口(`--check` / 信号 / 优雅关闭 / 周期状态日志)；
 - `bootstrap.build_gateway()` / `Application.gateway` / `cli._run_gateway_repl()`；
-- 配置项 `gateway_enabled` / `gateway_bus_maxsize` / `gateway_publish_timeout` / `gateway_shutdown_timeout`。
+- 配置项 `gateway_*` 4 个 + `qq_*` 8 个（见 §10）。
 
 ### 16.3 默认开关决策：暂不翻转
 
-**保持 `gateway_enabled=false`**，理由：
+**保持 `gateway_enabled=false`**（代码默认值），理由：
 
-1. 真实 QQ 传输（OneBot/NapCat）尚未接入，QQ 网关路径目前只有注入 transport 的 `QqAdapter`；
+1. 真实 QQ 传输已于 W5 接入并真机冒烟，但真实使用只覆盖了指令链路，尚未覆盖长跑/断线/并发；
 2. CLI 网关路径虽已真实冒烟，但需要一段真实使用验证指令/退出/并发体验；
 3. 双轨（旧直连 vs 网关）需要保持可回滚，翻转前应有回滚预案与观察指标。
 
 翻转触发条件（建议同时满足）：
 
-- `QqAdapter` 接入真实 OneBot/NapCat 传输并通过适配器契约测试；
+- ~~`QqAdapter` 接入真实 OneBot/NapCat 传输并通过适配器契约测试~~ ✅（W5 已完成）；
 - CLI 网关路径经真实使用（或一周灰度）无回归；
 - `Gateway.stats()` 观测到的死信/积压/在途在可接受范围（死信 0、队列无持续积压）。
 
-### 16.4 真实冒烟记录（2026-10-09，真实 DeepSeek API）
+### 16.4 真实冒烟记录
+
+**（2026-10-09，真实 DeepSeek API，W4）**
 
 - **CLI**：`GATEWAY_ENABLED=true` + 隔离 workspace/memory，管道输入「问一句 → /help → /exit」；
   回答与帮助均经总线输出，`/exit` 正常退出，sessions/JSONL 正常落盘；
@@ -582,8 +611,21 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
   （`target_channel=qq`、`correlation_id` 配对），`/help` 指令短路（不调用 Agent），`stats()` 全零健康；
 - 两次冒烟均在 `/tmp` 隔离目录完成，不影响真实 `workspace/` 与会话。
 
+**（2026-10-12，真实 NapCat，W5）**
+
+- 环境：Windows `D:\NapCat.Shell`(QQNT + NapCat.Shell, 机器人 QQ 3768130928)；
+  WSL2 Ubuntu 24.04 + `networkingMode=mirrored`(Windows/WSL 共享 localhost)；
+- NapCat 侧：「网络配置 → OneBot 11 → WebSocket 客户端」
+  `ws://127.0.0.1:3100/onebot/v11/ws` + Token `meowclaw-3100` + `array` 消息格式；
+- Agent 侧：`python -m meowmeowclaw.qq` 监听 `127.0.0.1:3100`；NapCat 按 30s 重连间隔自动连入
+  （日志 `NapCat 已连接: 127.0.0.1:<port>`）；
+- 验证项：错误 token 被拒（1008）、正确 token 接入、`/help` 指令经真实 WS 往返
+  （`send_private_msg` + `echo` ack）、重复 `message_id` 被去重、SIGINT 优雅关闭并释放端口；
+- 全程未消耗模型 token（`/help` 走策略直回），真实模型问答由用户侧私聊验证。
+
 ### 16.5 待后续
 
-- 真实 OneBot/NapCat/飞书/Web 适配器；`kind=push` 生产方；去重持久化；死信重放（可选）；
+- 飞书/Web 适配器；`kind=push` 生产方；去重持久化；死信重放（可选）；
+- QQ 群聊策略与多模态（图片/语音）；正向 WS 模式的真实 NapCat 冒烟（代码已实现，当前真机用的是反向）；
 - A+（会话运行时生命周期 API 与 JSONL 尾读优化）设计已确认，实施排期见 `docs/A_PLUS_OPTIMIZATION.md`；
   在当前文档中按既定约定于网关整体功能完成后启动。

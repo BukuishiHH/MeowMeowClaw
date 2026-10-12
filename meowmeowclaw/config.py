@@ -55,6 +55,16 @@ DEFAULT_GATEWAY_BUS_MAXSIZE = 1000
 DEFAULT_GATEWAY_PUBLISH_TIMEOUT = 5.0
 DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT = 10.0
 
+# QQ 渠道(NapCat / OneBot 11)默认值(见 README「接入 NapCat」)
+DEFAULT_QQ_OWNER_ID = ""
+DEFAULT_QQ_WS_MODE = "reverse"          # reverse: 本进程监听, NapCat 连入; forward: 本进程连接 NapCat
+DEFAULT_QQ_WS_HOST = "127.0.0.1"
+DEFAULT_QQ_WS_PORT = 3100
+DEFAULT_QQ_WS_PATH = "/onebot/v11/ws"
+DEFAULT_QQ_TOKEN = ""
+DEFAULT_QQ_ACTION_TIMEOUT = 10.0
+DEFAULT_QQ_MESSAGE_CHUNK_CHARS = 3000
+
 # 键别名映射
 _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "model": ("model", "model_name"),
@@ -79,6 +89,14 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "gateway_bus_maxsize": ("gateway_bus_maxsize",),
     "gateway_publish_timeout": ("gateway_publish_timeout",),
     "gateway_shutdown_timeout": ("gateway_shutdown_timeout",),
+    "qq_owner_id": ("qq_owner_id", "qq_owner", "owner_qq"),
+    "qq_ws_mode": ("qq_ws_mode", "napcat_ws_mode"),
+    "qq_ws_host": ("qq_ws_host", "napcat_ws_host"),
+    "qq_ws_port": ("qq_ws_port", "napcat_ws_port"),
+    "qq_ws_path": ("qq_ws_path", "napcat_ws_path"),
+    "qq_token": ("qq_token", "napcat_token"),
+    "qq_action_timeout": ("qq_action_timeout", "qq_api_timeout"),
+    "qq_message_chunk_chars": ("qq_message_chunk_chars", "qq_max_message_chars"),
 }
 
 # 已废弃配置键: 人设已固定为 <项目根>/identity.md, 出现时警告并忽略
@@ -201,6 +219,42 @@ def _resolve_tokenizer(value: Optional[str]) -> str:
     return DEFAULT_TOKENIZER
 
 
+def _resolve_ws_mode(value: Optional[str]) -> str:
+    """解析 OneBot11 连接方向: reverse(监听)/forward(主动连); 非法值回退默认."""
+    if value is None:
+        return DEFAULT_QQ_WS_MODE
+    text = str(value).strip().lower()
+    if text in ("reverse", "forward"):
+        return text
+    logger.warning("qq_ws_mode 取值不合法(%r), 回退默认值 %s", value, DEFAULT_QQ_WS_MODE)
+    return DEFAULT_QQ_WS_MODE
+
+
+def _resolve_port(value: Optional[str], default: int, name: str) -> int:
+    """解析端口(1-65535); 非法值回退默认并告警."""
+    if value is None:
+        return default
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("%s 不是整数(%r), 回退默认值 %d", name, value, default)
+        return default
+    if not 1 <= num <= 65535:
+        logger.warning("%s 不在 1-65535 范围内(%r), 回退默认值 %d", name, value, default)
+        return default
+    return num
+
+
+def _resolve_ws_path(value: Optional[str]) -> str:
+    """解析 WS 路径: 空白回退默认, 缺少前导斜杠时补齐."""
+    if value is None:
+        return DEFAULT_QQ_WS_PATH
+    text = str(value).strip()
+    if not text:
+        return DEFAULT_QQ_WS_PATH
+    return text if text.startswith("/") else f"/{text}"
+
+
 def _warn_deprecated_identity_keys(raw: dict[str, str]) -> None:
     """检测已废弃的人设配置键: 警告并忽略(人设固定为项目根 identity.md)."""
     present = [key for key in DEPRECATED_IDENTITY_KEYS if key in raw]
@@ -238,10 +292,20 @@ class Settings:
     gateway_bus_maxsize: int = DEFAULT_GATEWAY_BUS_MAXSIZE
     gateway_publish_timeout: float = DEFAULT_GATEWAY_PUBLISH_TIMEOUT
     gateway_shutdown_timeout: float = DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT
+    # QQ 渠道(NapCat / OneBot 11)
+    qq_owner_id: str = DEFAULT_QQ_OWNER_ID
+    qq_ws_mode: str = DEFAULT_QQ_WS_MODE
+    qq_ws_host: str = DEFAULT_QQ_WS_HOST
+    qq_ws_port: int = DEFAULT_QQ_WS_PORT
+    qq_ws_path: str = DEFAULT_QQ_WS_PATH
+    qq_token: str = DEFAULT_QQ_TOKEN
+    qq_action_timeout: float = DEFAULT_QQ_ACTION_TIMEOUT
+    qq_message_chunk_chars: int = DEFAULT_QQ_MESSAGE_CHUNK_CHARS
     source: str = str(ENV_FILE)
 
     def __repr__(self) -> str:
         masked_key = "***" if self.api_key else None
+        masked_qq_token = "***" if self.qq_token else None
         return (
             f"Settings(model={self.model!r}, base_url={self.base_url!r}, "
             f"workspace={str(self.workspace)!r}, max_iterations={self.max_iterations}, "
@@ -257,6 +321,11 @@ class Settings:
             f"gateway_bus_maxsize={self.gateway_bus_maxsize}, "
             f"gateway_publish_timeout={self.gateway_publish_timeout}, "
             f"gateway_shutdown_timeout={self.gateway_shutdown_timeout}, "
+            f"qq_owner_id={self.qq_owner_id!r}, qq_ws_mode={self.qq_ws_mode!r}, "
+            f"qq_ws_host={self.qq_ws_host!r}, qq_ws_port={self.qq_ws_port}, "
+            f"qq_ws_path={self.qq_ws_path!r}, qq_token={masked_qq_token}, "
+            f"qq_action_timeout={self.qq_action_timeout}, "
+            f"qq_message_chunk_chars={self.qq_message_chunk_chars}, "
             f"api_key={masked_key}, source={self.source!r})"
         )
 
@@ -342,6 +411,26 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["gateway_shutdown_timeout"]),
             DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT,
             "gateway_shutdown_timeout",
+        ),
+        qq_owner_id=_get(raw, *_KEY_ALIASES["qq_owner_id"]) or "",
+        qq_ws_mode=_resolve_ws_mode(_get(raw, *_KEY_ALIASES["qq_ws_mode"])),
+        qq_ws_host=_get(raw, *_KEY_ALIASES["qq_ws_host"]) or DEFAULT_QQ_WS_HOST,
+        qq_ws_port=_resolve_port(
+            _get(raw, *_KEY_ALIASES["qq_ws_port"]),
+            DEFAULT_QQ_WS_PORT,
+            "qq_ws_port",
+        ),
+        qq_ws_path=_resolve_ws_path(_get(raw, *_KEY_ALIASES["qq_ws_path"])),
+        qq_token=_get(raw, *_KEY_ALIASES["qq_token"]) or "",
+        qq_action_timeout=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["qq_action_timeout"]),
+            DEFAULT_QQ_ACTION_TIMEOUT,
+            "qq_action_timeout",
+        ),
+        qq_message_chunk_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["qq_message_chunk_chars"]),
+            DEFAULT_QQ_MESSAGE_CHUNK_CHARS,
+            "qq_message_chunk_chars",
         ),
         source=str(path),
     )

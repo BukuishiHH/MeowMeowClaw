@@ -1,0 +1,565 @@
+"""OneBot 11(NapCat)传输层: 反向 WebSocket 服务端 + 正向 WebSocket 客户端.
+
+职责边界(与 ``QqAdapter`` 组合使用)::
+
+    NapCat ──WS 事件(JSON)──► OneBot11Transport ──IncomingMessage──► QqAdapter.feed
+    NapCat ◄──WS 动作(JSON)── OneBot11Transport ◄──Envelope── QqAdapter.send
+
+约定:
+
+- 只有 ``post_type=message`` + ``message_type=private`` 的事件进入渠道层,
+  心跳/生命周期/群聊事件静默忽略(debug 日志);
+- 出站固定使用 ``send_private_msg``, 文本以 **消息段数组** 发送,
+  避免模型输出被 NapCat 当作 CQ 码执行; 超长文本按 ``max_text_chars`` 分片;
+- ``echo`` 与动作响应配对, 单次动作超时/失败只记 warning, 不杀出站循环;
+- ``stop_inbound()`` 只拒绝新连接/新事件, **不关闭既有连接**, 保证优雅关闭时
+  在途回复仍能送达; 真正的连接关闭在 ``stop()`` 里完成;
+- ``mode=reverse``: 本进程监听 ``ws://host:port+path``, NapCat 作为客户端接入并自动重连;
+- ``mode=forward``: 本进程作为客户端连接 NapCat 的 WS 服务端, 内置指数退避重连。
+"""
+
+import asyncio
+import hmac
+import json
+import logging
+import re
+import uuid
+from contextlib import suppress
+from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import parse_qs, quote, urlsplit
+
+from websockets.asyncio.client import connect
+from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
+
+from meowmeowclaw.gateway import Envelope, MessageBus
+
+from .base import IncomingMessage
+from .qq_adapter import QqAdapter
+
+logger = logging.getLogger(__name__)
+
+POST_TYPE_MESSAGE = "message"
+MESSAGE_TYPE_PRIVATE = "private"
+DEFAULT_MAX_TEXT_CHARS = 3000
+DEFAULT_ACTION_TIMEOUT = 10.0
+DEFAULT_RECONNECT_MIN = 1.0
+DEFAULT_RECONNECT_MAX = 30.0
+
+# 入站消息处理器: 收到一条平台无关消息, 返回是否成功入队
+Handler = Callable[[IncomingMessage], Awaitable[bool]]
+
+# CQ 码与消息段的占位转换(仅文本进入 Agent, 非文本转可读占位符)
+_CQ_PATTERN = re.compile(r"\[CQ:([A-Za-z0-9_]+)((?:,[^\[\]]*)?)\]")
+_SEGMENT_PLACEHOLDER = {
+    "image": "[图片]",
+    "face": "[表情]",
+    "record": "[语音]",
+    "video": "[视频]",
+    "file": "[文件]",
+    "json": "[卡片]",
+    "xml": "[卡片]",
+    "markdown": "[卡片]",
+    "poke": "[戳一戳]",
+    "forward": "[合并转发]",
+    "reply": "",
+}
+_NON_TEXT_PLACEHOLDER = "[非文本消息]"
+
+
+def _parse_cq_params(raw: str) -> dict[str, str]:
+    """解析 CQ 码参数串 ``,k=v,k2=v2``(值里的逗号按原样保留)."""
+    params: dict[str, str] = {}
+    for item in raw.lstrip(",").split(","):
+        key, _, value = item.partition("=")
+        if key:
+            params[key.strip()] = value
+    return params
+
+
+def _segment_placeholder(seg_type: str, data: dict[str, Any]) -> str:
+    """非文本消息段 -> 可读占位符."""
+    if seg_type == "at":
+        target = str(data.get("qq", ""))
+        return "@全体成员" if target == "all" else f"@{target}"
+    return _SEGMENT_PLACEHOLDER.get(seg_type, _NON_TEXT_PLACEHOLDER)
+
+
+def strip_cq_codes(text: str) -> str:
+    """把消息字符串里的 CQ 码替换成可读占位符(纯文本部分原样保留)."""
+    return _CQ_PATTERN.sub(
+        lambda match: _segment_placeholder(match.group(1), _parse_cq_params(match.group(2))),
+        text,
+    )
+
+
+def extract_text(message: Any) -> str:
+    """OneBot ``message`` 字段 -> 纯文本.
+
+    同时兼容数组消息段与 CQ 码字符串两种形态; 非文本段转占位符。
+    例: ``[{"type":"text","data":{"text":"hi"}},{"type":"image","data":{}}]`` -> ``"hi[图片]"``。
+    """
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        return strip_cq_codes(message)
+    if isinstance(message, (list, tuple)):
+        parts: list[str] = []
+        for segment in message:
+            if not isinstance(segment, dict):
+                parts.append(str(segment))
+                continue
+            seg_type = str(segment.get("type", ""))
+            data = segment.get("data")
+            if not isinstance(data, dict):
+                data = {}
+            if seg_type == "text":
+                parts.append(str(data.get("text", "")))
+            else:
+                parts.append(_segment_placeholder(seg_type, data))
+        return "".join(parts)
+    # 非字符串/非消息段的取值一律忽略, 避免把任意对象拼进 Prompt
+    return ""
+
+
+def _to_ms(value: Any) -> Optional[int]:
+    """OneBot ``time``(秒) -> 毫秒时间戳; 非法值返回 None(由渠道层取当前时间)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(float(value) * 1000)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip()) * 1000
+    return None
+
+
+def event_to_incoming(
+    payload: Any,
+    *,
+    channel: str = "qq",
+    scope: str = "private",
+) -> Optional[IncomingMessage]:
+    """OneBot 事件 -> ``IncomingMessage``; 非私聊消息 / 空文本返回 None."""
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("post_type") != POST_TYPE_MESSAGE:
+        return None
+    if payload.get("message_type") != MESSAGE_TYPE_PRIVATE:
+        return None
+    user_id = payload.get("user_id")
+    if user_id is None or not str(user_id).strip():
+        return None
+    raw_message = payload.get("message")
+    if raw_message is None:
+        raw_message = payload.get("raw_message")
+    text = extract_text(raw_message)
+    if not text.strip():
+        return None
+    message_id = payload.get("message_id")
+    return IncomingMessage(
+        channel=channel,
+        scope=scope,
+        conversation_id=str(user_id).strip(),
+        sender_id=str(user_id).strip(),
+        text=text,
+        message_id=None if message_id is None else str(message_id),
+        received_at_ms=_to_ms(payload.get("time")),
+    )
+
+
+def chunk_text(text: str, max_chars: int = DEFAULT_MAX_TEXT_CHARS) -> list[str]:
+    """按字符数切分长文本(超长回复分片发送); ``max_chars<=0`` 时不切分."""
+    if not text:
+        return []
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+    return [text[start : start + max_chars] for start in range(0, len(text), max_chars)]
+
+
+class OneBot11Transport:
+    """OneBot 11 传输(反向服务端 / 正向客户端二选一).
+
+    ``send(envelope)`` 满足 ``QqAdapter`` 的 transport 契约,
+    入站事件通过 ``handler``(通常是 ``QqAdapter.feed``)注入网关。
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str = "reverse",
+        host: str = "127.0.0.1",
+        port: int = 3100,
+        path: str = "/onebot/v11/ws",
+        token: str = "",
+        action_timeout: float = DEFAULT_ACTION_TIMEOUT,
+        max_text_chars: int = DEFAULT_MAX_TEXT_CHARS,
+        reconnect_min: float = DEFAULT_RECONNECT_MIN,
+        reconnect_max: float = DEFAULT_RECONNECT_MAX,
+        handler: Optional[Handler] = None,
+        channel: str = "qq",
+    ) -> None:
+        if mode not in ("reverse", "forward"):
+            raise ValueError(f"mode 必须是 reverse/forward: {mode!r}")
+        if not str(host).strip():
+            raise ValueError("host 不能为空")
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError(f"port 不合法: {port!r}")
+
+        self.mode = mode
+        self.host = str(host).strip()
+        self.port = int(port)
+        self.path = path if str(path).startswith("/") else f"/{path}"
+        self.token = str(token or "")
+        self.action_timeout = float(action_timeout)
+        self.max_text_chars = int(max_text_chars)
+        self.reconnect_min = max(0.1, float(reconnect_min))
+        self.reconnect_max = max(self.reconnect_min, float(reconnect_max))
+        self.channel = str(channel)
+        self._handler = handler
+
+        self._started = False
+        self._stopped = True
+        self._accepting = False
+        self._server: Optional[Server] = None
+        self._client_task: Optional[asyncio.Task] = None
+        self._active: Optional[ServerConnection] = None
+        self._pending: dict[str, asyncio.Future] = {}
+
+    def __repr__(self) -> str:
+        return (
+            f"<OneBot11Transport mode={self.mode!r} endpoint={self.endpoint!r} "
+            f"connected={self.connected}>"
+        )
+
+    # ------------------------------------------------------------------ 属性
+
+    @property
+    def endpoint(self) -> str:
+        """可读的监听/连接地址(token 不展示)."""
+        return f"ws://{self.host}:{self.port}{self.path}"
+
+    @property
+    def connected(self) -> bool:
+        websocket = self._active
+        return websocket is not None and websocket.state is State.OPEN
+
+    @property
+    def accepting(self) -> bool:
+        return self._accepting
+
+    def set_handler(self, handler: Optional[Handler]) -> None:
+        self._handler = handler
+
+    # ------------------------------------------------------------------ 生命周期
+
+    async def start(self) -> None:
+        """启动传输; reverse 模式绑定端口失败会直接抛异常(由调用方报错退出)."""
+        if self._started:
+            return
+        self._started = True
+        self._stopped = False
+        self._accepting = True
+        if self.mode == "reverse":
+            self._server = await serve(
+                self._handle_reverse,
+                self.host,
+                self.port,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=4 * 1024 * 1024,
+            )
+            logger.info("OneBot11 反向 WS 已监听 %s (等待 NapCat 连接)", self.endpoint)
+        else:
+            self._client_task = asyncio.create_task(self._run_forward(), name="onebot11-client")
+            logger.info("OneBot11 正向 WS 已启动, 目标 %s", self.endpoint)
+
+    def stop_inbound(self) -> None:
+        """停止接收新入站(幂等): 拒绝新连接/忽略新事件, 但不关闭既有连接."""
+        self._accepting = False
+
+    async def stop(self, timeout: float = 5.0) -> None:
+        """关闭连接与监听(幂等); 先关连接再关服务端, 避免关闭握手卡住监听."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._started = False
+        self._accepting = False
+
+        websocket, self._active = self._active, None
+        if websocket is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(websocket.close(), timeout=max(0.1, timeout / 2))
+
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.cancel()
+        self._pending.clear()
+
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+            with suppress(Exception):
+                await asyncio.wait_for(server.wait_closed(), timeout=max(0.1, timeout))
+
+        task, self._client_task = self._client_task, None
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        logger.info("OneBot11 传输已停止 (mode=%s)", self.mode)
+
+    # ------------------------------------------------------------------ 入站
+
+    async def _handle_reverse(self, websocket: ServerConnection) -> None:
+        """反向模式: NapCat 每条连接一个 handler 协程."""
+        if not self._authorized(websocket):
+            logger.warning("拒绝未通过 token 校验的 NapCat 连接: %s", self._peer(websocket))
+            with suppress(Exception):
+                await websocket.close(code=1008, reason="unauthorized")
+            return
+        if not self._accepting:
+            logger.info("已停止入站, 拒绝新连接: %s", self._peer(websocket))
+            with suppress(Exception):
+                await websocket.close(code=1001, reason="stopping")
+            return
+
+        previous, self._active = self._active, websocket
+        if previous is not None and previous is not websocket:
+            logger.info("NapCat 建立新连接, 关闭旧连接: %s", self._peer(previous))
+            with suppress(Exception):
+                await previous.close(code=1000, reason="replaced")
+
+        logger.info("NapCat 已连接: %s", self._peer(websocket))
+        try:
+            await self._read_loop(websocket)
+        except ConnectionClosed as exc:
+            logger.info("NapCat 连接已关闭: %s", exc)
+        except Exception:  # noqa: BLE001 单条连接异常不影响监听
+            logger.exception("NapCat 连接处理异常")
+        finally:
+            if self._active is websocket:
+                self._active = None
+            logger.info("NapCat 已断开, 等待重连")
+
+    async def _run_forward(self) -> None:
+        """正向模式: 作为客户端连接 NapCat 的 WS 服务端, 指数退避重连."""
+        delay = self.reconnect_min
+        while not self._stopped:
+            try:
+                async with connect(
+                    self._build_uri(),
+                    additional_headers=self._auth_headers(),
+                    open_timeout=10,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=4 * 1024 * 1024,
+                ) as websocket:
+                    self._active = websocket
+                    logger.info("已连接 NapCat: %s", self.endpoint)
+                    delay = self.reconnect_min
+                    await self._read_loop(websocket)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 连接失败/断开都走重连
+                if not self._stopped:
+                    logger.warning("NapCat 连接失败或断开(%r), %.1fs 后重连", exc, delay)
+            finally:
+                self._active = None
+            if self._stopped:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, self.reconnect_max)
+
+    async def _read_loop(self, websocket: Any) -> None:
+        async for raw in websocket:
+            if isinstance(raw, bytes):
+                try:
+                    raw = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    logger.warning("收到非 UTF-8 字节帧, 已忽略")
+                    continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError):
+                logger.warning("收到非法 JSON 帧, 已忽略: %.200s", raw)
+                continue
+            if not isinstance(payload, dict):
+                logger.warning("收到非对象 JSON 帧, 已忽略: %.200s", raw)
+                continue
+            await self._dispatch(payload)
+
+    async def _dispatch(self, payload: dict[str, Any]) -> None:
+        echo = payload.get("echo")
+        if echo is not None and ("retcode" in payload or "status" in payload):
+            future = self._pending.pop(str(echo), None)
+            if future is not None and not future.done():
+                future.set_result(payload)
+            return
+
+        incoming = event_to_incoming(payload, channel=self.channel)
+        if incoming is None:
+            logger.debug(
+                "忽略 OneBot 事件: post_type=%s message_type=%s",
+                payload.get("post_type"),
+                payload.get("message_type"),
+            )
+            return
+        if not self._accepting:
+            logger.debug("已停止入站, 丢弃消息: id=%s", incoming.message_id)
+            return
+        if self._handler is None:
+            logger.warning("未注入入站处理器, 丢弃消息: id=%s", incoming.message_id)
+            return
+        try:
+            await self._handler(incoming)
+        except Exception:  # noqa: BLE001 处理器异常不杀读循环
+            logger.exception("OneBot 入站分发失败: id=%s", incoming.message_id)
+
+    # ------------------------------------------------------------------ 出站
+
+    async def send(self, envelope: Envelope) -> None:
+        """把出站信封发给主人私聊; 未连接时丢弃并记 warning(fail-soft)."""
+        text = (envelope.text or "").strip()
+        if not text:
+            return
+
+        websocket = self._active
+        if websocket is None or websocket.state is not State.OPEN:
+            logger.warning("NapCat 未连接, 丢弃出站消息: id=%s", envelope.message_id)
+            return
+
+        target = (envelope.conversation_id or envelope.sender_id or "").strip()
+        if not target:
+            logger.warning("出站消息缺少 conversation_id/sender_id, 丢弃: id=%s", envelope.message_id)
+            return
+        user_id: Any = int(target) if target.isdigit() else target
+
+        chunks = chunk_text(text, self.max_text_chars)
+        for index, chunk in enumerate(chunks, start=1):
+            params = {"user_id": user_id, "message": [{"type": "text", "data": {"text": chunk}}]}
+            result = await self._call_api(websocket, "send_private_msg", params)
+            if result is None:
+                # 连接已断或超时: 停止后续分片, 避免无谓等待
+                return
+            logger.debug(
+                "已发送 QQ 私聊消息: id=%s chunk=%d/%d chars=%d",
+                envelope.message_id,
+                index,
+                len(chunks),
+                len(chunk),
+            )
+
+    async def _call_api(
+        self,
+        websocket: Any,
+        action: str,
+        params: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """发送动作并等待 ``echo`` 响应; 超时/失败返回 None(已记日志)."""
+        echo = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending[echo] = future
+        try:
+            await websocket.send(
+                json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False)
+            )
+            response = await asyncio.wait_for(future, timeout=self.action_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("OneBot 动作超时(%.1fs): %s", self.action_timeout, action)
+            return None
+        except ConnectionClosed as exc:
+            logger.warning("OneBot 动作发送失败(连接已关闭): %s (%s)", action, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 发送失败只影响本条消息
+            logger.warning("OneBot 动作发送失败: %s (%r)", action, exc)
+            return None
+        finally:
+            self._pending.pop(echo, None)
+
+        retcode = response.get("retcode")
+        if response.get("status") != "ok" and retcode != 0:
+            logger.warning(
+                "OneBot 动作返回失败: %s retcode=%s message=%s",
+                action,
+                retcode,
+                response.get("message") or response.get("wording") or "",
+            )
+            return None
+        return response
+
+    # ------------------------------------------------------------------ 鉴权/工具
+
+    def _authorized(self, websocket: ServerConnection) -> bool:
+        """反向模式 token 校验: 支持 ``?access_token=`` 与 ``Authorization: Bearer``."""
+        if not self.token:
+            return True
+        request = getattr(websocket, "request", None)
+        if request is None:  # pragma: no cover - 新版本 websockets 一定带 request
+            return False
+        query = parse_qs(urlsplit(getattr(request, "path", "") or "").query)
+        provided = (query.get("access_token") or [None])[0]
+        if provided is None:
+            headers = getattr(request, "headers", None) or {}
+            authorization = headers.get("Authorization") or headers.get("authorization") or ""
+            if isinstance(authorization, str) and authorization.lower().startswith("bearer "):
+                provided = authorization[7:].strip()
+        return hmac.compare_digest(str(provided or ""), self.token)
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
+
+    def _build_uri(self) -> str:
+        query = f"?access_token={quote(self.token)}" if self.token else ""
+        return f"ws://{self.host}:{self.port}{self.path}{query}"
+
+    @staticmethod
+    def _peer(websocket: ServerConnection) -> str:
+        address = getattr(websocket, "remote_address", None)
+        return f"{address[0]}:{address[1]}" if isinstance(address, tuple) and len(address) >= 2 else "unknown"
+
+
+class OneBot11Adapter(QqAdapter):
+    """``QqAdapter`` + ``OneBot11Transport`` 生命周期(实现网关适配器契约).
+
+    ``BaseChannelAdapter`` 只管理出站消费循环, 平台连接由本类接管:
+    先起出站消费再接收入站(契约要求), 关闭时先停入站(保留连接以送达在途回复),
+    最后在 ``stop()`` 里断开连接。
+    """
+
+    def __init__(self, transport: OneBot11Transport, *, channel: str = "qq") -> None:
+        super().__init__(channel=channel, transport=transport.send)
+        self.onebot = transport
+        self.onebot.set_handler(self.feed)
+
+    async def start(self, bus: MessageBus) -> None:
+        await super().start(bus)
+        try:
+            await self.onebot.start()
+        except BaseException:
+            await super().stop()
+            raise
+
+    async def stop_inbound(self) -> None:
+        await super().stop_inbound()
+        self.onebot.stop_inbound()
+
+    async def stop(self, timeout: float = 5.0) -> None:
+        await self.onebot.stop(timeout)
+        await super().stop(timeout)
+
+
+__all__ = [
+    "DEFAULT_ACTION_TIMEOUT",
+    "DEFAULT_MAX_TEXT_CHARS",
+    "MESSAGE_TYPE_PRIVATE",
+    "POST_TYPE_MESSAGE",
+    "OneBot11Adapter",
+    "OneBot11Transport",
+    "chunk_text",
+    "event_to_incoming",
+    "extract_text",
+    "strip_cq_codes",
+]

@@ -29,6 +29,14 @@ from meowmeowclaw.config import (
     DEFAULT_MEMORY_MAX_CHARS,
     DEFAULT_MEMORY_MAX_TURNS,
     DEFAULT_MODEL,
+    DEFAULT_QQ_ACTION_TIMEOUT,
+    DEFAULT_QQ_MESSAGE_CHUNK_CHARS,
+    DEFAULT_QQ_OWNER_ID,
+    DEFAULT_QQ_TOKEN,
+    DEFAULT_QQ_WS_HOST,
+    DEFAULT_QQ_WS_MODE,
+    DEFAULT_QQ_WS_PATH,
+    DEFAULT_QQ_WS_PORT,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_TIMEOUT,
     DEFAULT_TOKEN_BUDGET,
@@ -85,6 +93,23 @@ ENV_KEYS = (
     "GATEWAY_BUS_MAXSIZE",
     "GATEWAY_PUBLISH_TIMEOUT",
     "GATEWAY_SHUTDOWN_TIMEOUT",
+    "QQ_OWNER_ID",
+    "QQ_OWNER",
+    "OWNER_QQ",
+    "QQ_WS_MODE",
+    "NAPCAT_WS_MODE",
+    "QQ_WS_HOST",
+    "NAPCAT_WS_HOST",
+    "QQ_WS_PORT",
+    "NAPCAT_WS_PORT",
+    "QQ_WS_PATH",
+    "NAPCAT_WS_PATH",
+    "QQ_TOKEN",
+    "NAPCAT_TOKEN",
+    "QQ_ACTION_TIMEOUT",
+    "QQ_API_TIMEOUT",
+    "QQ_MESSAGE_CHUNK_CHARS",
+    "QQ_MAX_MESSAGE_CHARS",
 )
 
 
@@ -656,6 +681,95 @@ class TestSettingsObject:
         env = write_env(tmp_path, "model=m\n")
 
         assert load_settings(env).source == str(env)
+
+
+# ------------------------------------------------------------ QQ 渠道配置
+
+
+class TestQqSettings:
+    def test_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.qq_owner_id == DEFAULT_QQ_OWNER_ID
+        assert s.qq_ws_mode == DEFAULT_QQ_WS_MODE
+        assert s.qq_ws_host == DEFAULT_QQ_WS_HOST
+        assert s.qq_ws_port == DEFAULT_QQ_WS_PORT
+        assert s.qq_ws_path == DEFAULT_QQ_WS_PATH
+        assert s.qq_token == DEFAULT_QQ_TOKEN
+        assert s.qq_action_timeout == DEFAULT_QQ_ACTION_TIMEOUT
+        assert s.qq_message_chunk_chars == DEFAULT_QQ_MESSAGE_CHUNK_CHARS
+
+    def test_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "qq_owner_id=2328428288\n"
+            "qq_ws_mode=forward\n"
+            "qq_ws_host=10.0.0.5\n"
+            "qq_ws_port=3001\n"
+            "qq_ws_path=onebot/v11/ws\n"
+            "qq_token=meowclaw-3100\n"
+            "qq_action_timeout=3.5\n"
+            "qq_message_chunk_chars=1200\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.qq_owner_id == "2328428288"
+        assert s.qq_ws_mode == "forward"
+        assert s.qq_ws_host == "10.0.0.5"
+        assert s.qq_ws_port == 3001
+        assert s.qq_ws_path == "/onebot/v11/ws"  # 自动补前导斜杠
+        assert s.qq_token == "meowclaw-3100"
+        assert s.qq_action_timeout == 3.5
+        assert s.qq_message_chunk_chars == 1200
+
+    def test_aliases(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "qq_owner=10001\nnapcat_ws_mode=forward\nnapcat_ws_port=3002\nnapcat_token=tok\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.qq_owner_id == "10001"
+        assert s.qq_ws_mode == "forward"
+        assert s.qq_ws_port == 3002
+        assert s.qq_token == "tok"
+
+    @pytest.mark.parametrize("raw", ["REVERSE", "Reverse"])
+    def test_mode_is_case_insensitive(self, tmp_path, raw):
+        assert load_settings(write_env(tmp_path, f"qq_ws_mode={raw}\n")).qq_ws_mode == "reverse"
+
+    def test_invalid_mode_falls_back(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, "qq_ws_mode=sideways\n"))
+
+        assert s.qq_ws_mode == DEFAULT_QQ_WS_MODE
+        assert any("qq_ws_mode" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize("raw", ["0", "65536", "-1", "abc"])
+    def test_invalid_port_falls_back(self, tmp_path, caplog, raw):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, f"qq_ws_port={raw}\n"))
+
+        assert s.qq_ws_port == DEFAULT_QQ_WS_PORT
+        assert any("qq_ws_port" in record.message for record in caplog.records)
+
+    def test_blank_values_fall_back(self, tmp_path):
+        s = load_settings(
+            write_env(tmp_path, "qq_ws_host=\nqq_ws_path=\nqq_ws_mode=\nqq_action_timeout=\n")
+        )
+
+        assert s.qq_ws_host == DEFAULT_QQ_WS_HOST
+        assert s.qq_ws_path == DEFAULT_QQ_WS_PATH
+        assert s.qq_ws_mode == DEFAULT_QQ_WS_MODE
+        assert s.qq_action_timeout == DEFAULT_QQ_ACTION_TIMEOUT
+
+    def test_repr_masks_qq_token(self):
+        text = repr(Settings(qq_token="meowclaw-3100"))
+
+        assert "meowclaw-3100" not in text
+        assert "qq_token=***" in text
 
 
 # ------------------------------------------------- 模块级副作用护栏

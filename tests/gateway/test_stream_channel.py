@@ -228,6 +228,9 @@ class TestDispatcherStreamPhases:
         assert events[0].correlation_id == "m-1"
         # worker 确实拿到了 on_delta 回调(该轮走流式)
         assert conversation.calls[0]["on_delta"] is not None
+        # 流式观测计数(S6): 2 条 delta 入队, 0 条丢弃
+        assert dispatcher.stream_deltas_published == 2
+        assert dispatcher.stream_deltas_dropped == 0
 
     @pytest.mark.asyncio
     async def test_stream_disabled_emits_only_reply(self):
@@ -290,6 +293,8 @@ class TestDispatcherStreamPhases:
             await dispatcher.stop()
 
         assert bus.best_effort_calls == 2
+        assert dispatcher.stream_deltas_published == 0
+        assert dispatcher.stream_deltas_dropped == 2
         assert [event.metadata.get("phase") for event in events] == [
             STREAM_PHASE_START,
             STREAM_PHASE_END,
@@ -300,7 +305,11 @@ class TestDispatcherStreamPhases:
 
     def test_gateway_stats_exposes_stream_flag(self):
         gateway = Gateway(conversation=StubConversation(), stream_enabled=True)
-        assert gateway.stats()["stream_enabled"] is True
+        stats = gateway.stats()
+
+        assert stats["stream_enabled"] is True
+        assert stats["stream_deltas_published"] == 0
+        assert stats["stream_deltas_dropped"] == 0
         assert Gateway(conversation=StubConversation()).stats()["stream_enabled"] is False
 
 

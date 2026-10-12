@@ -1,9 +1,9 @@
 # MeowMeowClaw 流式输出设计（v1：Provider 流式 / CLI 逐字 / QQ 伪流式）
 
-> 状态：**设计已确认（2026-10-12），按 §9 里程碑实施**。本文定义流式输出的行为、契约、里程碑与验收标准；
+> 状态：**全部里程碑已完成（S1–S5.1 + S6，2026-10-12）**。本文定义流式输出的行为、契约、里程碑与验收标准；
 > 只新增能力，**不改 JSONL 存储格式、不改 AgentLoop 护栏与上下文压缩语义**。
-> 首批范围 **S1–S4**（地基 / 网关通道 / CLI 流式 / QQ typing）；S5(`block`) 与 S6 收尾在用户真机验证后再排期；
-> 进度回填 §9.3 与 §12。
+> 落地范围：地基(S1) / 网关通道(S2) / CLI 逐字(S3) / QQ typing(S4) / QQ block(S5) / block 均匀性修复(S5.1) / 收尾(S6)；
+> 进度与实测见 §9.3、§12。`stream_enabled` 代码默认仍为 `false`（用户 .env 已开启）。
 > 关联：`meowmeowclaw/llm/base.py`、`meowmeowclaw/llm/openai_compat.py`、`meowmeowclaw/agent/loop.py`、
 > `meowmeowclaw/conversation.py`、`meowmeowclaw/gateway/`、`meowmeowclaw/channels/`、
 > `docs/GATEWAY_DESIGN.md`、`docs/MEMORY_DESIGN.md`、`docs/CONTEXT_COMPRESSION_DESIGN.md`。
@@ -453,7 +453,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S4 QQ typing | 已完成 | `e87ed37` | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
 | S5 QQ block | 已完成 | `1ab8193` | 2026-10-12 | 新增 30 用例；修复 TypingKeepAlive 无限等待缺陷 |
 | S5.1 block 均匀性 | 已完成 | `a731860` | 2026-10-12 | 用户实测反馈: 首块 22 字 + 尾块 700 字；新增 39 用例 |
-| S6 收尾 | 待排期 | — | — | 文档/冒烟随 S1–S4 增量同步 |
+| S6 收尾 | 已完成 | 待回填 | 2026-10-12 | README/网关文档同步；`stats()` 流式计数；真机记录回填 |
 
 状态取值：`待确认 → 未开始 → 进行中 → 已完成 / 已放弃（附原因）`；每个里程碑**独立提交**，提交前必须满足：
 ① `ruff check` 通过；② 全量回归不低于基线；③ 该里程碑新增测试全绿；④ 回填本表与 §12。
@@ -560,7 +560,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S4 | `e87ed37` | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
 | S5 | `1ab8193` | 2026-10-12 | `BlockSegmenter`(段落/换行/句末/逗号/硬切 + 代码围栏保护)；`OneBot11Adapter` block 模式(首块阈值 + 最小间隔 + 条数封顶 + 水位线补发)；`qq_stream_first_chars/min_chars/min_interval/max_messages/hard_chars` 配置；`TypingKeepAlive` 改协作式停止(修复无限等待)；新增 test_streaming(+16)/test_onebot11(+6)/QQ 集成(+2)/config(+6) | ruff 通过；全量回归；端到端: 气泡拼接 == 完整回答、条数 ≤ max+1、无重复 |
 | S5.1 | `a731860` | 2026-10-12 | `BlockSegmenter` 改为窗口内取"最贴 target"边界；触发门槛改为首块 `max(first,min)` / 后续 `target`；中间气泡预留收尾槽位；`split_evenly` 收尾均分 + `flush_interval`；新增 `qq_stream_target_chars/max_block_chars/flush_interval`，`hard_chars` 降级为别名；新增 `tests/channels/test_block_uniformity.py`(10) + 分段/适配器/配置用例更新 | ruff 通过；全量回归；用用户原文实测 722 字 → 5 条极差 34、288 字 → 2 条极差 2 |
-| S6 | — | — | — | — |
+| S6 | 待回填 | 2026-10-12 | README 新增「流式输出」章节 + 配置表 12 项 + 目录结构/模块表更新；`GATEWAY_DESIGN.md` 补 `KIND_STREAM`/`delta_seq`/best-effort 语义与 §16.6 接入小结；`Gateway.stats()` 新增 `stream_deltas_published/dropped`；§12 真机与参数标定回填 | ruff 通过；全量回归 1244 passed |
 
 ### 12.2 真机实测结论
 
@@ -569,17 +569,24 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | NapCat 动作枚举（183 个）中无消息编辑 API | 已确认（源码勘察） | 2026-10-12 |
 | `set_input_status` 可用性 | 真实 NapCat（Windows, 机器人 3768130928）连入 WSL2 Agent 后调用成功；`event_type=1/0/2` 均返回 `retcode ok` | 2026-10-12 |
 | `set_input_status` 采用值 | 取 `event_type=1`（与 NapCat 源码 `payloadExample` 及其自身 `input_status` notice 默认值一致）；0/2 的结束态语义暂无差异，保持不发送 | 2026-10-12 |
-| "对方正在输入" 的 QQ 客户端实际观感 | **待用户真机确认**（脚本只能验证接口成功） | — |
-| `block` 模式: 文本完整性与条数封顶 | **已自动化验证**（假 NapCat 端到端: 中间气泡 + 最终补发拼接 == 完整回答, 条数 ≤ `max_messages+1`, 无重复/无缺失） | 2026-10-12 |
-| `block` 模式观感与风控表现 | **待用户真机确认**（脚本只能验证协议与文本完整性） | — |
+| "对方正在输入" 的 QQ 客户端观感 | 用户 S5 真机测试（block 模式, 首块前会显示）未反馈异常；`typing` 档位可随时复核 | 2026-10-12 |
+| `block` 模式: 文本完整性与条数封顶 | **已自动化验证**（假 NapCat 端到端: 中间气泡 + 最终补发拼接 == 完整回答, 条数受上限约束, 无重复/无缺失） | 2026-10-12 |
+| `block` 模式观感与风控 | **用户真机实测**: 能输出多气泡、无风控异常；但发现分块严重不均（首块 22 字 / 尾块 700 字）→ 触发 S5.1 修复（§12.4） | 2026-10-12 |
+| S5.1 修复后复测 | 用户复测后进入 S6 收尾（视为通过）；后续如需微调可用 `qq_stream_target_chars` 调块大小 | 2026-10-12 |
+| S6 进程级冒烟 | 隔离端口 + 假 NapCat + `stream_enabled=true/qq_stream_mode=block`：网关启动、`stats()` 带流式计数、收发正常、优雅关闭 | 2026-10-12 |
 
 ### 12.3 参数标定记录
 
 | 参数 | 初值 | 真机标定值 | 依据 |
 |---|---|---|---|
-| `qq_stream_min_interval` | 2.5s | — | 观感 + 风控观察 |
-| `qq_stream_max_messages` | 5 | — | 观感 |
-| `qq_stream_first_chars` | 60 | — | 首字延迟 |
+| `qq_stream_min_interval` | 2.5s | **2.5s** | 用户 S5 真机测试无风控异常 |
+| `qq_stream_max_messages` | 5 | **5** | 用户确认（单轮总气泡上限） |
+| `qq_stream_first_chars` | 60 | **150（=target）** | S5.1: 首块下限偏小会挤占预算、尾块变大；调小可更早见首块（显式权衡） |
+| `qq_stream_min_chars` | 80 | **80** | 单块硬下限 |
+| `qq_stream_target_chars` | — | **150** | S5.1 用户确认；同级边界取最贴近它的 |
+| `qq_stream_max_block_chars` | — | **260** | S5.1 用户确认；单块硬上限 |
+| `qq_stream_flush_interval` | — | **0.3s** | S5.1 用户确认；收尾补发块间隔 |
+| `qq_stream_hard_chars` | 900 | **废弃（别名）** | S5.1: 语义并入 `max_block_chars` |
 
 ### 12.4 缺陷修复记录
 

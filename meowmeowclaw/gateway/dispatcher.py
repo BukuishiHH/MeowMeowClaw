@@ -56,6 +56,9 @@ class GatewayDispatcher:
         self.shutdown_timeout = float(shutdown_timeout)
         # 流式总开关: false 时不产生任何 KIND_STREAM 信封, 也不给 worker 传 on_delta(零回归)
         self.stream_enabled = bool(stream_enabled)
+        # 流式观测(S6): delta 成功入队 / 被丢弃(背压或总线关闭)的条数
+        self.stream_deltas_published = 0
+        self.stream_deltas_dropped = 0
         self._semaphore = asyncio.Semaphore(max_inflight)
         self._inflight: set[asyncio.Task] = set()
         self._task: Optional[asyncio.Task] = None
@@ -208,14 +211,19 @@ class GatewayDispatcher:
         """delta 走 best-effort: 队列满/总线关闭直接丢弃, 不写死信, 不影响本轮."""
         envelope = make_stream_event(request, phase=STREAM_PHASE_DELTA, text=text, seq=seq)
         target = outbound_queue(envelope.target_channel or envelope.channel)
+        delivered = False
         try:
             publish_best_effort = getattr(self.bus, "publish_best_effort", None)
             if publish_best_effort is not None:
-                await publish_best_effort(target, envelope)
+                delivered = bool(await publish_best_effort(target, envelope))
             else:  # 自定义总线未实现 best-effort 时退化为普通发布
-                await self.bus.publish(target, envelope)
+                delivered = bool(await self.bus.publish(target, envelope))
         except GatewayClosedError:
             logger.debug("总线已关闭, 丢弃流式增量: correlation=%s", envelope.correlation_id)
+        if delivered:
+            self.stream_deltas_published += 1
+        else:
+            self.stream_deltas_dropped += 1
 
     async def _publish_stream(self, request: Envelope, phase: str) -> None:
         """start/end 相位: 与 reply 同级别的强语义."""

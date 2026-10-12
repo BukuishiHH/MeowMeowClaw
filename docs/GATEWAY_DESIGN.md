@@ -114,7 +114,7 @@ meowmeowclaw/gateway/
 ```python
 @dataclass(frozen=True)
 class Envelope:
-    kind: str                        # request / reply / command / push / error
+    kind: str                        # request / reply / command / push / error / stream
     channel: str                     # 入站=来源渠道；出站=目标渠道
     scope: str = "private"           # private / group / session
     conversation_id: str = ""        # QQ uin / 群 group_id / CLI session / Web 会话
@@ -128,6 +128,7 @@ class Envelope:
     created_at_ms: int = 0           # 网关内部时间
     target_channel: Optional[str] = None  # 出站路由键；入站可为 None
     metadata: dict[str, Any] = field(default_factory=dict)
+    delta_seq: int = 0               # 仅 KIND_STREAM 的 delta 相位使用（单调递增，便于排障）
 ```
 
 约定：
@@ -138,6 +139,10 @@ class Envelope:
 - **直发命令回复**：`kind="reply"`，由 Policy 构造，`metadata["source"]="policy"`；
 - **错误回复**：`kind="error"`，走同一出站队列（v1 仅日志，不额外造文案）；
 - **主动推送**：`kind="push"`，只要求 `target_channel + conversation_id + text`，v1 预留；
+- **流式相位（S1–S5.1）**：`kind="stream"`，`metadata["phase"] ∈ {start, delta, end}`；
+  `start/end` 走强语义（进死信，用于"正在输入"等状态开关），`delta` 走
+  `MessageBus.publish_best_effort()`（背压直接丢弃、**不写死信**，避免流式刷爆排障队列）；
+  完整设计与实测见 **`docs/STREAMING_DESIGN.md`**；
 - `message_id` 是幂等键；`correlation_id` 只用于配对，不参与去重；
 - Envelope 是不可变对象；跨队列传递不做深拷贝（单进程内约定只读）。
 
@@ -150,7 +155,7 @@ class Envelope:
 | 键 | 方向 | 消费者 |
 |---|---|---|
 | `inbound` | 适配器 → dispatcher | `GatewayDispatcher`（单任务） |
-| `outbound:<channel>` | dispatcher/worker → 适配器 | 对应 `ChannelAdapter`（每渠道一个消费任务） |
+| `outbound:<channel>` | dispatcher/worker → 适配器 | 对应 `ChannelAdapter`（每渠道一个消费任务）；`kind=stream` 的相位信封也走这里 |
 | `deadletter` | 失败/超时 → 调试 | 人工/日志（v1 不实现自动重放） |
 
 ### 4.2 契约
@@ -192,6 +197,8 @@ class ChannelAdapter(Protocol):
   异常只 warning（单条失败不杀循环）；
 - 入站辅助：`make_inbound(...)` 生成 Envelope 并 `await bus.publish(INBOUND, env)`；
 - 适配器只做协议转换与收发，**不做会话策略**（策略在 Policy 层）；
+- 适配器可消费 `kind=stream` 相位：`start/end` 用于状态类动作（如 QQ "正在输入"），
+  `delta` 由渠道自行决定如何呈现（CLI 逐字 / QQ 分块 / 直接忽略），**绝不逐条转发为平台消息**；
 - 生命周期分两段：`stop_inbound()` 先停入站，等 dispatcher/in-flight 排空后由 Gateway 调用 `stop()`，
   后者排空本渠道出站队列（超时丢弃 + warning）再取消出站消费任务；`start/stop_inbound/stop` 均幂等；
   不得在 `send` 中做无超时阻塞。
@@ -380,6 +387,12 @@ await bus.publish(outbound_queue(env.channel), reply)
 | `qq_token` | 空 | 与 NapCat 网络配置 Token 一致；反向模式服务端校验 |
 | `qq_action_timeout` | `10` | 单次 OneBot 动作等待响应秒数 |
 | `qq_message_chunk_chars` | `3000` | 单条 QQ 消息字符上限，超长自动分片 |
+| `stream_enabled` | `false` | 流式输出总开关；false 时不产生任何 `kind=stream` 信封（零回归） |
+| `qq_stream_mode` | `typing` | `off` / `typing`（"正在输入"+1 条气泡）/ `block`（渐进式多气泡） |
+| `cli_stream` | `true` | CLI 逐字输出（需 `stream_enabled=true`） |
+
+> 流式的呈现参数（`qq_typing_*`、`qq_stream_first/min/target/max_block/min_interval/max_messages/flush_interval`、
+> `stream_preamble_*`）见 `docs/STREAMING_DESIGN.md` §6；`qq_stream_hard_chars` 已废弃（别名）。
 
 模块常量（暂不配置）：`GATEWAY_MAX_INFLIGHT=64`、`DEDUP_MAXSIZE=4096`、`DEADLETTER_MAX_KEEP=128`。
 解析与校验沿用 `config.py` 的"系统环境变量 > .env > 默认值 + 非法回退 + warning"模式；
@@ -581,11 +594,11 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 ### 16.2 实现文件
 
 - `meowmeowclaw/gateway/`：`envelope / bus / dedup / policy / adapter / worker / dispatcher / gateway`；
-- `meowmeowclaw/channels/`：`bridge / commands / qq_policy / qq_adapter / onebot11 / cli_policy / cli_adapter`
+- `meowmeowclaw/channels/`：`bridge / commands / qq_policy / qq_adapter / onebot11 / streaming / cli_policy / cli_adapter`
   + `qq_private` 兼容 facade；
 - `meowmeowclaw/qq.py`：QQ 渠道进程入口(`--check` / 信号 / 优雅关闭 / 周期状态日志)；
 - `bootstrap.build_gateway()` / `Application.gateway` / `cli._run_gateway_repl()`；
-- 配置项 `gateway_*` 4 个 + `qq_*` 8 个（见 §10）。
+- 配置项 `gateway_*` 4 个 + `qq_*` 8 个（见 §10）+ 流式 12 个（见 `docs/STREAMING_DESIGN.md` §6）。
 
 ### 16.3 默认开关决策：暂不翻转
 
@@ -626,6 +639,21 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 ### 16.5 待后续
 
 - 飞书/Web 适配器；`kind=push` 生产方；去重持久化；死信重放（可选）；
+- 流式输出后续项（`qq_stream_mode=block` 的观感调参、群聊/多模态流式）见
+  `docs/STREAMING_DESIGN.md` §12.3 / §16.5；
 - QQ 群聊策略与多模态（图片/语音）；正向 WS 模式的真实 NapCat 冒烟（代码已实现，当前真机用的是反向）；
 - A+（会话运行时生命周期 API 与 JSONL 尾读优化）设计已确认，实施排期见 `docs/A_PLUS_OPTIMIZATION.md`；
   在当前文档中按既定约定于网关整体功能完成后启动。
+
+### 16.6 流式输出接入（S1–S5.1，2026-10-12）
+
+- **Provider**：`LLMProvider.chat_stream()`（默认回退 `chat()`，未覆写者零破坏）；OpenAI 兼容实现按
+  index 拼装 `tool_calls` 分片、保留中断前文本；
+- **Agent/Gateway**：`run_turn(on_delta=...)` → dispatcher 以 `kind=stream` 三相位（start/delta/end）
+  下发；delta 走 best-effort，`push`/`reply` 仍为强语义；
+- **渠道**：CLI 逐字（水位线只补后缀）；QQ `typing`（NapCat `set_input_status` 续期）/ `block`
+  （`BlockSegmenter` 语义分块 + 节流封顶 + 收尾均分）；
+- **观测**：`Gateway.stats()` 增加 `stream_enabled / stream_deltas_published / stream_deltas_dropped`；
+- 实测：722 字 → `[137,159,148,125,145]`（5 条，极差 34）、288 字 → `[144,142]`；
+  与模型吐字节奏无关；全量回归 1244 passed。
+- 详见 `docs/STREAMING_DESIGN.md`。

@@ -5,8 +5,8 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 46 个源码模块 / 约 8830 行; 测试 41 个文件 / **1104 个用例**(1096 passed + 6 skipped + 2 xfailed)
-- **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊)
+- **代码规模**: 47 个源码模块 / 约 10310 行; 测试 47 个文件 / **1252 个用例**(1244 passed + 6 skipped + 2 xfailed)
+- **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
 ---
@@ -72,6 +72,20 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `qq_token` | 空 | 与 NapCat 网络配置里的 Token 一致; 留空不校验(reverse 下不建议) |
 | `qq_action_timeout` | `10` | 单次 OneBot 动作(发消息)等待响应秒数 |
 | `qq_message_chunk_chars` | `3000` | 单条 QQ 消息字符上限, 超长回复自动分片 |
+| `stream_enabled` | `false` | 流式输出总开关; `false` 时与旧版逐字节一致 |
+| `cli_stream` | `true` | CLI 逐字输出(需 `stream_enabled=true`) |
+| `qq_stream_mode` | `typing` | `off` / `typing`(仅"正在输入"+"1 条完整气泡) / `block`(渐进式多气泡) |
+| `qq_typing_indicator` | `true` | 是否发送"对方正在输入"(NapCat `set_input_status`) |
+| `qq_typing_refresh_seconds` | `5` | "正在输入"续期间隔(秒) |
+| `qq_stream_first_chars` | `150` | `block` 模式首块触发下限(默认=target; 调小可更早见首块) |
+| `qq_stream_min_chars` | `80` | `block` 模式单块硬下限 |
+| `qq_stream_target_chars` | `150` | `block` 模式理想块大小(同级边界里取最贴近它的) |
+| `qq_stream_max_block_chars` | `260` | `block` 模式单块硬上限(无自然边界时也在此处硬切) |
+| `qq_stream_min_interval` | `2.5` | 两条中间气泡最小间隔(秒) |
+| `qq_stream_max_messages` | `5` | **单轮总气泡上限**(含收尾补发) |
+| `qq_stream_flush_interval` | `0.3` | 收尾补发块之间的间隔(秒) |
+| `stream_suppress_tool_preamble` | `true` | 工具轮"前导文本"抑制(缓冲+宽限), `false`=过程旁白也发 |
+| `stream_preamble_grace_ms` / `_chars` | `1500` / `40` | 前导抑制的宽限窗口(毫秒 / 字符) |
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
 
@@ -146,6 +160,31 @@ python -m meowmeowclaw.qq            # 启动 QQ 渠道(等价入口: meowmeowcl
 - 图片/语音等非文本段转 `[图片]` `[语音]` 等占位符进入上下文, v1 不支持多模态回复;
 - 安全: 反向模式在服务端校验 Token; `stop_inbound()` 只停收新消息、保留连接, 保证优雅关闭时在途回复仍能送达。
 
+### 流式输出(CLI 逐字 / QQ 渐进式气泡)
+
+设计、里程碑与验收见 **`docs/STREAMING_DESIGN.md`**(S1–S5.1 已落地)。
+
+```ini
+stream_enabled=true          # 总开关; 默认 false(零行为变化)
+cli_stream=true              # CLI 逐字输出
+qq_stream_mode=typing        # off | typing | block
+```
+
+| 渠道 | 形态 | 说明 |
+|---|---|---|
+| CLI | 逐字打印 | 生成中实时输出; 最终只补发剩余后缀, **不会重打一遍** |
+| QQ `typing` | "对方正在输入…" + **1 条**完整气泡 | 默认档位; 0 中间气泡, 无刷屏风险 |
+| QQ `block` | **渐进式多条气泡** | 按语义边界分块(段落>换行>句末>逗号>硬切), 每块 80~260 字、贴近 target 150; 单轮总气泡 ≤5; 收尾按预算均分 |
+
+**QQ 无法编辑已发消息**(NapCat 183 个动作里没有 edit), 所以 QQ 侧只做"伪流式":
+`block` 靠**语义分块 + 节流 + 条数封顶**避免"一字一气泡", 最终答复只补发未送达的后缀
+(水位线保证不重复、不缺失); 模型吐字节奏不影响块大小(30/60/120 字一批结果一致)。
+
+- 不可调和的边界: 若模型先输出较长正文、再决定调用工具, 那部分旁白无法收回
+  (默认用 `stream_suppress_tool_preamble=true` 抑制, 见设计文档 §4.3/§8);
+- 观测: `Gateway.stats()` 含 `stream_enabled / stream_deltas_published / stream_deltas_dropped`;
+- 回滚: `qq_stream_mode=typing`(仅保留"正在输入") 或 `stream_enabled=false`(完全回到旧行为)。
+
 ### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)
 
 | 工具 | 能力 | 关键限制 |
@@ -213,7 +252,7 @@ python -m meowmeowclaw.qq            # 启动 QQ 渠道(等价入口: meowmeowcl
 | --- | ---: | --- | --- |
 | `meowmeowclaw/config.py` | 184 | 读 `.env`、校验兜底, 纯解析不产生副作用 | `load_config()` / `Settings` |
 | `meowmeowclaw/paths.py` | 40 | 项目根 / `.env` / workspace / 人设路径的唯一来源 | `PROJECT_ROOT` / `resolve_workspace()` / `IDENTITY_FILE` |
-| `meowmeowclaw/llm/base.py` | 65 | LLM 接入抽象 + **统一数据契约** | `LLMProvider.chat()`、`LLMResponse`、`ToolCallRequest`、`FINISH_REASON_*` |
+| `meowmeowclaw/llm/base.py` | 104 | LLM 接入抽象 + **统一数据契约** + 流式事件 | `LLMProvider.chat()` / `chat_stream()`、`StreamTextDelta` / `StreamFinal` |
 | `meowmeowclaw/llm/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
 | `meowmeowclaw/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
 | `meowmeowclaw/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
@@ -230,7 +269,7 @@ python -m meowmeowclaw.qq            # 启动 QQ 渠道(等价入口: meowmeowcl
 | `meowmeowclaw/memory/noop.py` | 42 | 长期记忆占位实现(v1 由 MEMORY.md 承担) | `NoopLongTermStore` |
 | `meowmeowclaw/memory/filelock.py` | 110 | 跨进程 advisory 文件锁(flock/msvcrt) | `FileLock` / `async_file_lock` |
 | `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
-| `meowmeowclaw/agent/loop.py` | 319 | **控制流**: 多轮往返、防爆护栏、历史快照 | `AgentLoop.run_turn()` / `AgentTurn` / `run()` / `clear_history()` |
+| `meowmeowclaw/agent/loop.py` | 459 | **控制流**: 多轮往返、防爆护栏、历史快照、流式增量与工具轮前导抑制 | `AgentLoop.run_turn(on_delta=...)` / `AgentTurn` / `run()` / `clear_history()` |
 | `meowmeowclaw/conversation.py` | 179 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/qq.py` | 223 | **QQ 渠道进程入口**: 配置校验/`--check`/装配/信号与优雅关闭/周期状态日志 | `main()` / `run_qq()` / `qq_config_problems()` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
@@ -238,7 +277,8 @@ python -m meowmeowclaw.qq            # 启动 QQ 渠道(等价入口: meowmeowcl
 | `meowmeowclaw/channels/commands.py` | 67 | 跨渠道会话指令公共逻辑(QQ/CLI 共用) | `SessionCommandHelper` |
 | `meowmeowclaw/channels/qq_policy.py` | 234 | QQ 策略: 身份过滤 / 6h 惰性轮换 / 指令 | `QqPolicy` |
 | `meowmeowclaw/channels/qq_adapter.py` | 47 | QQ 适配器(可注入 transport; 传输见 `onebot11.py`) | `QqAdapter` |
-| `meowmeowclaw/channels/onebot11.py` | 565 | **OneBot 11(NapCat)传输**: 反向服务端/正向客户端、token 鉴权、消息段↔文本、`send_private_msg`、分片、重连 | `OneBot11Transport` / `OneBot11Adapter` / `event_to_incoming()` |
+| `meowmeowclaw/channels/onebot11.py` | 826 | **OneBot 11(NapCat)传输**: 反向服务端/正向客户端、token 鉴权、消息段↔文本、`send_private_msg`、分片、重连、`set_input_status`、block 分段呈现 | `OneBot11Transport` / `OneBot11Adapter` |
+| `meowmeowclaw/channels/streaming.py` | 438 | **流式渲染基础件**: 水位线/前缀补发、语义分块(`BlockSegmenter`)、收尾均分(`split_evenly`)、"正在输入"续期(`TypingKeepAlive`) | `StreamAssembler` / `BlockSegmenter` / `split_evenly` |
 | `meowmeowclaw/channels/qq_private.py` | 260 | QQ active 指针存储 + `QqPrivateService` 兼容 facade | `QqPrivateActiveStore` / `QqPrivateService` |
 | `meowmeowclaw/channels/cli_policy.py` | 209 | CLI 策略: 会话生命周期 + /help /new /clear /sessions /tools /skills | `CliPolicy` |
 | `meowmeowclaw/channels/cli_adapter.py` | 111 | CLI 适配器: REPL + 总线收发 + Future 配对 | `CliAdapter` |
@@ -495,6 +535,10 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
 | `channels/test_qq_policy.py` | 11 | QQ 策略: 身份/轮换/指令/跨渠道删除 |
 | `channels/test_qq_adapter.py` | 3 | QQ 适配器: 入站转换/出站/停入站 |
+| `channels/test_streaming.py` | 29 | 流式基础件: 语义分块窗口/边界优先级/围栏保护/收尾均分/输入状态续期 |
+| `channels/test_block_uniformity.py` | 10 | **S5.1 回归**: 用实测原文验证 722/288 字分块均匀、内容一致、条数封顶 |
+| `tests/test_stream_llm.py` | 17 | 流式 Provider 契约: 默认回退/tool_calls 分片/空流回退/中断保文本/400 重试 |
+| `agent/test_loop_stream.py` | 11 | AgentLoop 增量外发与工具轮前导抑制 |
 | `channels/test_onebot11.py` | 32 | OneBot11: 文本/CQ 码提取、事件过滤、反向鉴权、正向重连、分片、stop_inbound 契约 |
 | `channels/test_qq_napcat_integration.py` | 7 | 假 NapCat 客户端 ↔ Agent 反向 WS 端到端(往返/忽略/指令/轮换/重连) |
 | `test_qq_entry.py` | 8 | QQ 入口: 配置校验、--check 输出、生命周期(启动→信号→优雅关闭) |
@@ -532,7 +576,7 @@ MeowMeowClaw/
 ├── pyproject.toml               # 依赖 / 控制台入口 / pytest 配置
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 41 个测试文件 / 1104 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 47 个测试文件 / 1252 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -571,8 +615,9 @@ MeowMeowClaw/
     │   ├── qq_adapter.py        # QqAdapter(可注入 transport)
     │   ├── onebot11.py          # OneBot11 传输(NapCat 反向/正向 WS) + OneBot11Adapter
     │   ├── qq_private.py        # active 指针 + 兼容 facade
+    │   ├── streaming.py         # 流式基础件: 水位线/语义分块/收尾均分/输入状态续期
     │   ├── cli_policy.py        # CliPolicy(会话/指令)
-    │   └── cli_adapter.py       # CliAdapter(REPL)
+    │   └── cli_adapter.py       # CliAdapter(REPL, 支持逐字输出)
     ├── gateway/                 # 单进程 asyncio 消息总线网关
     │   ├── envelope.py          # 统一信封
     │   ├── bus.py               # AsyncioQueueBus + 死信/观测
@@ -590,7 +635,7 @@ MeowMeowClaw/
 ## 11. 已知限制与 Roadmap
 
 - A+（会话 IO 尾读 + 运行时生命周期 + 指标）设计已确认、待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
-- 流式输出（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式）设计草案已提交，里程碑 S1–S6 与验收见 `docs/STREAMING_DESIGN.md`（待确认后按里程碑实现）
+- 流式输出已落地 **S1–S5.1**（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式，`stream_enabled` 默认 `false`）；里程碑、实测数据与验收见 `docs/STREAMING_DESIGN.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现
 - 技能系统边界见 [4.4](#44-边界): 纯文本、单层目录、不含脚本与资源随附

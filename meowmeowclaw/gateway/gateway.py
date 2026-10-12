@@ -81,6 +81,8 @@ class Gateway:
             "queue_sizes": sizes,
             "deadletter_count": deadletter,
             "stream_enabled": self.dispatcher.stream_enabled,
+            "stream_deltas_published": self.dispatcher.stream_deltas_published,
+            "stream_deltas_dropped": self.dispatcher.stream_deltas_dropped,
         }
 
     def register(self, adapter: ChannelAdapter) -> ChannelAdapter:

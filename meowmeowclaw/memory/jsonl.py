@@ -26,7 +26,7 @@ from typing import Any, Optional, Sequence, Union
 from .errors import InvalidSessionKeyError, SessionStoreError
 from .filelock import async_file_lock
 from .metrics import StoreMetrics, measure
-from .tail import read_header, read_last_valid_turn
+from .tail import read_header, read_last_lines, read_last_valid_turn
 from .models import (
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     MIN_SHORT_ID_LENGTH,
@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 HEADER_TYPE = "header"
 TURN_TYPE = "turn"
+# A3: load_recent 反向窗口读取的初始字节预算(UTF-8 最坏 4 字节/字符 + 一个块)
+_TAIL_BYTE_BUDGET_BASE = 64 * 1024
 
 
 @dataclass
@@ -252,6 +254,62 @@ class JsonlSessionStore:
             logger.warning("读取会话文件失败: %s (%r)", path, exc)
         return turns
 
+    @classmethod
+    def _read_turns_tail(
+        cls,
+        path: Path,
+        *,
+        max_turns: Optional[int],
+        max_chars: Optional[int],
+    ) -> list[dict[str, Any]]:
+        """A3: 反向块读, 只取窗口所需的末尾 turn(按时间顺序返回).
+
+        成本 O(窗口): 从文件尾向前按块读取, 命中 ``max_turns``/``max_chars`` 即停,
+        与文件总长度解耦; 返回结果是 ``_read_turns`` 结果的**后缀**, 上层继续执行
+        相同的 ``max_turns`` 切片与 ``_trim_by_chars``, 即可保证与全量路径逐字节一致。
+
+        字节预算是估计值(``max_chars * 4 + 64KB``): 不足时按块翻倍继续向前读,
+        直到满足窗口或到达文件头; 只有读到文件头才能确认"确实没有更多 turn"。
+        末尾半行/损坏行由 JSON 解析自然跳过, 与全量路径相同; 解码/IO 异常向上抛,
+        由调用方回退 ``_read_turns`` 全量路径(兼容性优先)。
+        """
+        if not path.is_file():
+            return []
+        budget = (
+            _TAIL_BYTE_BUDGET_BASE
+            if max_chars is None
+            else max_chars * 4 + _TAIL_BYTE_BUDGET_BASE
+        )
+        while True:
+            lines = read_last_lines(path, max_bytes=budget)
+            # read_last_lines 因达到预算而提前停: 可能有更旧的 turn 未读到, 需翻倍重试;
+            # 实际读到的字节数小于预算, 说明已经到文件头, 不可能再多了。
+            exhausted = sum(len(raw) + 1 for raw in lines) < budget
+            turns: list[dict[str, Any]] = []
+            char_total = 0
+            satisfied = False
+            for raw in lines:
+                record = cls._loads(raw.strip().decode("utf-8"))
+                if record is None:
+                    logger.warning("跳过损坏的 JSONL 行: %s", path)
+                    continue
+                if record.get("type") != TURN_TYPE:
+                    continue
+                turns.append(record)
+                if max_turns is not None and len(turns) >= max_turns:
+                    satisfied = True
+                    break
+                if max_chars is not None:
+                    char_total += cls._turn_char_size(record)
+                    # 累计字符已超过上限: 更旧的 turn 必被 _trim_by_chars 丢弃, 可以停
+                    if char_total > max_chars:
+                        satisfied = True
+                        break
+            if satisfied or exhausted:
+                turns.reverse()
+                return turns
+            budget *= 2
+
     @staticmethod
     def _key_from_header(header: dict[str, Any], fallback: SessionKey) -> SessionKey:
         canonical = header.get("session_key")
@@ -424,7 +482,24 @@ class JsonlSessionStore:
         if max_chars is not None and max_chars < 0:
             raise SessionStoreError("max_chars 不能为负数")
 
-        turns = await asyncio.to_thread(self._read_turns, self._active_path(key))
+        if max_turns == 0 or max_chars == 0:
+            # 窗口为空: 旧路径也会裁成空, 无需触碰文件
+            return []
+
+        path = self._active_path(key)
+        try:
+            # A3: 反向块读只取窗口所需尾部(成本 O(窗口)); 返回值是 _read_turns 的后缀
+            turns = await asyncio.to_thread(
+                self._read_turns_tail,
+                path,
+                max_turns=max_turns,
+                max_chars=max_chars,
+            )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            logger.warning("会话窗口尾读失败, 回退全量扫描: %s (%r)", path, exc)
+            turns = await asyncio.to_thread(self._read_turns, path)
+
+        # 与旧路径完全一致的裁剪顺序: 先 max_turns 后 max_chars(尾读已保证结果一致)
         if max_turns is not None:
             turns = turns[-max_turns:] if max_turns > 0 else []
         if max_chars is not None:

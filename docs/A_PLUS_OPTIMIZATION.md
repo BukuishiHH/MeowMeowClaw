@@ -1,7 +1,7 @@
 # MeowMeowClaw A+ 优化设计：会话 IO 尾读与运行时生命周期（v1）
 
-> 状态：**A1–A2 已完成（2026-10-12），A3–A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
-> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1。
+> 状态：**A1–A3 已完成（2026-10-12），A4–A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
+> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1–§8.3。
 > 关联：`docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5、`meowmeowclaw/memory/jsonl.py`、
 > `meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`。
 
@@ -296,7 +296,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 
 - [x] A1：`stats()` 可用；基准脚本输出与 §2.1 一致（实测偏差 ≤11%，见 §8.1）；
 - [x] A2：`get_meta/append_turn/list_sessions` 尾读路径通过全部契约与崩溃恢复用例（实测 O(1)，见 §8.2）；
-- [ ] A3：2000 轮 `load_recent` p95 ≤3ms 且平坦；差分测试通过；
+- [x] A3：2000 轮 `load_recent` p95 ≤3ms 且平坦；差分测试通过（实测 p95 1.57ms、50→2000 差值 0.09ms，见 §8.3）；
 - [ ] A4：`close_session/evict_idle/max_cached_sessions` 可用；归档/轮换/关停可释放；无并发回归；
 - [ ] A5：配置/README/ADR 同步；全量回归 + 真实 CLI/QQ 冒烟通过；
 - [ ] 更新 `docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5 与本文"实现记录"。
@@ -309,7 +309,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 |---|---|---|---|
 | A1 | 已完成 | `4f4d0bc` | metrics + `stats()` + 基准脚本；新增 28 用例；实测偏差 ≤11% |
 | A2 | 已完成 | `2fd8cd1` | 尾读工具 + 三路径改造；新增 37 用例；2000 轮 `get_meta` p95 0.53ms |
-| A3 | 待实现 | — | 依赖 A2（`load_recent` 仍为 O(总长度)，见 §8.2 基准） |
+| A3 | 已完成 | 待回填 | `load_recent` 反向块读 + 窗口裁剪；新增 212 用例；2000 轮 p95 1.57ms、50→2000 差值 0.09ms |
 | A4 | 待实现 | — | 依赖 A1（可与 A2/A3 并行） |
 | A5 | 待实现 | — | 依赖 A3+A4 |
 
@@ -381,3 +381,37 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 - 顺带收益：批量生成（`append_turn` × 2000）从 30.9s 降到 2.1s；
 - `load_recent` 本轮未改（35.27ms @2000，仍 O(总长度)）→ **A3 的目标**；
   1000 轮那一行的偏高属同机波动（同一代码路径两次采样 17.96ms / 22.51ms）。
+
+### 8.3 A3 实现记录（2026-10-12）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/memory/jsonl.py` | 新增 `_read_turns_tail()`（反向块读 + 字节预算按需翻倍 + 窗口命中即停）；`load_recent` 改走尾读，异常回退 `_read_turns` 全量路径；空窗口（0）直接返回 |
+| `scripts/bench_session_store.py` | 新增 50→2000 轮 `load_recent p95` 平坦性检查；A3 后基线偏差为负时判定为"优于 §2.1 基线（提速）"，不再误报 |
+| `tests/memory/test_jsonl_load_recent_tail.py`（新增） | 212 用例：200 组随机差分（每组 10 个窗口组合）＋ 12 个尾读/回退/预算/边界用例 |
+
+**实现要点**
+
+1. 复用 A2 反向块读从文件尾向前读；正常窗口在命中 `max_turns`、或"累计字符 > max_chars"（至少保留最新 1 轮）时立即停止，成本 O(窗口)，与文件总长度解耦；
+2. 初始字节预算 `max_chars * 4 + 64KB`（UTF-8 最坏 4 字节/字符）；预算内凑不齐窗口时翻倍重读，直到满足窗口或**确认到达文件头**（`read_last_lines` 实际返回字节数 < 当前预算）；`max_chars=None` 时从 64KB 起步同样翻倍；
+3. 尾读结果是全量 `_read_turns` 结果的**后缀**：累计字符已超上限那一轮之后，更旧轮必被 `_trim_by_chars` 丢弃，因此继续调用原裁剪函数即可保证与旧路径逐字节一致；不切断 turn、损坏行/半行跳过、`max_chars` 至少保留最新一轮等语义不变；
+4. 崩溃半行/损坏行/非 dict JSON 由 JSON 解析自然跳过；`max_turns=0 / max_chars=0` 不触碰文件；`OSError / UnicodeDecodeError / ValueError` 回退全量路径（非法 UTF-8 时两条路径最终都抛 `UnicodeDecodeError`，与旧行为一致）；
+5. **差分测试**：200 组随机文件 × 10 个窗口组合（含损坏行、非 dict JSON、空行、半行、中文、工具调用、无尾换行、超大行），尾读结果与"全量读取 + 相同 max_turns/max_chars 裁剪"逐消息一致。
+
+**基准复测（同机、20 次采样；A2 = A3 前，A3 = 本次；窗口 `max_turns=50 / max_chars=120000`）**
+
+| 轮数 | 文件 | `load_recent` A2 avg/p95 (ms) | `load_recent` A3 avg/p95 (ms) | p95 改进 |
+|---:|---:|---:|---:|---:|
+| 50 | 0.36 MB | 1.34 / 1.92 | **1.27 / 1.66** | 基本持平（文件小于初始预算） |
+| 200 | 1.42 MB | 4.12 / 5.00 | **1.77 / 2.44** | ~2.0x |
+| 500 | 3.56 MB | 9.55 / 11.64 | **1.72 / 2.43** | ~4.8x |
+| 1000 | 7.12 MB | 22.51 / 32.98 * | **1.54 / 1.82** | ~10.6x（对比另一采样 19.37ms） |
+| 2000 | 14.23 MB | 35.27 / 41.80 | **1.33 / 1.57** | ~26.6x |
+
+\* A2 的 1000 轮行有同机波动（同一代码路径另一次采样为 17.96 / 19.37ms），仅作粗略对照。
+
+- **G1 达标**：2000 轮 `load_recent` p95 1.57ms（≤3ms）；50→2000 轮 p95 差值 0.09ms、avg 差值 0.06ms（验收 ≤2ms），文件大小增长已不影响窗口读取；
+- 全量回归 **1521 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；既有崩溃恢复、双实例并发、归档/删除用例全绿；
+- 复现命令：`python scripts/bench_session_store.py`（可用 `--sizes/--samples/--keep` 调整）。

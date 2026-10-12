@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 49 个源码模块 / 约 10720 行; 测试 51 个文件 / **1317 个用例**(1309 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 49 个源码模块 / 约 10800 行; 测试 52 个文件 / **1529 个用例**(1521 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -265,7 +265,7 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/skills/tool.py` | 85 | `load_skill` 工具(技能子系统对 Agent 的唯一出口) | `LoadSkillTool` |
 | `meowmeowclaw/memory/models.py` | 381 | 会话数据模型 + `MemoryRecord`(结构化长期记忆) | `SessionKey` / `SessionMessage` / `MemoryRecord` / `new_memory_record` |
 | `meowmeowclaw/memory/store.py` | 96 | 仓储抽象: `SessionStore` + `LongTermStore`(async Protocol) | `SessionStore` / `LongTermStore` |
-| `meowmeowclaw/memory/jsonl.py` | 652 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行; A1 计时与 `stats()`; A2 三路径尾读 | `JsonlSessionStore` |
+| `meowmeowclaw/memory/jsonl.py` | 727 | JSONL 实现: 轮次原子写 / 窗口装载 / 归档 / 短 ID / 跨进程锁与崩溃补行; A1 计时与 `stats()`; A2 三路径尾读; A3 `load_recent` 反向块读窗口 | `JsonlSessionStore` |
 | `meowmeowclaw/memory/metrics.py` | 126 | **A+ A1 指标**: 有界延迟样本(count/avg/p50/p95)、三项主路径、`measure()` 计时 | `LatencyStats` / `StoreMetrics` |
 | `meowmeowclaw/memory/tail.py` | 114 | **A+ A2 尾读**: 反向块读完整行、惰性生成器命中即停、首行 header / 末条有效 turn | `read_header` / `read_last_lines` / `read_last_valid_turn` |
 | `meowmeowclaw/memory/noop.py` | 42 | 长期记忆占位实现(v1 由 MEMORY.md 承担) | `NoopLongTermStore` |
@@ -539,6 +539,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `channels/test_qq_adapter.py` | 3 | QQ 适配器: 入站转换/出站/停入站 |
 | `memory/test_tail.py` | 27 | A+ A2 尾读工具: 反向块读/UTF-8 跨块/超大行/上限/与全量等价 |
 | `memory/test_jsonl_tail_path.py` | 10 | A+ A2 存储层: 打桩证明不走全量、回退路径、A+1 累计口径、归档回退 |
+| `memory/test_jsonl_load_recent_tail.py` | 212 | **A+ A3 窗口尾读**: 200 组随机文件全量差分 + 预算翻倍/回退/半行/超大行/UTF-8 边界 |
 | `channels/test_streaming.py` | 29 | 流式基础件: 语义分块窗口/边界优先级/围栏保护/收尾均分/输入状态续期 |
 | `channels/test_block_uniformity.py` | 10 | **S5.1 回归**: 用实测原文验证 722/288 字分块均匀、内容一致、条数封顶 |
 | `tests/test_stream_llm.py` | 17 | 流式 Provider 契约: 默认回退/tool_calls 分片/空流回退/中断保文本/400 重试 |
@@ -582,7 +583,7 @@ MeowMeowClaw/
 │   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 51 个测试文件 / 1317 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 52 个测试文件 / 1529 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -610,7 +611,7 @@ MeowMeowClaw/
     │   ├── tail.py              # A+ A2: JSONL 反向块读(尾读 header/末条有效 turn)
     │   ├── models.py            # SessionKey / SessionMessage / MemoryRecord
     │   ├── store.py             # SessionStore + LongTermStore 抽象接口
-    │   ├── jsonl.py             # JsonlSessionStore 实现
+    │   ├── jsonl.py             # JsonlSessionStore 实现(A3: load_recent 反向块读窗口)
     │   ├── noop.py              # NoopLongTermStore(v1 占位)
     │   ├── filelock.py          # 跨进程 advisory 文件锁
     │   └── errors.py            # 记忆层错误类型
@@ -642,7 +643,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- A+（会话 IO 尾读 + 运行时生命周期 + 指标）设计已确认、待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
+- A+（会话 IO 尾读 + 运行时生命周期 + 指标）已落地 **A1–A3**（指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口）；**A4–A5**（运行时生命周期、配置与集成验收）待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
 - 流式输出已落地 **S1–S5.1**（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式，`stream_enabled` 默认 `false`）；里程碑、实测数据与验收见 `docs/STREAMING_DESIGN.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现

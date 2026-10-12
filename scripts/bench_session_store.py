@@ -13,7 +13,8 @@
 - ``load_recent(max_turns=50, max_chars=120000)`` 后再做一次 ``to_llm_message()`` 投影
   (与 ``ConversationService._load_history`` 同口径);
 - 每个指标采样 ``--samples`` 次(默认 20), 输出 avg / p95(ms), 并与 §2.1 基线对照;
-- 额外测量 ``list_sessions``(A2 验收项: 每会话只读 header + 末条有效 turn)。
+- 额外测量 ``list_sessions``(A2 验收项: 每会话只读 header + 末条有效 turn);
+- A3 后 ``load_recent`` 应显著低于 §2.1 基线(负偏差为提速), 并检查 50→2000 轮 p95 平坦性。
 
 实现说明: 生成阶段用 ``append_turn`` 逐轮写入(与真实路径同 schema);
 测量阶段换一个**全新 store 实例**(指标从零开始, 不含生成阶段噪声)。
@@ -174,9 +175,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     checked = [deviation for _, _, _, deviation in results if deviation == deviation]  # 非 NaN
     if checked:
         worst = max(abs(value) for value in checked)
-        verdict = "✅ 与 §2.1 一致(±20% 内)" if worst <= 20.0 else "⚠️ 与 §2.1 偏差 >20%, 请确认机器负载"
+        if worst <= 20.0:
+            verdict = "✅ 与 §2.1 基线一致(±20% 内)"
+        elif all(value <= 0 for value in checked):
+            verdict = "✅ 显著优于 §2.1 基线(A+ 尾读生效, 负偏差为提速)"
+        else:
+            verdict = "⚠️ 与 §2.1 偏差 >20%, 请确认机器负载"
         print()
         print(f"# load_recent avg 最大偏差 {worst:.0f}% → {verdict}")
+
+    # A3 验收: 50 → 2000 轮之间 load_recent p95 基本平坦(差值 ≤2ms)
+    by_turns = {turns: metrics for turns, _, metrics, _ in results}
+    if 50 in by_turns and 2000 in by_turns:
+        small = by_turns[50]["load_recent"].get("p95")
+        large = by_turns[2000]["load_recent"].get("p95")
+        if small is not None and large is not None:
+            delta_p95 = abs(float(large) - float(small))
+            flat_verdict = "✅" if delta_p95 <= 2.0 else "⚠️"
+            print(
+                f"# load_recent p95 平坦性: 50→2000 轮差值 {delta_p95:.2f}ms → {flat_verdict} "
+                "(A3 验收 ≤2ms)"
+            )
     return 0
 
 

@@ -398,9 +398,11 @@ class TestNapCatBlockStreaming:
                 typing_enabled=False,
                 block_first_chars=6,
                 block_min_chars=6,
+                block_target_chars=12,
+                block_max_chars=40,
                 block_min_interval=0.01,
                 block_max_messages=3,
-                block_hard_chars=200,
+                block_flush_interval=0.0,
             ),
         )
         try:

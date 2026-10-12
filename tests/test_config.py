@@ -39,10 +39,12 @@ from meowmeowclaw.config import (
     DEFAULT_QQ_STREAM_MODE,
     DEFAULT_QQ_TYPING_INDICATOR,
     DEFAULT_QQ_STREAM_FIRST_CHARS,
-    DEFAULT_QQ_STREAM_HARD_CHARS,
+    DEFAULT_QQ_STREAM_FLUSH_INTERVAL,
+    DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS,
     DEFAULT_QQ_STREAM_MAX_MESSAGES,
     DEFAULT_QQ_STREAM_MIN_CHARS,
     DEFAULT_QQ_STREAM_MIN_INTERVAL,
+    DEFAULT_QQ_STREAM_TARGET_CHARS,
     DEFAULT_QQ_TYPING_REFRESH_SECONDS,
     DEFAULT_QQ_WS_PORT,
     DEFAULT_STREAM_ENABLED,
@@ -131,8 +133,11 @@ ENV_KEYS = (
     "QQ_TYPING_INTERVAL",
     "QQ_STREAM_FIRST_CHARS",
     "QQ_STREAM_MIN_CHARS",
+    "QQ_STREAM_TARGET_CHARS",
+    "QQ_STREAM_MAX_BLOCK_CHARS",
     "QQ_STREAM_MIN_INTERVAL",
     "QQ_STREAM_MAX_MESSAGES",
+    "QQ_STREAM_FLUSH_INTERVAL",
     "QQ_STREAM_HARD_CHARS",
     "STREAM_ENABLED",
     "CLI_STREAM",
@@ -893,36 +898,61 @@ class TestStreamSettings:
 
         assert s.qq_stream_first_chars == DEFAULT_QQ_STREAM_FIRST_CHARS
         assert s.qq_stream_min_chars == DEFAULT_QQ_STREAM_MIN_CHARS
+        assert s.qq_stream_target_chars == DEFAULT_QQ_STREAM_TARGET_CHARS
+        assert s.qq_stream_max_block_chars == DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS
         assert s.qq_stream_min_interval == DEFAULT_QQ_STREAM_MIN_INTERVAL
         assert s.qq_stream_max_messages == DEFAULT_QQ_STREAM_MAX_MESSAGES
-        assert s.qq_stream_hard_chars == DEFAULT_QQ_STREAM_HARD_CHARS
+        assert s.qq_stream_flush_interval == DEFAULT_QQ_STREAM_FLUSH_INTERVAL
+        # 废弃字段与 max_block_chars 保持一致
+        assert s.qq_stream_hard_chars == DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS
 
     def test_qq_block_values(self, tmp_path):
         env = write_env(
             tmp_path,
             "qq_stream_first_chars=20\n"
             "qq_stream_min_chars=30\n"
+            "qq_stream_target_chars=90\n"
+            "qq_stream_max_block_chars=180\n"
             "qq_stream_min_interval=1.5\n"
             "qq_stream_max_messages=2\n"
-            "qq_stream_hard_chars=300\n",
+            "qq_stream_flush_interval=0\n",
         )
 
         s = load_settings(env)
 
         assert s.qq_stream_first_chars == 20
         assert s.qq_stream_min_chars == 30
+        assert s.qq_stream_target_chars == 90
+        assert s.qq_stream_max_block_chars == 180
         assert s.qq_stream_min_interval == 1.5
         assert s.qq_stream_max_messages == 2
-        assert s.qq_stream_hard_chars == 300
+        assert s.qq_stream_flush_interval == 0.0  # 0 = 收尾不等待
+
+    def test_qq_stream_hard_chars_is_deprecated_alias(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, "qq_stream_hard_chars=333\n"))
+
+        assert s.qq_stream_max_block_chars == 333  # 旧键按别名生效
+        assert s.qq_stream_hard_chars == 333
+        assert any("qq_stream_hard_chars 已废弃" in record.message for record in caplog.records)
+
+    def test_new_key_wins_over_deprecated_alias(self, tmp_path):
+        env = write_env(tmp_path, "qq_stream_hard_chars=333\nqq_stream_max_block_chars=200\n")
+
+        s = load_settings(env)
+
+        assert s.qq_stream_max_block_chars == 200
 
     @pytest.mark.parametrize(
         "line",
         [
             "qq_stream_first_chars=0\n",
             "qq_stream_min_chars=-1\n",
+            "qq_stream_target_chars=0\n",
+            "qq_stream_max_block_chars=0\n",
             "qq_stream_min_interval=0\n",
             "qq_stream_max_messages=abc\n",
-            "qq_stream_hard_chars=0\n",
+            "qq_stream_flush_interval=-1\n",
         ],
     )
     def test_qq_block_invalid_values_fall_back(self, tmp_path, caplog, line):
@@ -930,9 +960,11 @@ class TestStreamSettings:
         defaults = {
             "qq_stream_first_chars": DEFAULT_QQ_STREAM_FIRST_CHARS,
             "qq_stream_min_chars": DEFAULT_QQ_STREAM_MIN_CHARS,
+            "qq_stream_target_chars": DEFAULT_QQ_STREAM_TARGET_CHARS,
+            "qq_stream_max_block_chars": DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS,
             "qq_stream_min_interval": DEFAULT_QQ_STREAM_MIN_INTERVAL,
             "qq_stream_max_messages": DEFAULT_QQ_STREAM_MAX_MESSAGES,
-            "qq_stream_hard_chars": DEFAULT_QQ_STREAM_HARD_CHARS,
+            "qq_stream_flush_interval": DEFAULT_QQ_STREAM_FLUSH_INTERVAL,
         }
 
         with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):

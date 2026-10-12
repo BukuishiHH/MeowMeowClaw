@@ -110,8 +110,9 @@ def _print_check(config: Settings, transport: OneBot11Transport) -> None:
     print(
         "  qq_stream_*            : "
         f"first={config.qq_stream_first_chars} min={config.qq_stream_min_chars} "
-        f"interval={config.qq_stream_min_interval} max={config.qq_stream_max_messages} "
-        f"hard={config.qq_stream_hard_chars}"
+        f"target={config.qq_stream_target_chars} max_block={config.qq_stream_max_block_chars} "
+        f"interval={config.qq_stream_min_interval} max_msgs={config.qq_stream_max_messages} "
+        f"flush={config.qq_stream_flush_interval}"
     )
     print(f"  stream_enabled         : {config.stream_enabled}")
     print(f"  端点                   : {transport.endpoint}")
@@ -145,9 +146,11 @@ async def run_qq(
         typing_refresh_seconds=config.qq_typing_refresh_seconds,
         block_first_chars=config.qq_stream_first_chars,
         block_min_chars=config.qq_stream_min_chars,
+        block_target_chars=config.qq_stream_target_chars,
+        block_max_chars=config.qq_stream_max_block_chars,
         block_min_interval=config.qq_stream_min_interval,
         block_max_messages=config.qq_stream_max_messages,
-        block_hard_chars=config.qq_stream_hard_chars,
+        block_flush_interval=config.qq_stream_flush_interval,
     )
     policy = QqPolicy(app.conversation, QqPrivateActiveStore(config.memory_dir), config.qq_owner_id)
 

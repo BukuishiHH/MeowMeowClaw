@@ -261,33 +261,50 @@ class TypingKeepAlive:
     """QQ 专用: start → set_input_status(1) → 每 refresh 秒续期 → end/超时停止。"""
 ```
 
-**`BlockSegmenter` 边界规则（从高到低优先级）**
+**`BlockSegmenter` 切块算法（S5.1 修订）**
 
-1. `\n\n`（段落边界）
-2. `\n`（换行）
-3. 句末标点：`。！？!?；;…`
-4. 逗号类：`，,、`（仅当缓冲 ≥ `min_chars × 1.5`）
-5. 无任何边界且缓冲 ≥ `hard_chars` → 强制硬切
+只在 `[min_chars, max_chars]` 窗口内选切点：
 
-**保护规则**
+1. **边界优先级**：`\n\n`（段落）> `\n`（换行）> 句末标点（`。！？!?；;…`）> 逗号（仅当窗口 ≥ `min_chars×1.5`）；
+2. **同级内取最接近 `target_chars` 的边界**（旧实现取"该优先级里最后一个"，会产生 22 字小头 + 700 字巨块）；
+3. 窗口内无自然边界且缓冲已达 `max_chars` → 硬切（回退到最近空白/标点，不切断 URL/数字）；
+4. 缓冲不足 `min_chars` → 继续攒，不切；
+5. 未闭合 ``` 代码围栏之后的内容不参与切割。
 
-- 反引号代码围栏（```）未闭合时**不切**，直到闭合或触发 `hard_chars`；
-- 不在 URL / 数字内部切（如 `3.14`、`1,000`、`http://...`）；
-- 单块仍受 `qq_message_chunk_chars` 限制（块内再分片）。
+**触发（flush）门槛**
 
-**节流（三层防御，彻底消灭"一字一气泡"）**
+| 时机 | 门槛 |
+|---|---|
+| 首块 | `max(first_chars, min_chars)`（默认 150 = target；调小可更早看到首块，但首块会偏小） |
+| 后续块 | `target_chars`（块大小因此贴近理想值，不会被"小步快跑"切碎） |
+| 中间气泡条数 | ≤ `max_messages - 1`（给收尾补发**预留一条槽位**，保证总条数不超上限） |
+| 两块之间 | ≥ `min_interval` 秒（节流，防风控） |
 
-```python
-def _should_flush(self) -> bool:
-    if self.mode != "block":                    return False
-    if now - self.last_sent_at < min_interval:  return False   # 时间节流
-    if self.messages_sent >= max_messages:      return False   # 条数硬上限
-    floor = first_chars if self.messages_sent == 0 else min_chars
-    return len(self.buffer) >= floor and self.segmenter.has_boundary()
-```
+**收尾均分（最终 `reply`）**
 
-> 数学结论：单轮中间气泡数 **≤ `qq_stream_max_messages`**（默认 5），与模型吐字速度无关；
-> 无论流式如何表现，最终 `reply` 都会把**剩余全部内容**补齐。
+剩余文本（水位线扣除后）按 `pieces = min(预算, ⌈剩余长度 / target_chars⌉)` 均分：
+
+- 每块优先落在自然边界、且不超过 `max_chars`；
+- 块与块之间按 `flush_interval`（默认 0.3s）小间隔发送，避免"最后一口气发好几条"；
+- 预算用尽时，剩余内容整体作为最后一条（**安全阀**：这是显式上限带来的唯一可能偏大的气泡）。
+
+**保护规则**：代码围栏内不切；硬切回退空白/标点；单块仍受 `qq_message_chunk_chars`（3000）约束。
+
+**参数与默认值（S5.1 定稿）**
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `qq_stream_first_chars` | `150` | 首块触发下限（默认 = target；调小可更早见首块） |
+| `qq_stream_min_chars` | `80` | 单块硬下限 |
+| `qq_stream_target_chars` | `150` | 理想块大小（同级边界里取最贴近它的） |
+| `qq_stream_max_block_chars` | `260` | 单块硬上限（无边界时也在此处硬切） |
+| `qq_stream_min_interval` | `2.5` | 中间气泡最小间隔（秒） |
+| `qq_stream_max_messages` | `5` | **单轮总气泡上限**（含收尾补发） |
+| `qq_stream_flush_interval` | `0.3` | 收尾补发块之间的间隔（秒，0=不等待） |
+| ~~`qq_stream_hard_chars`~~ | 别名 | 已废弃：等价于 `qq_stream_max_block_chars`（旧 .env 仍可用） |
+
+> 实测（S5.1，用户原文）：722 字 → `[137, 159, 148, 125, 145]`（5 条，极差 34，且与模型吐字节奏无关）；
+> 288 字 → `[144, 142]`（2 条，极差 2）。旧实现为 `[22, 700]`。
 
 ### 4.7 QQ 适配器新增动作（`channels/onebot11.py`）
 
@@ -343,11 +360,14 @@ kind=stream(start/end)→ 忽略(start 可选打印 "[生成中...]" 前缀, 由
 | `qq_stream_mode` | `typing` | `off` / `typing` / `block`；`draft` 按 S-D2 不实现，配置传入会被拒绝并回退默认 |
 | `qq_typing_indicator` | `true` | 是否调用 `set_input_status` |
 | `qq_typing_refresh_seconds` | `5` | "正在输入"续期间隔 |
-| `qq_stream_first_chars` | `60` | `block` 模式首块最小字数（越小首字越快） |
-| `qq_stream_min_chars` | `80` | `block` 模式后续块最小字数 |
-| `qq_stream_min_interval` | `2.5` | `block` 模式两条气泡最小间隔（秒） |
-| `qq_stream_max_messages` | `5` | 单轮中间气泡硬上限 |
-| `qq_stream_hard_chars` | `900` | 无自然边界时的强制切点 |
+| `qq_stream_first_chars` | `150` | `block` 模式首块触发下限（默认 = target；调小可更早见首块但均匀性略降） |
+| `qq_stream_min_chars` | `80` | 单块硬下限 |
+| `qq_stream_target_chars` | `150` | 理想块大小（同级边界里取最贴近它的） |
+| `qq_stream_max_block_chars` | `260` | 单块硬上限（无边界时也在此处硬切） |
+| `qq_stream_min_interval` | `2.5` | 两条中间气泡的最小间隔（秒） |
+| `qq_stream_max_messages` | `5` | **单轮总气泡上限**（含收尾补发） |
+| `qq_stream_flush_interval` | `0.3` | 收尾补发块之间的间隔（秒） |
+| ~~`qq_stream_hard_chars`~~ | 别名 | 已废弃（S5.1），等价于 `qq_stream_max_block_chars` |
 | `stream_preamble_grace_ms` | `1500` | 工具轮前导抑制宽限（毫秒） |
 | `stream_preamble_grace_chars` | `40` | 工具轮前导抑制宽限（字符） |
 | `stream_suppress_tool_preamble` | `true` | `false` = 工具轮文本照发（调试用） |
@@ -401,6 +421,7 @@ kind=stream(start/end)→ 忽略(start 可选打印 "[生成中...]" 前缀, 由
 | **S3** | CLI 流式 | `CliAdapter` delta 打印 + 最终只补后缀；`config.py` 新增 `stream_enabled/cli_stream`；CLI 启动信息 | 交互 + 管道两种方式验证；无重复尾巴；关闭开关逐字节一致 | CLI 逐字输出 |
 | **S4** | QQ：`typing` 指示器 | `onebot11.set_input_status` + `TypingKeepAlive` + adapter 消费 `start/end`；`qq_stream_mode=typing` | **真机**：QQ 客户端出现"对方正在输入…"；最终仍是 1 条完整气泡；NapCat 不支持时静默降级；指令不触发 typing | QQ 有"生成中"体感 |
 | **S5** | QQ：`block` 语义分段 | `BlockSegmenter` + 节流/封顶/兜底 + `qq_stream_*` 配置 | 单测（边界/围栏/上限/前缀不变量）+ 真机：800 字回答 ≤6 条气泡、拼接一致、无重复 | QQ 渐进呈现 |
+| **S5.1** | block 均匀性修复 | 窗口内取边界（贴 target）+ 首块/后续触发门槛 + 中间气泡预留收尾槽位 + 收尾按预算均分（`split_evenly`）+ 新增 `target/max_block/flush_interval` 配置（`hard_chars` 降级为别名） | 用用户实测原文回归：722 字 → `[137,159,148,125,145]`、288 字 → `[144,142]`，与吐字节奏无关；每块 ∈ [min, max]；总条数 ≤ `max_messages` | QQ 气泡大小均匀 |
 | **S6** | 收尾 | README / `.env.example` / `GATEWAY_DESIGN.md` 同步；真机冒烟记录；可选 `Gateway.stats()` 流式计数 | 文档齐全；ruff + 全量回归通过；冒烟记录回填 §12 | — |
 
 **明确不做（v1）**：`draft` 撤回重发（S-D2）、合并转发卡片、emoji 秒回 ack、群聊流式、token 级直发。
@@ -431,6 +452,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S3 CLI 流式 | 已完成 | `740b673` | 2026-10-12 | 新增 15 用例；全量 1168 passed；管道冒烟通过 |
 | S4 QQ typing | 已完成 | `e87ed37` | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
 | S5 QQ block | 已完成 | `1ab8193` | 2026-10-12 | 新增 30 用例；修复 TypingKeepAlive 无限等待缺陷 |
+| S5.1 block 均匀性 | 已完成 | 待回填 | 2026-10-12 | 用户实测反馈: 首块 22 字 + 尾块 700 字；新增 39 用例 |
 | S6 收尾 | 待排期 | — | — | 文档/冒烟随 S1–S4 增量同步 |
 
 状态取值：`待确认 → 未开始 → 进行中 → 已完成 / 已放弃（附原因）`；每个里程碑**独立提交**，提交前必须满足：
@@ -537,6 +559,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S3 | `740b673` | 2026-10-12 | `config` 新增 `stream_enabled/cli_stream/stream_preamble_grace_*`；`bootstrap` 透传网关与 Agent；`CliAdapter(stream=...)` delta 逐字写出 + 最终只补后缀(水位线)；`cli.py` 启动信息展示流式状态；新增 `tests/channels/test_cli_stream.py`(9) + `test_config.py`(6) | ruff 通过；1168 passed / 6 skipped / 2 xfailed（S2 基线 1153）；真实管道 REPL 冒烟：回答恰好输出一次 |
 | S4 | `e87ed37` | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
 | S5 | `1ab8193` | 2026-10-12 | `BlockSegmenter`(段落/换行/句末/逗号/硬切 + 代码围栏保护)；`OneBot11Adapter` block 模式(首块阈值 + 最小间隔 + 条数封顶 + 水位线补发)；`qq_stream_first_chars/min_chars/min_interval/max_messages/hard_chars` 配置；`TypingKeepAlive` 改协作式停止(修复无限等待)；新增 test_streaming(+16)/test_onebot11(+6)/QQ 集成(+2)/config(+6) | ruff 通过；全量回归；端到端: 气泡拼接 == 完整回答、条数 ≤ max+1、无重复 |
+| S5.1 | 待回填 | 2026-10-12 | `BlockSegmenter` 改为窗口内取"最贴 target"边界；触发门槛改为首块 `max(first,min)` / 后续 `target`；中间气泡预留收尾槽位；`split_evenly` 收尾均分 + `flush_interval`；新增 `qq_stream_target_chars/max_block_chars/flush_interval`，`hard_chars` 降级为别名；新增 `tests/channels/test_block_uniformity.py`(10) + 分段/适配器/配置用例更新 | ruff 通过；全量回归；用用户原文实测 722 字 → 5 条极差 34、288 字 → 2 条极差 2 |
 | S6 | — | — | — | — |
 
 ### 12.2 真机实测结论
@@ -562,4 +585,5 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 
 | 日期 | 缺陷 | 现象 | 根因 | 修复 | 验证 |
 |---|---|---|---|---|---|
+| 2026-10-12 | block 分块严重不均（S5，用户真机反馈） | 722 字回答被切成 `[22, 700]`：首块只有 22 字、尾块 700 字 | ① `take()` 按优先级取"该级最后一个边界"，小标题段落边界(22 字)胜出；② 下限判定看"缓冲长度"而非"切出块长度"；③ 无单块上限（`hard_chars=900` 只是"完全无边界"兜底）；④ 最终 `reply` 剩余文本不分块 | ① 窗口 `[min, max]` 内取**最贴 target** 的边界；② 触发门槛改为首块 `max(first,min)`、后续 `target`；③ 中间气泡预留 1 个收尾槽位；④ 收尾用 `split_evenly` 按预算均分（块间 `flush_interval` 小间隔） | 用户原文回归：722 字 → `[137,159,148,125,145]`、288 字 → `[144,142]`；吐字节奏（30/60/120 字/批）不影响结果；拼接内容一致、无重复 |
 | 2026-10-12 | `TypingKeepAlive.stop()` 无限等待（S4 引入，S5 压测发现） | 偶发卡死：`adapter.send(delta)` 永不返回，后续 QQ 回复全部停摆 | `stop()` 用 `task.cancel()` + `await task`；当底层 websockets 在某个 await 点吞掉取消时，被取消的任务不会结束，`await task` 永久挂起（`_stop_typing` 在**适配器出站循环**里调用，代价被放大） | 改为**协作式停止**：`_stop_event` 标志 + `asyncio.wait({task}, timeout=stop_timeout)`；超时只记 debug 并放弃等待（任务会在当前动作结束后自行退出） | 新增回归用例（模拟"吞掉取消"的 action）；`test_streaming + test_onebot11` 连续 5 次运行 70 passed 无挂起 |

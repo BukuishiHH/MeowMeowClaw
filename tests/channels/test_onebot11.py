@@ -632,9 +632,11 @@ def block_adapter(transport, **kwargs):
         "typing_enabled": False,
         "block_first_chars": 5,
         "block_min_chars": 5,
+        "block_target_chars": 10,
+        "block_max_chars": 20,
         "block_min_interval": 1.0,
         "block_max_messages": 3,
-        "block_hard_chars": 50,
+        "block_flush_interval": 0.0,
     }
     params.update(kwargs)
     return OneBot11Adapter(transport, **params)
@@ -678,10 +680,10 @@ class TestAdapterBlockMode:
                 await adapter.send(make_reply(request, full))
                 await collector.stop()
 
-                # take() 取"最后一个边界之前"的全部内容: 一次尽量多发, 减少气泡数
-                assert collector.messages == ["第一句。第二句。", "第三句。第四句。", "第五句。"]
+                # S5.1: 首块达到 max(first,min) 即切; 后续块等到 target 再切(块大小均匀)
+                assert collector.messages == ["第一句。第二句。", "第三句。第四句。第五句。"]
                 assert "".join(collector.messages) == full  # 不重复、不缺失
-                assert len(collector.messages) <= adapter.block_max_messages + 1
+                assert len(collector.messages) <= adapter.block_max_messages
                 assert "set_input_status" not in collector.actions  # typing 已关闭
         finally:
             await adapter.stop()
@@ -735,10 +737,9 @@ class TestAdapterBlockMode:
                 await adapter.send(make_reply(request, full))
                 await collector.stop()
 
-                assert len(collector.messages) == 2  # 1 条中间气泡 + 1 条剩余
+                # 总上限=1: 不产生中间气泡, 整段作为唯一一条发出
+                assert collector.messages == [full]
                 assert "".join(collector.messages) == full
-                assert collector.messages[0] == "一。二。三。"
-                assert collector.messages[1] == "四。"
         finally:
             await adapter.stop()
             await transport.stop()

@@ -14,7 +14,7 @@
 """
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Union
 
@@ -69,12 +69,16 @@ DEFAULT_QQ_MESSAGE_CHUNK_CHARS = 3000
 DEFAULT_QQ_STREAM_MODE = "typing"          # off | typing | block(S5 实现)
 DEFAULT_QQ_TYPING_INDICATOR = True
 DEFAULT_QQ_TYPING_REFRESH_SECONDS = 5.0
-# block 分段呈现默认值(保守: 防刷屏 + 防风控)
-DEFAULT_QQ_STREAM_FIRST_CHARS = 60
-DEFAULT_QQ_STREAM_MIN_CHARS = 80
-DEFAULT_QQ_STREAM_MIN_INTERVAL = 2.5
-DEFAULT_QQ_STREAM_MAX_MESSAGES = 5
-DEFAULT_QQ_STREAM_HARD_CHARS = 900
+# block 分段呈现默认值(保守: 防刷屏 + 防风控; S5.1 修订为"大小可控 + 收尾均分")
+DEFAULT_QQ_STREAM_FIRST_CHARS = 150     # 首块触发下限(默认=target, 保证块大小均匀)
+DEFAULT_QQ_STREAM_MIN_CHARS = 80        # 单块下限
+DEFAULT_QQ_STREAM_TARGET_CHARS = 150    # 理想块大小
+DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS = 260 # 单块硬上限
+DEFAULT_QQ_STREAM_MIN_INTERVAL = 2.5    # 中间气泡最小间隔(秒)
+DEFAULT_QQ_STREAM_MAX_MESSAGES = 5      # 单轮总气泡上限(含收尾补发)
+DEFAULT_QQ_STREAM_FLUSH_INTERVAL = 0.3  # 收尾补发块之间的间隔(秒)
+# 已废弃: 旧键 qq_stream_hard_chars 现在作为 qq_stream_max_block_chars 的别名读取
+DEFAULT_QQ_STREAM_HARD_CHARS = DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS
 
 # 流式输出默认值(设计见 docs/STREAMING_DESIGN.md §6)
 DEFAULT_STREAM_ENABLED = False
@@ -122,6 +126,10 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "qq_stream_min_chars": ("qq_stream_min_chars",),
     "qq_stream_min_interval": ("qq_stream_min_interval",),
     "qq_stream_max_messages": ("qq_stream_max_messages",),
+    "qq_stream_target_chars": ("qq_stream_target_chars",),
+    "qq_stream_max_block_chars": ("qq_stream_max_block_chars",),
+    "qq_stream_flush_interval": ("qq_stream_flush_interval",),
+    # 已废弃(S5.1): 作为 qq_stream_max_block_chars 的别名读取
     "qq_stream_hard_chars": ("qq_stream_hard_chars",),
     "stream_enabled": ("stream_enabled",),
     "cli_stream": ("cli_stream",),
@@ -250,6 +258,21 @@ def _resolve_tokenizer(value: Optional[str]) -> str:
     return DEFAULT_TOKENIZER
 
 
+def _resolve_non_negative_float(value: Optional[str], default: float, name: str) -> float:
+    """解析非负浮点(收尾间隔等, 0 合法); 非法值回退默认并告警."""
+    if value is None:
+        return default
+    try:
+        num = float(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("%s 不是数字(%r), 回退默认值 %s", name, value, default)
+        return default
+    if num < 0:
+        logger.warning("%s 不能为负数(%r), 回退默认值 %s", name, value, default)
+        return default
+    return num
+
+
 def _resolve_non_negative_int(value: Optional[str], default: int, name: str) -> int:
     """解析非负整数(流式宽限等, 0 合法); 非法值回退默认并告警."""
     if value is None:
@@ -368,8 +391,12 @@ class Settings:
     qq_typing_refresh_seconds: float = DEFAULT_QQ_TYPING_REFRESH_SECONDS
     qq_stream_first_chars: int = DEFAULT_QQ_STREAM_FIRST_CHARS
     qq_stream_min_chars: int = DEFAULT_QQ_STREAM_MIN_CHARS
+    qq_stream_target_chars: int = DEFAULT_QQ_STREAM_TARGET_CHARS
+    qq_stream_max_block_chars: int = DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS
     qq_stream_min_interval: float = DEFAULT_QQ_STREAM_MIN_INTERVAL
     qq_stream_max_messages: int = DEFAULT_QQ_STREAM_MAX_MESSAGES
+    qq_stream_flush_interval: float = DEFAULT_QQ_STREAM_FLUSH_INTERVAL
+    # 已废弃: qq_stream_max_block_chars 的旧名(兼容保留, 值与之相同)
     qq_stream_hard_chars: int = DEFAULT_QQ_STREAM_HARD_CHARS
     # 流式输出(§6)
     stream_enabled: bool = DEFAULT_STREAM_ENABLED
@@ -408,8 +435,10 @@ class Settings:
             f"qq_stream_first_chars={self.qq_stream_first_chars}, "
             f"qq_stream_min_chars={self.qq_stream_min_chars}, "
             f"qq_stream_min_interval={self.qq_stream_min_interval}, "
+            f"qq_stream_target_chars={self.qq_stream_target_chars}, "
+            f"qq_stream_max_block_chars={self.qq_stream_max_block_chars}, "
             f"qq_stream_max_messages={self.qq_stream_max_messages}, "
-            f"qq_stream_hard_chars={self.qq_stream_hard_chars}, "
+            f"qq_stream_flush_interval={self.qq_stream_flush_interval}, "
             f"stream_enabled={self.stream_enabled}, cli_stream={self.cli_stream}, "
             f"stream_preamble_grace_ms={self.stream_preamble_grace_ms}, "
             f"stream_preamble_grace_chars={self.stream_preamble_grace_chars}, "
@@ -427,6 +456,16 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
     path = Path(env_file) if env_file is not None else ENV_FILE
     raw = _merge_sources(read_env_file(path))
     _warn_deprecated_identity_keys(raw)
+
+    # S5.1: 旧键 qq_stream_hard_chars 作为 qq_stream_max_block_chars 的别名(废弃)
+    max_block_raw = _get(raw, *_KEY_ALIASES["qq_stream_max_block_chars"])
+    if max_block_raw is None:
+        hard_alias = _get(raw, *_KEY_ALIASES["qq_stream_hard_chars"])
+        if hard_alias is not None:
+            logger.warning(
+                "qq_stream_hard_chars 已废弃, 请改用 qq_stream_max_block_chars; 本次按别名生效"
+            )
+            max_block_raw = hard_alias
 
     workspace = resolve_workspace(_get(raw, *_KEY_ALIASES["workspace"]))
     settings = Settings(
@@ -551,11 +590,22 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             DEFAULT_QQ_STREAM_MAX_MESSAGES,
             "qq_stream_max_messages",
         ),
-        qq_stream_hard_chars=_resolve_positive_int(
-            _get(raw, *_KEY_ALIASES["qq_stream_hard_chars"]),
-            DEFAULT_QQ_STREAM_HARD_CHARS,
-            "qq_stream_hard_chars",
+        qq_stream_target_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["qq_stream_target_chars"]),
+            DEFAULT_QQ_STREAM_TARGET_CHARS,
+            "qq_stream_target_chars",
         ),
+        qq_stream_max_block_chars=_resolve_positive_int(
+            max_block_raw,
+            DEFAULT_QQ_STREAM_MAX_BLOCK_CHARS,
+            "qq_stream_max_block_chars",
+        ),
+        qq_stream_flush_interval=_resolve_non_negative_float(
+            _get(raw, *_KEY_ALIASES["qq_stream_flush_interval"]),
+            DEFAULT_QQ_STREAM_FLUSH_INTERVAL,
+            "qq_stream_flush_interval",
+        ),
+        qq_stream_hard_chars=0,  # 占位, 下一行由 max_block 回填(见下方 replace)
         stream_enabled=_resolve_bool(
             _get(raw, *_KEY_ALIASES["stream_enabled"]),
             DEFAULT_STREAM_ENABLED,
@@ -583,6 +633,10 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
         ),
         source=str(path),
     )
+
+    # 废弃字段 qq_stream_hard_chars 与 max_block_chars 保持一致(兼容旧读者)
+    if settings.qq_stream_hard_chars != settings.qq_stream_max_block_chars:
+        settings = replace(settings, qq_stream_hard_chars=settings.qq_stream_max_block_chars)
 
     if not settings.has_api_key:
         logger.warning("未读取到 api_key, 调用模型时会认证失败")

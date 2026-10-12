@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from meowmeowclaw.channels.streaming import BlockSegmenter, TypingKeepAlive
+from meowmeowclaw.channels.streaming import BlockSegmenter, TypingKeepAlive, split_evenly
 
 
 async def wait_until(predicate, timeout: float = 2.0, interval: float = 0.005) -> bool:
@@ -146,86 +146,88 @@ class TestTypingKeepAlive:
 
 
 class TestBlockSegmenter:
-    def test_paragraph_boundary_has_highest_priority(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=200)
-        seg.push("第一段。\n\n第二段")
-
-        assert seg.take() == "第一段。\n\n"
-        assert seg.buffered_length == len("第二段")
-
-    def test_line_boundary(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=200)
-        seg.push("标题\n正文还在继续")
-
-        assert seg.take() == "标题\n"
-
-    def test_sentence_boundary(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=200)
-        seg.push("第一句。第二句还没说完")
-
-        assert seg.take() == "第一句。"
-
-    def test_comma_only_when_buffer_long_enough(self):
-        short = BlockSegmenter(soft_chars=10, hard_chars=200)
-        short.push("一个短句，后面还有")
-        assert short.take() is None  # 13 < 10*1.5
-
-        long = BlockSegmenter(soft_chars=10, hard_chars=200)
-        long.push("一二三四五六七八，九十十一十二十三")
-        assert long.take() == "一二三四五六七八，"
-
-    def test_no_boundary_returns_none(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=200)
-        seg.push("没有任何标点的长文本")
+    def test_returns_none_below_min_chars(self):
+        seg = BlockSegmenter(min_chars=80, target_chars=150, max_chars=260)
+        seg.push("短句。")
 
         assert seg.has_boundary() is False
         assert seg.take() is None
-        assert seg.buffered_length == len("没有任何标点的长文本")
+        assert seg.buffered_length == len("短句。")
 
-    def test_hard_cut_when_too_long(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=20)
-        seg.push("x" * 50)
+    def test_block_size_stays_within_window_near_target(self):
+        """核心回归: 每块都落在 [min, max] 且贴近 target(不再"小头 + 巨尾")."""
+        seg = BlockSegmenter(min_chars=80, target_chars=150, max_chars=260)
+        seg.push("一二三四五。" * 100)  # 每句 6 字, 共 600 字
+
+        blocks: list[str] = []
+        while True:
+            block = seg.take()
+            if block is None:
+                break
+            blocks.append(block)
+
+        assert blocks
+        assert all(80 <= len(block) <= 260 for block in blocks)
+        # 目标 150 → 除最后一块外都应贴近 target, 而不是一路贴到 260 上限
+        assert all(len(block) <= 165 for block in blocks[:-1])
+
+    def test_picks_boundary_closest_to_target(self):
+        seg = BlockSegmenter(min_chars=80, target_chars=150, max_chars=260)
+        # 句末切点: 85 / 186 / 287(>max) → 目标 150 → 取 186
+        seg.push("甲" * 84 + "。" + "乙" * 100 + "。" + "丙" * 100)
+
+        assert len(seg.take()) == 186
+
+    def test_paragraph_boundary_has_priority(self):
+        seg = BlockSegmenter(min_chars=10, target_chars=100, max_chars=300)
+        seg.push("甲" * 30 + "\n\n" + "乙" * 100 + "。" + "丙" * 100)
 
         block = seg.take()
 
-        assert block is not None and len(block) == 20
-        assert seg.buffered_length == 30
+        assert block.endswith("\n\n")  # 段落边界优先于更靠后的句末边界
+        assert len(block) == 32
+
+    def test_comma_only_when_window_long_enough(self):
+        seg = BlockSegmenter(min_chars=10, target_chars=100, max_chars=300)
+        seg.push("甲" * 10 + "，")  # 11 字 < min*1.5=15, 且无其他边界
+        assert seg.take() is None
+
+        seg.push("乙" * 10)  # 21 字 >= 15 → 逗号可作为边界
+        assert seg.take() == "甲" * 10 + "，"
+
+    def test_hard_cut_when_no_boundary_at_max(self):
+        seg = BlockSegmenter(min_chars=10, target_chars=40, max_chars=50)
+        seg.push("x" * 120)
+
+        block = seg.take()
+
+        assert block is not None and len(block) == 50
 
     def test_hard_cut_prefers_whitespace(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=20)
-        seg.push("aaaa bbbb cccc dddd eeee")
+        seg = BlockSegmenter(min_chars=10, target_chars=30, max_chars=30)
+        seg.push("x" * 20 + " " + "x" * 20)
 
         block = seg.take()
 
-        assert block == "aaaa bbbb cccc dddd "
-        assert len(block) <= 20
+        assert block == "x" * 20 + " "  # 上限处回退到空白, 不切断长串
+        assert len(block) <= 30
 
     def test_unclosed_code_fence_blocks_cutting_inside(self):
-        # 唯一边界(换行)位于未闭合围栏内部 → 不允许切
-        seg = BlockSegmenter(soft_chars=10, hard_chars=1000)
+        seg = BlockSegmenter(min_chars=10, target_chars=40, max_chars=1000)
         seg.push("```python\nprint('hi')\nprint('x')")
 
         assert seg.has_boundary() is False
         assert seg.take() is None
 
     def test_cut_before_fence_keeps_block_intact(self):
-        # 允许在围栏**之前**的换行处切, 但围栏整体留在缓冲里, 不会被劈开
-        seg = BlockSegmenter(soft_chars=10, hard_chars=1000)
+        seg = BlockSegmenter(min_chars=4, target_chars=20, max_chars=1000)
         seg.push("说明：\n```python\nprint('hi')")
 
         assert seg.take() == "说明：\n"
         assert seg.flush() == "```python\nprint('hi')"
 
-    def test_closed_code_fence_allows_cutting(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=1000)
-        seg.push("说明：\n```python\nprint('hi')\n```\n后续")
-        block = seg.take()
-
-        assert block is not None and block.endswith("\n")
-        assert "```" in block or "```" in seg.flush()  # 围栏前后不丢内容
-
     def test_flush_returns_remaining_and_clears(self):
-        seg = BlockSegmenter(soft_chars=10, hard_chars=200)
+        seg = BlockSegmenter(min_chars=10, target_chars=40, max_chars=200)
         seg.push("没有边界的剩余内容")
 
         assert seg.flush() == "没有边界的剩余内容"
@@ -237,10 +239,57 @@ class TestBlockSegmenter:
         seg.push("")
         assert seg.buffered_length == 0
 
-    @pytest.mark.parametrize("kwargs", [{"soft_chars": 0}, {"soft_chars": -1}, {"hard_chars": 0}])
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"min_chars": 0},
+            {"target_chars": 0},
+            {"max_chars": 0},
+        ],
+    )
     def test_invalid_params_rejected(self, kwargs):
         with pytest.raises(ValueError):
             BlockSegmenter(**kwargs)
 
-    def test_hard_chars_never_below_soft(self):
-        assert BlockSegmenter(soft_chars=100, hard_chars=20).hard_chars == 100
+    def test_target_and_max_are_clamped_to_min(self):
+        seg = BlockSegmenter(min_chars=100, target_chars=20, max_chars=30)
+
+        assert seg.target_chars == 100
+        assert seg.max_chars == 100
+
+    def test_repr_reports_window(self):
+        text = repr(BlockSegmenter(min_chars=80, target_chars=150, max_chars=260))
+
+        assert "min=80" in text and "target=150" in text and "max=260" in text
+
+
+class TestSplitEvenly:
+    def test_even_pieces(self):
+        blocks = split_evenly(
+            "字" * 722, pieces=5, target_chars=150, max_chars=260, min_chars=80
+        )
+
+        assert len(blocks) == 5
+        assert all(abs(len(block) - 145) <= 1 for block in blocks)
+        assert "".join(blocks) == "字" * 722
+
+    def test_prefers_natural_boundary(self):
+        text = "第一句。第二句。第三句。第四句。第五句。第六句。第七句。第八句。"
+        blocks = split_evenly(text, pieces=2, target_chars=16, max_chars=260, min_chars=4)
+
+        assert "".join(blocks) == text
+        assert all(block.endswith("。") for block in blocks)  # 都切在句末
+
+    def test_single_piece_keeps_text_whole(self):
+        assert split_evenly("短回答。", pieces=1, target_chars=150, max_chars=260) == ["短回答。"]
+
+    def test_empty_text(self):
+        assert split_evenly("", pieces=3, target_chars=150, max_chars=260) == []
+
+    def test_respects_max_chars(self):
+        blocks = split_evenly(
+            "x" * 2000, pieces=3, target_chars=150, max_chars=260, min_chars=80
+        )
+
+        assert "".join(blocks) == "x" * 2000
+        assert all(len(block) <= 260 for block in blocks[:-1])  # 末块承载安全阀剩余

@@ -22,6 +22,7 @@ import asyncio
 import hmac
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -53,6 +54,7 @@ from .streaming import (
     StreamAssembler,
     TypingKeepAlive,
     chunk_text,
+    split_evenly,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,12 +66,16 @@ DEFAULT_ACTION_TIMEOUT = 10.0
 DEFAULT_RECONNECT_MIN = 1.0
 DEFAULT_RECONNECT_MAX = 30.0
 
-# block 分段呈现默认参数(见 docs/STREAMING_DESIGN.md §6)
-DEFAULT_BLOCK_FIRST_CHARS = 60
-DEFAULT_BLOCK_MIN_CHARS = 80
-DEFAULT_BLOCK_MIN_INTERVAL = 2.5
-DEFAULT_BLOCK_MAX_MESSAGES = 5
-DEFAULT_BLOCK_HARD_CHARS = 900
+# block 分段呈现默认参数(见 docs/STREAMING_DESIGN.md §6, S5.1 修订)
+DEFAULT_BLOCK_FIRST_CHARS = 150     # 首块触发下限(默认=target; 调小可更早看到首块, 但均匀性略降)
+DEFAULT_BLOCK_MIN_CHARS = 80        # 单块下限
+DEFAULT_BLOCK_TARGET_CHARS = 150    # 理想块大小(同级边界里取最贴近它的)
+DEFAULT_BLOCK_MAX_CHARS = 260       # 单块硬上限(无边界时也在此处硬切)
+DEFAULT_BLOCK_MIN_INTERVAL = 2.5    # 中间气泡最小间隔(秒)
+DEFAULT_BLOCK_MAX_MESSAGES = 5      # **单轮总气泡上限**(含收尾补发)
+DEFAULT_BLOCK_FLUSH_INTERVAL = 0.3  # 收尾补发块之间的间隔(秒, 防风控)
+# 单个 correlation 的分段状态上限(防回复丢失时泄漏)
+MAX_BLOCK_STATES = 64
 
 
 @dataclass
@@ -599,9 +605,11 @@ class OneBot11Adapter(QqAdapter):
         typing_event_type: int = 1,
         block_first_chars: int = DEFAULT_BLOCK_FIRST_CHARS,
         block_min_chars: int = DEFAULT_BLOCK_MIN_CHARS,
+        block_target_chars: int = DEFAULT_BLOCK_TARGET_CHARS,
+        block_max_chars: int = DEFAULT_BLOCK_MAX_CHARS,
         block_min_interval: float = DEFAULT_BLOCK_MIN_INTERVAL,
         block_max_messages: int = DEFAULT_BLOCK_MAX_MESSAGES,
-        block_hard_chars: int = DEFAULT_BLOCK_HARD_CHARS,
+        block_flush_interval: float = DEFAULT_BLOCK_FLUSH_INTERVAL,
         clock: Optional[Callable[[], float]] = None,
     ) -> None:
         super().__init__(channel=channel, transport=transport.send)
@@ -611,6 +619,8 @@ class OneBot11Adapter(QqAdapter):
             raise ValueError(f"block_max_messages 必须为正整数: {block_max_messages!r}")
         if block_min_interval <= 0:
             raise ValueError(f"block_min_interval 必须为正数: {block_min_interval!r}")
+        if block_flush_interval < 0:
+            raise ValueError(f"block_flush_interval 不能为负数: {block_flush_interval!r}")
         self.onebot = transport
         self.onebot.set_handler(self.feed)
         self.stream_mode = stream_mode
@@ -620,9 +630,11 @@ class OneBot11Adapter(QqAdapter):
         # block 模式参数(见 docs/STREAMING_DESIGN.md §6)
         self.block_first_chars = max(1, int(block_first_chars))
         self.block_min_chars = max(1, int(block_min_chars))
+        self.block_target_chars = max(1, int(block_target_chars))
+        self.block_max_chars = max(1, int(block_max_chars))
         self.block_min_interval = float(block_min_interval)
         self.block_max_messages = int(block_max_messages)
-        self.block_hard_chars = max(int(block_hard_chars), self.block_min_chars)
+        self.block_flush_interval = float(block_flush_interval)
         # 水位线: 记录"已作为气泡送达"的内容, 最终 reply 只补发剩余后缀
         self.assembler = StreamAssembler(max_chars=self.onebot.max_text_chars)
         self._clock = clock or time.monotonic
@@ -657,18 +669,41 @@ class OneBot11Adapter(QqAdapter):
         if envelope.kind == KIND_STREAM:
             await self._handle_stream_envelope(envelope)
             return
-        correlation = envelope.correlation_id
-        # block 模式: 中间气泡已经发出去了一部分, 最终只补发剩余后缀(绝不重复)
-        if self.stream_mode == "block" and self.assembler.sent_text(correlation):
-            remaining = "".join(self.assembler.plan_final(correlation, envelope.text))
-            self.assembler.forget(correlation)
-            if not remaining:
-                self.sent.append(envelope)  # 全部内容已作为气泡送达, 不再重发
-                return
-            await super().send(replace(envelope, text=remaining))
+        if self.stream_mode == "block":
+            await self._finish_block_reply(envelope)
             return
-        self.assembler.forget(correlation)
+        self.assembler.forget(envelope.correlation_id)
         await super().send(envelope)
+
+    async def _finish_block_reply(self, envelope: Envelope) -> None:
+        """block 模式的最终回答: 把**尚未送达**的剩余文本均分成若干块再发出.
+
+        - 即使模型一口气吐完(一个中间气泡都没有), 也不会出现"最后一条塞进一大段";
+        - 已送达部分由水位线扣除, 绝不重复;
+        - 总气泡数受 ``block_max_messages`` 约束(含已发出的中间气泡)。
+        """
+        correlation = envelope.correlation_id
+        state = self._blocks.pop(correlation, None)
+        sent_count = state.messages if state is not None else 0
+        remaining = self.assembler.remaining_text(correlation, envelope.text)
+        self.assembler.forget(correlation)
+        if not remaining:
+            self.sent.append(envelope)  # 内容已全部作为气泡送达, 不再重发
+            return
+
+        budget = max(1, self.block_max_messages - sent_count)
+        pieces = min(budget, max(1, math.ceil(len(remaining) / self.block_target_chars)))
+        blocks = split_evenly(
+            remaining,
+            pieces=pieces,
+            target_chars=self.block_target_chars,
+            max_chars=self.block_max_chars,
+            min_chars=min(self.block_min_chars, len(remaining)),
+        )
+        for index, block in enumerate(blocks):
+            if index and self.block_flush_interval:
+                await asyncio.sleep(self.block_flush_interval)
+            await self._emit_bubble(envelope, block)
 
     async def _handle_stream_envelope(self, envelope: Envelope) -> None:
         phase = envelope.metadata.get("phase")
@@ -679,8 +714,8 @@ class OneBot11Adapter(QqAdapter):
             if self.stream_mode == "block":
                 await self._handle_block_delta(envelope)
         elif phase == STREAM_PHASE_END:
+            # 只停 typing; 分段状态保留到最终 reply 再清理(收尾需要已发块数)
             await self._stop_typing(envelope.correlation_id)
-            self._blocks.pop(envelope.correlation_id, None)
 
     # ------------------------------------------------------------------ block 分段呈现
 
@@ -694,16 +729,29 @@ class OneBot11Adapter(QqAdapter):
         if state is None:
             state = _BlockState(
                 segmenter=BlockSegmenter(
-                    soft_chars=self.block_min_chars, hard_chars=self.block_hard_chars
+                    min_chars=self.block_min_chars,
+                    target_chars=self.block_target_chars,
+                    max_chars=self.block_max_chars,
                 )
             )
             self._blocks[correlation] = state
+            # 防泄漏: 极端情况下 reply 迟迟不来时按插入序淘汰旧状态
+            while len(self._blocks) > MAX_BLOCK_STATES:
+                self._blocks.pop(next(iter(self._blocks)), None)
         state.segmenter.push(text)
 
+        # 中间气泡最多用掉"总上限 - 1"个槽位, 给收尾补发留一条(否则总条数会超上限)
+        intermediate_cap = max(0, self.block_max_messages - 1)
         while True:
-            if state.messages >= self.block_max_messages:
-                return  # 条数封顶: 剩余内容全部由最终消息承载
-            floor = self.block_first_chars if state.messages == 0 else self.block_min_chars
+            if state.messages >= intermediate_cap:
+                return
+            # 首块允许早一点(>= max(first_chars, min_chars)); 后续块等到 target 再切,
+            # 这样每块都贴近理想大小, 不会出现"一堆小块把预算吃光、尾巴一大坨"
+            floor = (
+                max(self.block_first_chars, self.block_min_chars)
+                if state.messages == 0
+                else self.block_target_chars
+            )
             if state.segmenter.buffered_length < floor:
                 return
             now = self._clock()
@@ -764,10 +812,12 @@ __all__ = [
     "OneBot11Adapter",
     "OneBot11Transport",
     "DEFAULT_BLOCK_FIRST_CHARS",
-    "DEFAULT_BLOCK_HARD_CHARS",
+    "DEFAULT_BLOCK_FLUSH_INTERVAL",
+    "DEFAULT_BLOCK_MAX_CHARS",
     "DEFAULT_BLOCK_MAX_MESSAGES",
     "DEFAULT_BLOCK_MIN_CHARS",
     "DEFAULT_BLOCK_MIN_INTERVAL",
+    "DEFAULT_BLOCK_TARGET_CHARS",
     "TypingKeepAlive",
     "chunk_text",
     "event_to_incoming",

@@ -385,6 +385,7 @@ kind=stream(start/end)→ 忽略(start 可选打印 "[生成中...]" 前缀, 由
 | 流与最终文本不一致（网关重试/内容改写） | 内容重复或缺失 | 前缀校验 + 整段重发兜底（I1） |
 | 长回答 × 分块 × 3000 字上限 | 块内二次分片错乱 | `BlockSegmenter` 输出再经 `chunk_text()`；不变式测试覆盖 |
 | 关闭/重启期间的流 | 半截消息 | `end/reply` 在优雅关闭排空范围内；delta 允许丢弃 |
+| 输入状态续期任务的取消未被投递（底层 SDK 在 await 点吞掉 `CancelledError`） | `stop()` 永久挂起 → **冻结出站循环, 所有 QQ 回复停摆** | `TypingKeepAlive` 采用**协作式停止**：停止标志 + 有限等待(默认 0.25s) + 超时放弃等待；S5 实测复现并修复（见 §12.4） |
 | `stream_enabled=false` 回归 | 行为漂移 | S1–S5 每个里程碑都跑全量回归 + 契约测试 |
 
 ---
@@ -429,7 +430,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S2 网关流式通道 | 已完成 | `4ee4f19` | 2026-10-12 | 新增 26 用例；全量 1153 passed |
 | S3 CLI 流式 | 已完成 | `740b673` | 2026-10-12 | 新增 15 用例；全量 1168 passed；管道冒烟通过 |
 | S4 QQ typing | 已完成 | `e87ed37` | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
-| S5 QQ block | 待排期 | — | — | S1–S4 真机验证通过后决定 |
+| S5 QQ block | 已完成 | 待回填 | 2026-10-12 | 新增 30 用例；修复 TypingKeepAlive 无限等待缺陷 |
 | S6 收尾 | 待排期 | — | — | 文档/冒烟随 S1–S4 增量同步 |
 
 状态取值：`待确认 → 未开始 → 进行中 → 已完成 / 已放弃（附原因）`；每个里程碑**独立提交**，提交前必须满足：
@@ -535,7 +536,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S2 | `4ee4f19` | 2026-10-12 | `gateway/envelope` 新增 `KIND_STREAM`+`delta_seq`+`make_stream_event`；`AsyncioQueueBus.publish_best_effort`(丢弃不写死信)；dispatcher 三相位(start/delta/end)+on_delta 注入；`channels/streaming.py::StreamAssembler`(水位线/前缀补发)；新增 `tests/gateway/test_stream_channel.py`(26) | ruff 通过；1153 passed / 6 skipped / 2 xfailed（S1 基线 1127） |
 | S3 | `740b673` | 2026-10-12 | `config` 新增 `stream_enabled/cli_stream/stream_preamble_grace_*`；`bootstrap` 透传网关与 Agent；`CliAdapter(stream=...)` delta 逐字写出 + 最终只补后缀(水位线)；`cli.py` 启动信息展示流式状态；新增 `tests/channels/test_cli_stream.py`(9) + `test_config.py`(6) | ruff 通过；1168 passed / 6 skipped / 2 xfailed（S2 基线 1153）；真实管道 REPL 冒烟：回答恰好输出一次 |
 | S4 | `e87ed37` | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
-| S5 | — | — | — | — |
+| S5 | 待回填 | 2026-10-12 | `BlockSegmenter`(段落/换行/句末/逗号/硬切 + 代码围栏保护)；`OneBot11Adapter` block 模式(首块阈值 + 最小间隔 + 条数封顶 + 水位线补发)；`qq_stream_first_chars/min_chars/min_interval/max_messages/hard_chars` 配置；`TypingKeepAlive` 改协作式停止(修复无限等待)；新增 test_streaming(+16)/test_onebot11(+6)/QQ 集成(+2)/config(+6) | ruff 通过；全量回归；端到端: 气泡拼接 == 完整回答、条数 ≤ max+1、无重复 |
 | S6 | — | — | — | — |
 
 ### 12.2 真机实测结论
@@ -546,7 +547,8 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | `set_input_status` 可用性 | 真实 NapCat（Windows, 机器人 3768130928）连入 WSL2 Agent 后调用成功；`event_type=1/0/2` 均返回 `retcode ok` | 2026-10-12 |
 | `set_input_status` 采用值 | 取 `event_type=1`（与 NapCat 源码 `payloadExample` 及其自身 `input_status` notice 默认值一致）；0/2 的结束态语义暂无差异，保持不发送 | 2026-10-12 |
 | "对方正在输入" 的 QQ 客户端实际观感 | **待用户真机确认**（脚本只能验证接口成功） | — |
-| `block` 模式观感与风控表现 | 待 S5 实测 | — |
+| `block` 模式: 文本完整性与条数封顶 | **已自动化验证**（假 NapCat 端到端: 中间气泡 + 最终补发拼接 == 完整回答, 条数 ≤ `max_messages+1`, 无重复/无缺失） | 2026-10-12 |
+| `block` 模式观感与风控表现 | **待用户真机确认**（脚本只能验证协议与文本完整性） | — |
 
 ### 12.3 参数标定记录
 
@@ -555,3 +557,9 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | `qq_stream_min_interval` | 2.5s | — | 观感 + 风控观察 |
 | `qq_stream_max_messages` | 5 | — | 观感 |
 | `qq_stream_first_chars` | 60 | — | 首字延迟 |
+
+### 12.4 缺陷修复记录
+
+| 日期 | 缺陷 | 现象 | 根因 | 修复 | 验证 |
+|---|---|---|---|---|---|
+| 2026-10-12 | `TypingKeepAlive.stop()` 无限等待（S4 引入，S5 压测发现） | 偶发卡死：`adapter.send(delta)` 永不返回，后续 QQ 回复全部停摆 | `stop()` 用 `task.cancel()` + `await task`；当底层 websockets 在某个 await 点吞掉取消时，被取消的任务不会结束，`await task` 永久挂起（`_stop_typing` 在**适配器出站循环**里调用，代价被放大） | 改为**协作式停止**：`_stop_event` 标志 + `asyncio.wait({task}, timeout=stop_timeout)`；超时只记 debug 并放弃等待（任务会在当前动作结束后自行退出） | 新增回归用例（模拟"吞掉取消"的 action）；`test_streaming + test_onebot11` 连续 5 次运行 70 passed 无挂起 |

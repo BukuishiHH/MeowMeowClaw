@@ -38,6 +38,11 @@ from meowmeowclaw.config import (
     DEFAULT_QQ_WS_PATH,
     DEFAULT_QQ_STREAM_MODE,
     DEFAULT_QQ_TYPING_INDICATOR,
+    DEFAULT_QQ_STREAM_FIRST_CHARS,
+    DEFAULT_QQ_STREAM_HARD_CHARS,
+    DEFAULT_QQ_STREAM_MAX_MESSAGES,
+    DEFAULT_QQ_STREAM_MIN_CHARS,
+    DEFAULT_QQ_STREAM_MIN_INTERVAL,
     DEFAULT_QQ_TYPING_REFRESH_SECONDS,
     DEFAULT_QQ_WS_PORT,
     DEFAULT_STREAM_ENABLED,
@@ -124,6 +129,11 @@ ENV_KEYS = (
     "QQ_TYPING",
     "QQ_TYPING_REFRESH_SECONDS",
     "QQ_TYPING_INTERVAL",
+    "QQ_STREAM_FIRST_CHARS",
+    "QQ_STREAM_MIN_CHARS",
+    "QQ_STREAM_MIN_INTERVAL",
+    "QQ_STREAM_MAX_MESSAGES",
+    "QQ_STREAM_HARD_CHARS",
     "STREAM_ENABLED",
     "CLI_STREAM",
     "STREAM_PREAMBLE_GRACE_MS",
@@ -877,6 +887,59 @@ class TestStreamSettings:
 
         assert s.qq_typing_refresh_seconds == DEFAULT_QQ_TYPING_REFRESH_SECONDS
         assert any("qq_typing_refresh_seconds" in record.message for record in caplog.records)
+
+    def test_qq_block_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.qq_stream_first_chars == DEFAULT_QQ_STREAM_FIRST_CHARS
+        assert s.qq_stream_min_chars == DEFAULT_QQ_STREAM_MIN_CHARS
+        assert s.qq_stream_min_interval == DEFAULT_QQ_STREAM_MIN_INTERVAL
+        assert s.qq_stream_max_messages == DEFAULT_QQ_STREAM_MAX_MESSAGES
+        assert s.qq_stream_hard_chars == DEFAULT_QQ_STREAM_HARD_CHARS
+
+    def test_qq_block_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "qq_stream_first_chars=20\n"
+            "qq_stream_min_chars=30\n"
+            "qq_stream_min_interval=1.5\n"
+            "qq_stream_max_messages=2\n"
+            "qq_stream_hard_chars=300\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.qq_stream_first_chars == 20
+        assert s.qq_stream_min_chars == 30
+        assert s.qq_stream_min_interval == 1.5
+        assert s.qq_stream_max_messages == 2
+        assert s.qq_stream_hard_chars == 300
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "qq_stream_first_chars=0\n",
+            "qq_stream_min_chars=-1\n",
+            "qq_stream_min_interval=0\n",
+            "qq_stream_max_messages=abc\n",
+            "qq_stream_hard_chars=0\n",
+        ],
+    )
+    def test_qq_block_invalid_values_fall_back(self, tmp_path, caplog, line):
+        name = line.split("=")[0]
+        defaults = {
+            "qq_stream_first_chars": DEFAULT_QQ_STREAM_FIRST_CHARS,
+            "qq_stream_min_chars": DEFAULT_QQ_STREAM_MIN_CHARS,
+            "qq_stream_min_interval": DEFAULT_QQ_STREAM_MIN_INTERVAL,
+            "qq_stream_max_messages": DEFAULT_QQ_STREAM_MAX_MESSAGES,
+            "qq_stream_hard_chars": DEFAULT_QQ_STREAM_HARD_CHARS,
+        }
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, line))
+
+        assert getattr(s, name) == defaults[name]
+        assert any(name in record.message for record in caplog.records)
 
     def test_repr_contains_stream_flags(self):
         text = repr(Settings(stream_enabled=True, cli_stream=False))

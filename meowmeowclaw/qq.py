@@ -107,6 +107,12 @@ def _print_check(config: Settings, transport: OneBot11Transport) -> None:
     print(f"  qq_stream_mode         : {config.qq_stream_mode}")
     print(f"  qq_typing_indicator    : {config.qq_typing_indicator}")
     print(f"  qq_typing_refresh_s    : {config.qq_typing_refresh_seconds}")
+    print(
+        "  qq_stream_*            : "
+        f"first={config.qq_stream_first_chars} min={config.qq_stream_min_chars} "
+        f"interval={config.qq_stream_min_interval} max={config.qq_stream_max_messages} "
+        f"hard={config.qq_stream_hard_chars}"
+    )
     print(f"  stream_enabled         : {config.stream_enabled}")
     print(f"  端点                   : {transport.endpoint}")
     print(f"  记忆目录               : {config.memory_dir}")
@@ -137,6 +143,11 @@ async def run_qq(
         stream_mode=config.qq_stream_mode,
         typing_enabled=config.qq_typing_indicator,
         typing_refresh_seconds=config.qq_typing_refresh_seconds,
+        block_first_chars=config.qq_stream_first_chars,
+        block_min_chars=config.qq_stream_min_chars,
+        block_min_interval=config.qq_stream_min_interval,
+        block_max_messages=config.qq_stream_max_messages,
+        block_hard_chars=config.qq_stream_hard_chars,
     )
     policy = QqPolicy(app.conversation, QqPrivateActiveStore(config.memory_dir), config.qq_owner_id)
 
@@ -215,8 +226,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     transport = build_transport(app.config)
-    if app.config.qq_stream_mode == "block":
-        print("[启动警告] qq_stream_mode=block 将在 S5 实现, 当前按 typing 处理(不产生中间气泡)。")
     if not app.config.qq_token:
         print("[启动警告] qq_token 为空: 任何能访问监听端口的本机进程都可冒充 NapCat。")
 

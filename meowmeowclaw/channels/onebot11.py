@@ -23,8 +23,10 @@ import hmac
 import json
 import logging
 import re
+import time
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -34,7 +36,9 @@ from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
 from meowmeowclaw.gateway import (
+    KIND_REPLY,
     KIND_STREAM,
+    STREAM_PHASE_DELTA,
     STREAM_PHASE_END,
     STREAM_PHASE_START,
     Envelope,
@@ -43,7 +47,13 @@ from meowmeowclaw.gateway import (
 
 from .base import IncomingMessage
 from .qq_adapter import QqAdapter
-from .streaming import DEFAULT_MAX_TEXT_CHARS, TypingKeepAlive, chunk_text
+from .streaming import (
+    DEFAULT_MAX_TEXT_CHARS,
+    BlockSegmenter,
+    StreamAssembler,
+    TypingKeepAlive,
+    chunk_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +63,22 @@ MESSAGE_TYPE_PRIVATE = "private"
 DEFAULT_ACTION_TIMEOUT = 10.0
 DEFAULT_RECONNECT_MIN = 1.0
 DEFAULT_RECONNECT_MAX = 30.0
+
+# block 分段呈现默认参数(见 docs/STREAMING_DESIGN.md §6)
+DEFAULT_BLOCK_FIRST_CHARS = 60
+DEFAULT_BLOCK_MIN_CHARS = 80
+DEFAULT_BLOCK_MIN_INTERVAL = 2.5
+DEFAULT_BLOCK_MAX_MESSAGES = 5
+DEFAULT_BLOCK_HARD_CHARS = 900
+
+
+@dataclass
+class _BlockState:
+    """单个 correlation 的分段呈现状态(仅 block 模式)."""
+
+    segmenter: BlockSegmenter
+    messages: int = 0
+    last_sent_at: Optional[float] = None
 
 # 入站消息处理器: 收到一条平台无关消息, 返回是否成功入队
 Handler = Callable[[IncomingMessage], Awaitable[bool]]
@@ -571,18 +597,39 @@ class OneBot11Adapter(QqAdapter):
         typing_enabled: bool = True,
         typing_refresh_seconds: float = 5.0,
         typing_event_type: int = 1,
+        block_first_chars: int = DEFAULT_BLOCK_FIRST_CHARS,
+        block_min_chars: int = DEFAULT_BLOCK_MIN_CHARS,
+        block_min_interval: float = DEFAULT_BLOCK_MIN_INTERVAL,
+        block_max_messages: int = DEFAULT_BLOCK_MAX_MESSAGES,
+        block_hard_chars: int = DEFAULT_BLOCK_HARD_CHARS,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         super().__init__(channel=channel, transport=transport.send)
         if stream_mode not in ("off", "typing", "block"):
             raise ValueError(f"stream_mode 取值不支持: {stream_mode!r}")
+        if block_max_messages <= 0:
+            raise ValueError(f"block_max_messages 必须为正整数: {block_max_messages!r}")
+        if block_min_interval <= 0:
+            raise ValueError(f"block_min_interval 必须为正数: {block_min_interval!r}")
         self.onebot = transport
         self.onebot.set_handler(self.feed)
         self.stream_mode = stream_mode
         self.typing_enabled = bool(typing_enabled)
         self.typing_refresh_seconds = float(typing_refresh_seconds)
         self.typing_event_type = int(typing_event_type)
+        # block 模式参数(见 docs/STREAMING_DESIGN.md §6)
+        self.block_first_chars = max(1, int(block_first_chars))
+        self.block_min_chars = max(1, int(block_min_chars))
+        self.block_min_interval = float(block_min_interval)
+        self.block_max_messages = int(block_max_messages)
+        self.block_hard_chars = max(int(block_hard_chars), self.block_min_chars)
+        # 水位线: 记录"已作为气泡送达"的内容, 最终 reply 只补发剩余后缀
+        self.assembler = StreamAssembler(max_chars=self.onebot.max_text_chars)
+        self._clock = clock or time.monotonic
         # correlation_id -> 续期任务(仅在 agent 生成期间存在)
         self._typing: dict[str, TypingKeepAlive] = {}
+        # correlation_id -> 分段状态(仅 block 模式)
+        self._blocks: dict[str, _BlockState] = {}
 
     async def start(self, bus: MessageBus) -> None:
         await super().start(bus)
@@ -598,6 +645,8 @@ class OneBot11Adapter(QqAdapter):
 
     async def stop(self, timeout: float = 5.0) -> None:
         await self._stop_all_typing()
+        self._blocks.clear()
+        self.assembler.clear()
         await self.onebot.stop(timeout)
         await super().stop(timeout)
 
@@ -608,15 +657,75 @@ class OneBot11Adapter(QqAdapter):
         if envelope.kind == KIND_STREAM:
             await self._handle_stream_envelope(envelope)
             return
+        correlation = envelope.correlation_id
+        # block 模式: 中间气泡已经发出去了一部分, 最终只补发剩余后缀(绝不重复)
+        if self.stream_mode == "block" and self.assembler.sent_text(correlation):
+            remaining = "".join(self.assembler.plan_final(correlation, envelope.text))
+            self.assembler.forget(correlation)
+            if not remaining:
+                self.sent.append(envelope)  # 全部内容已作为气泡送达, 不再重发
+                return
+            await super().send(replace(envelope, text=remaining))
+            return
+        self.assembler.forget(correlation)
         await super().send(envelope)
 
     async def _handle_stream_envelope(self, envelope: Envelope) -> None:
         phase = envelope.metadata.get("phase")
         if phase == STREAM_PHASE_START:
+            self.assembler.register(envelope.correlation_id)
             self._start_typing(envelope.correlation_id, envelope)
+        elif phase == STREAM_PHASE_DELTA:
+            if self.stream_mode == "block":
+                await self._handle_block_delta(envelope)
         elif phase == STREAM_PHASE_END:
             await self._stop_typing(envelope.correlation_id)
-        # STREAM_PHASE_DELTA: S4 不产生中间气泡; 逐条 delta 只在 block(S5) 时消费
+            self._blocks.pop(envelope.correlation_id, None)
+
+    # ------------------------------------------------------------------ block 分段呈现
+
+    async def _handle_block_delta(self, envelope: Envelope) -> None:
+        """按"语义边界 + 节流 + 条数封顶"发中间气泡(见 docs/STREAMING_DESIGN.md §4.6)."""
+        text = envelope.text
+        if not text:
+            return
+        correlation = envelope.correlation_id
+        state = self._blocks.get(correlation)
+        if state is None:
+            state = _BlockState(
+                segmenter=BlockSegmenter(
+                    soft_chars=self.block_min_chars, hard_chars=self.block_hard_chars
+                )
+            )
+            self._blocks[correlation] = state
+        state.segmenter.push(text)
+
+        while True:
+            if state.messages >= self.block_max_messages:
+                return  # 条数封顶: 剩余内容全部由最终消息承载
+            floor = self.block_first_chars if state.messages == 0 else self.block_min_chars
+            if state.segmenter.buffered_length < floor:
+                return
+            now = self._clock()
+            if state.last_sent_at is not None and now - state.last_sent_at < self.block_min_interval:
+                return  # 时间节流
+            block = state.segmenter.take()
+            if block is None:
+                return  # 尚未形成自然边界
+
+            await self._emit_bubble(envelope, block)
+            self.assembler.mark_sent(correlation, block)
+            state.messages += 1
+            state.last_sent_at = self._clock()
+            if state.messages == 1:
+                # 第一条气泡已经把"有内容了"传递出去, 输入状态可以停掉
+                await self._stop_typing(correlation)
+
+    async def _emit_bubble(self, envelope: Envelope, text: str) -> None:
+        """把一段中间内容作为独立气泡发出(复用最终回复通道)."""
+        bubble = replace(envelope, kind=KIND_REPLY, text=text)
+        self.sent.append(bubble)
+        await self.onebot.send(bubble)
 
     def _typing_active(self) -> bool:
         return self.typing_enabled and self.stream_mode in ("typing", "block")
@@ -654,6 +763,11 @@ __all__ = [
     "POST_TYPE_MESSAGE",
     "OneBot11Adapter",
     "OneBot11Transport",
+    "DEFAULT_BLOCK_FIRST_CHARS",
+    "DEFAULT_BLOCK_HARD_CHARS",
+    "DEFAULT_BLOCK_MAX_MESSAGES",
+    "DEFAULT_BLOCK_MIN_CHARS",
+    "DEFAULT_BLOCK_MIN_INTERVAL",
     "TypingKeepAlive",
     "chunk_text",
     "event_to_incoming",

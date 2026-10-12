@@ -16,6 +16,13 @@ import pytest
 from websockets.asyncio.client import connect
 
 from meowmeowclaw.channels.onebot11 import OneBot11Adapter, OneBot11Transport
+from meowmeowclaw.llm.base import (
+    FINISH_REASON_STOP,
+    LLMProvider,
+    LLMResponse,
+    StreamFinal,
+    StreamTextDelta,
+)
 from meowmeowclaw.channels.qq_policy import QqPolicy
 from meowmeowclaw.channels.qq_private import QqPrivateActiveStore
 from meowmeowclaw.gateway import Gateway
@@ -51,6 +58,30 @@ def group_event(text: str, *, user_id: str = OWNER, message_id: int = 1, time_ms
     payload["message_type"] = "group"
     payload["group_id"] = GROUP_ID
     return payload
+
+
+class StreamingPartsProvider(LLMProvider):
+    """逐条吐增量(每条之间可插入延迟), 最终回答为 parts 拼接."""
+
+    def __init__(self, parts: list[str], *, delay: float = 0.0) -> None:
+        self.parts = list(parts)
+        self.delay = float(delay)
+        self.stream_calls = 0
+        self.chat_calls = 0
+
+    async def chat(self, messages, tools=None, model=None, max_tokens=None) -> LLMResponse:
+        self.chat_calls += 1
+        raise AssertionError("流式场景不应调用 chat()")
+
+    async def chat_stream(self, messages, tools=None, model=None, max_tokens=None):
+        self.stream_calls += 1
+        for part in self.parts:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            yield StreamTextDelta(part)
+        yield StreamFinal(
+            LLMResponse(content="".join(self.parts), finish_reason=FINISH_REASON_STOP)
+        )
 
 
 @asynccontextmanager
@@ -95,8 +126,11 @@ async def build_gateway(
     idle_timeout_ms: int = 6 * 60 * 60 * 1000,
     stream_enabled: bool = False,
     adapter_factory=None,
+    conversation_kwargs=None,
 ):
-    conversation = build_conversation(tmp_path / "memory", provider)
+    conversation = build_conversation(
+        tmp_path / "memory", provider, **(conversation_kwargs or {})
+    )
     active_store = QqPrivateActiveStore(tmp_path / "memory")
     clock = Clock()
     policy = QqPolicy(conversation, active_store, OWNER, idle_timeout_ms=idle_timeout_ms, clock=clock)
@@ -339,5 +373,80 @@ class TestNapCatTypingIndicator:
                 frame = await next_action(websocket)
                 assert frame["action"] == "send_private_msg"
                 await ack(websocket, frame)
+        finally:
+            await gateway.stop()
+
+
+# --------------------------------------------------- QQ 流式: block 分段(S5)
+
+
+class TestNapCatBlockStreaming:
+    @pytest.mark.asyncio
+    async def test_block_bubbles_join_to_full_answer_within_cap(self, tmp_path):
+        """端到端: 中间气泡 + 最终补发 的拼接必须等于完整回答, 且条数受封顶约束."""
+        parts = ["第一句话。", "第二句话。", "第三句话。", "第四句话。", "第五句话。"]
+        provider = StreamingPartsProvider(parts, delay=0.05)
+        gateway, transport, _, _, _ = await build_gateway(
+            tmp_path,
+            provider,
+            stream_enabled=True,
+            # 关掉 Agent 侧的前导宽限, 让每个增量立刻下发(否则短回答会被合并成一次)
+            conversation_kwargs={"stream_preamble_grace_chars": 1, "stream_preamble_grace_ms": 1},
+            adapter_factory=lambda item: OneBot11Adapter(
+                item,
+                stream_mode="block",
+                typing_enabled=False,
+                block_first_chars=6,
+                block_min_chars=6,
+                block_min_interval=0.01,
+                block_max_messages=3,
+                block_hard_chars=200,
+            ),
+        )
+        try:
+            async with napcat_client(transport.port) as websocket:
+                assert await wait_connected(transport)
+                await send_event(websocket, private_event("讲点什么", time_ms=1_000_000))
+
+                bubbles: list[str] = []
+                while True:
+                    try:
+                        frame = await next_action(websocket, timeout=1.0)
+                    except asyncio.TimeoutError:
+                        break
+                    if frame["action"] == "send_private_msg":
+                        bubbles.append(action_texts(frame)[0])
+                    await ack(websocket, frame)
+                assert provider.stream_calls == 1  # 确实走了流式
+                assert bubbles, "至少应发出 1 条消息"
+                full = "".join(parts)
+                assert "".join(bubbles) == full  # 不重复、不缺失
+                assert len(bubbles) >= 2  # 至少发生一次中间气泡(而不是整段兜底)
+                assert len(bubbles) <= 4  # block_max_messages(3) + 最终 1 条
+        finally:
+            await gateway.stop()
+
+    @pytest.mark.asyncio
+    async def test_short_answer_block_mode_single_bubble(self, tmp_path):
+        provider = StreamingPartsProvider(["短答。"])
+        gateway, transport, _, _, _ = await build_gateway(
+            tmp_path,
+            provider,
+            stream_enabled=True,
+            adapter_factory=lambda item: OneBot11Adapter(
+                item, stream_mode="block", typing_enabled=False, block_first_chars=50
+            ),
+        )
+        try:
+            async with napcat_client(transport.port) as websocket:
+                assert await wait_connected(transport)
+                await send_event(websocket, private_event("在吗", time_ms=1_000_000))
+
+                frame = await next_action(websocket, timeout=3.0)
+                assert frame["action"] == "send_private_msg"
+                assert action_texts(frame) == ["短答。"]
+                await ack(websocket, frame)
+                with pytest.raises(asyncio.TimeoutError):
+                    await next_action(websocket, timeout=0.4)
         finally:
             await gateway.stop()

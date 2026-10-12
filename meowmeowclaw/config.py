@@ -69,6 +69,12 @@ DEFAULT_QQ_MESSAGE_CHUNK_CHARS = 3000
 DEFAULT_QQ_STREAM_MODE = "typing"          # off | typing | block(S5 实现)
 DEFAULT_QQ_TYPING_INDICATOR = True
 DEFAULT_QQ_TYPING_REFRESH_SECONDS = 5.0
+# block 分段呈现默认值(保守: 防刷屏 + 防风控)
+DEFAULT_QQ_STREAM_FIRST_CHARS = 60
+DEFAULT_QQ_STREAM_MIN_CHARS = 80
+DEFAULT_QQ_STREAM_MIN_INTERVAL = 2.5
+DEFAULT_QQ_STREAM_MAX_MESSAGES = 5
+DEFAULT_QQ_STREAM_HARD_CHARS = 900
 
 # 流式输出默认值(设计见 docs/STREAMING_DESIGN.md §6)
 DEFAULT_STREAM_ENABLED = False
@@ -112,6 +118,11 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "qq_stream_mode": ("qq_stream_mode", "qq_stream"),
     "qq_typing_indicator": ("qq_typing_indicator", "qq_typing"),
     "qq_typing_refresh_seconds": ("qq_typing_refresh_seconds", "qq_typing_interval"),
+    "qq_stream_first_chars": ("qq_stream_first_chars",),
+    "qq_stream_min_chars": ("qq_stream_min_chars",),
+    "qq_stream_min_interval": ("qq_stream_min_interval",),
+    "qq_stream_max_messages": ("qq_stream_max_messages",),
+    "qq_stream_hard_chars": ("qq_stream_hard_chars",),
     "stream_enabled": ("stream_enabled",),
     "cli_stream": ("cli_stream",),
     "stream_preamble_grace_ms": ("stream_preamble_grace_ms",),
@@ -355,6 +366,11 @@ class Settings:
     qq_stream_mode: str = DEFAULT_QQ_STREAM_MODE
     qq_typing_indicator: bool = DEFAULT_QQ_TYPING_INDICATOR
     qq_typing_refresh_seconds: float = DEFAULT_QQ_TYPING_REFRESH_SECONDS
+    qq_stream_first_chars: int = DEFAULT_QQ_STREAM_FIRST_CHARS
+    qq_stream_min_chars: int = DEFAULT_QQ_STREAM_MIN_CHARS
+    qq_stream_min_interval: float = DEFAULT_QQ_STREAM_MIN_INTERVAL
+    qq_stream_max_messages: int = DEFAULT_QQ_STREAM_MAX_MESSAGES
+    qq_stream_hard_chars: int = DEFAULT_QQ_STREAM_HARD_CHARS
     # 流式输出(§6)
     stream_enabled: bool = DEFAULT_STREAM_ENABLED
     cli_stream: bool = DEFAULT_CLI_STREAM
@@ -389,6 +405,11 @@ class Settings:
             f"qq_stream_mode={self.qq_stream_mode!r}, "
             f"qq_typing_indicator={self.qq_typing_indicator}, "
             f"qq_typing_refresh_seconds={self.qq_typing_refresh_seconds}, "
+            f"qq_stream_first_chars={self.qq_stream_first_chars}, "
+            f"qq_stream_min_chars={self.qq_stream_min_chars}, "
+            f"qq_stream_min_interval={self.qq_stream_min_interval}, "
+            f"qq_stream_max_messages={self.qq_stream_max_messages}, "
+            f"qq_stream_hard_chars={self.qq_stream_hard_chars}, "
             f"stream_enabled={self.stream_enabled}, cli_stream={self.cli_stream}, "
             f"stream_preamble_grace_ms={self.stream_preamble_grace_ms}, "
             f"stream_preamble_grace_chars={self.stream_preamble_grace_chars}, "
@@ -509,6 +530,31 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["qq_typing_refresh_seconds"]),
             DEFAULT_QQ_TYPING_REFRESH_SECONDS,
             "qq_typing_refresh_seconds",
+        ),
+        qq_stream_first_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["qq_stream_first_chars"]),
+            DEFAULT_QQ_STREAM_FIRST_CHARS,
+            "qq_stream_first_chars",
+        ),
+        qq_stream_min_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["qq_stream_min_chars"]),
+            DEFAULT_QQ_STREAM_MIN_CHARS,
+            "qq_stream_min_chars",
+        ),
+        qq_stream_min_interval=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["qq_stream_min_interval"]),
+            DEFAULT_QQ_STREAM_MIN_INTERVAL,
+            "qq_stream_min_interval",
+        ),
+        qq_stream_max_messages=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["qq_stream_max_messages"]),
+            DEFAULT_QQ_STREAM_MAX_MESSAGES,
+            "qq_stream_max_messages",
+        ),
+        qq_stream_hard_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["qq_stream_hard_chars"]),
+            DEFAULT_QQ_STREAM_HARD_CHARS,
+            "qq_stream_hard_chars",
         ),
         stream_enabled=_resolve_bool(
             _get(raw, *_KEY_ALIASES["stream_enabled"]),

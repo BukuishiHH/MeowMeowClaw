@@ -8,7 +8,8 @@
 import asyncio
 import json
 import socket
-from typing import Any
+from contextlib import suppress
+from typing import Any, Optional
 
 import pytest
 from websockets.asyncio.client import connect
@@ -29,6 +30,8 @@ from meowmeowclaw.gateway import (
     STREAM_PHASE_START,
     AsyncioQueueBus,
     Envelope,
+    make_inbound,
+    make_reply,
     make_stream_event,
     outbound_queue,
 )
@@ -568,3 +571,255 @@ class TestAdapterIgnoresDeltas:
 
         with pytest.raises(ValueError):
             OneBot11Adapter(transport, stream_mode="draft")
+
+
+# ------------------------------------------------------- block 分段呈现(S5)
+
+
+class FakeClock:
+    """可注入的单调时钟(秒), 用于稳定验证节流."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class ActionCollector:
+    """后台读帧并 ack: 记录 send_private_msg 的文本, 同时应答 typing 等动作."""
+
+    def __init__(self, websocket) -> None:
+        self.websocket = websocket
+        self.messages: list[str] = []
+        self.actions: list[str] = []
+        self._task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                raw = await self.websocket.recv()
+                payload = json.loads(raw)
+                action = payload.get("action", "")
+                self.actions.append(action)
+                if action == "send_private_msg":
+                    self.messages.append(payload["params"]["message"][0]["data"]["text"])
+                await self.websocket.send(
+                    json.dumps({"status": "ok", "retcode": 0, "echo": payload.get("echo")})
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 收尾阶段连接关闭属正常
+            return
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+def block_adapter(transport, **kwargs):
+    params = {
+        "stream_mode": "block",
+        "typing_enabled": False,
+        "block_first_chars": 5,
+        "block_min_chars": 5,
+        "block_min_interval": 1.0,
+        "block_max_messages": 3,
+        "block_hard_chars": 50,
+    }
+    params.update(kwargs)
+    return OneBot11Adapter(transport, **params)
+
+
+def sentences_request():
+    return make_inbound(
+        channel="qq",
+        text="问题",
+        conversation_id="2328428288",
+        sender_id="2328428288",
+        message_id="m-1",
+    )
+
+
+class TestAdapterBlockMode:
+    @pytest.mark.asyncio
+    async def test_bounded_bubbles_and_final_suffix_join_to_full_answer(self):
+        port = free_port()
+        clock = FakeClock()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = block_adapter(transport, clock=clock)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                collector = ActionCollector(websocket)
+                collector.start()
+                request = sentences_request()
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_START))
+
+                parts = ["第一句。", "第二句。", "第三句。", "第四句。", "第五句。"]
+                full = ""
+                for index, part in enumerate(parts, start=1):
+                    full += part
+                    clock.advance(2.0)
+                    await adapter.send(
+                        make_stream_event(request, phase=STREAM_PHASE_DELTA, text=part, seq=index)
+                    )
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_END))
+                await adapter.send(make_reply(request, full))
+                await collector.stop()
+
+                # take() 取"最后一个边界之前"的全部内容: 一次尽量多发, 减少气泡数
+                assert collector.messages == ["第一句。第二句。", "第三句。第四句。", "第五句。"]
+                assert "".join(collector.messages) == full  # 不重复、不缺失
+                assert len(collector.messages) <= adapter.block_max_messages + 1
+                assert "set_input_status" not in collector.actions  # typing 已关闭
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_throttle_limits_bubbles_within_interval(self):
+        port = free_port()
+        clock = FakeClock()  # 不推进 → 只允许第一条
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = block_adapter(transport, clock=clock, block_min_interval=10.0)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                collector = ActionCollector(websocket)
+                collector.start()
+                request = sentences_request()
+                for index, part in enumerate(["第一句。", "第二句。", "第三句。"], start=1):
+                    await adapter.send(
+                        make_stream_event(request, phase=STREAM_PHASE_DELTA, text=part, seq=index)
+                    )
+                await adapter.send(make_reply(request, "第一句。第二句。第三句。"))
+                await collector.stop()
+
+                assert collector.messages == ["第一句。第二句。", "第三句。"]
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_max_messages_cap_moves_rest_to_final_reply(self):
+        port = free_port()
+        clock = FakeClock()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = block_adapter(transport, clock=clock, block_max_messages=1)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                collector = ActionCollector(websocket)
+                collector.start()
+                request = sentences_request()
+                full = ""
+                for index, part in enumerate(["一。", "二。", "三。", "四。"], start=1):
+                    full += part
+                    clock.advance(2.0)
+                    await adapter.send(
+                        make_stream_event(request, phase=STREAM_PHASE_DELTA, text=part, seq=index)
+                    )
+                await adapter.send(make_reply(request, full))
+                await collector.stop()
+
+                assert len(collector.messages) == 2  # 1 条中间气泡 + 1 条剩余
+                assert "".join(collector.messages) == full
+                assert collector.messages[0] == "一。二。三。"
+                assert collector.messages[1] == "四。"
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_short_answer_produces_single_final_message(self):
+        port = free_port()
+        clock = FakeClock()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = block_adapter(transport, clock=clock, block_first_chars=50)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                collector = ActionCollector(websocket)
+                collector.start()
+                request = sentences_request()
+                await adapter.send(
+                    make_stream_event(request, phase=STREAM_PHASE_DELTA, text="短回答。", seq=1)
+                )
+                await adapter.send(make_reply(request, "短回答。"))
+                await collector.stop()
+
+                assert collector.messages == ["短回答。"]
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_when_all_content_already_bubbled(self):
+        port = free_port()
+        clock = FakeClock()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = block_adapter(transport, clock=clock)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                collector = ActionCollector(websocket)
+                collector.start()
+                request = sentences_request()
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_START))
+                clock.advance(2.0)
+                await adapter.send(
+                    make_stream_event(request, phase=STREAM_PHASE_DELTA, text="完整一句。", seq=1)
+                )
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_END))
+                await adapter.send(make_reply(request, "完整一句。"))
+                await collector.stop()
+
+                assert collector.messages == ["完整一句。"]  # 不再补发重复内容
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_typing_stops_after_first_bubble(self):
+        port = free_port()
+        clock = FakeClock()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = block_adapter(
+            transport, clock=clock, typing_enabled=True, typing_refresh_seconds=30.0
+        )
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                collector = ActionCollector(websocket)
+                collector.start()
+                request = sentences_request()
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_START))
+                clock.advance(2.0)
+                await adapter.send(
+                    make_stream_event(request, phase=STREAM_PHASE_DELTA, text="第一句说得长。", seq=1)
+                )
+                await asyncio.sleep(0.05)
+
+                assert "set_input_status" in collector.actions  # 开始时有"正在输入"
+                assert adapter._typing == {}  # 第一条气泡后已停止续期
+                await adapter.send(make_reply(request, "第一句说得长。"))
+                await collector.stop()
+        finally:
+            await adapter.stop()
+            await transport.stop()

@@ -430,7 +430,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S2 网关流式通道 | 已完成 | `4ee4f19` | 2026-10-12 | 新增 26 用例；全量 1153 passed |
 | S3 CLI 流式 | 已完成 | `740b673` | 2026-10-12 | 新增 15 用例；全量 1168 passed；管道冒烟通过 |
 | S4 QQ typing | 已完成 | `e87ed37` | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
-| S5 QQ block | 已完成 | 待回填 | 2026-10-12 | 新增 30 用例；修复 TypingKeepAlive 无限等待缺陷 |
+| S5 QQ block | 已完成 | `1ab8193` | 2026-10-12 | 新增 30 用例；修复 TypingKeepAlive 无限等待缺陷 |
 | S6 收尾 | 待排期 | — | — | 文档/冒烟随 S1–S4 增量同步 |
 
 状态取值：`待确认 → 未开始 → 进行中 → 已完成 / 已放弃（附原因）`；每个里程碑**独立提交**，提交前必须满足：
@@ -536,7 +536,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S2 | `4ee4f19` | 2026-10-12 | `gateway/envelope` 新增 `KIND_STREAM`+`delta_seq`+`make_stream_event`；`AsyncioQueueBus.publish_best_effort`(丢弃不写死信)；dispatcher 三相位(start/delta/end)+on_delta 注入；`channels/streaming.py::StreamAssembler`(水位线/前缀补发)；新增 `tests/gateway/test_stream_channel.py`(26) | ruff 通过；1153 passed / 6 skipped / 2 xfailed（S1 基线 1127） |
 | S3 | `740b673` | 2026-10-12 | `config` 新增 `stream_enabled/cli_stream/stream_preamble_grace_*`；`bootstrap` 透传网关与 Agent；`CliAdapter(stream=...)` delta 逐字写出 + 最终只补后缀(水位线)；`cli.py` 启动信息展示流式状态；新增 `tests/channels/test_cli_stream.py`(9) + `test_config.py`(6) | ruff 通过；1168 passed / 6 skipped / 2 xfailed（S2 基线 1153）；真实管道 REPL 冒烟：回答恰好输出一次 |
 | S4 | `e87ed37` | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
-| S5 | 待回填 | 2026-10-12 | `BlockSegmenter`(段落/换行/句末/逗号/硬切 + 代码围栏保护)；`OneBot11Adapter` block 模式(首块阈值 + 最小间隔 + 条数封顶 + 水位线补发)；`qq_stream_first_chars/min_chars/min_interval/max_messages/hard_chars` 配置；`TypingKeepAlive` 改协作式停止(修复无限等待)；新增 test_streaming(+16)/test_onebot11(+6)/QQ 集成(+2)/config(+6) | ruff 通过；全量回归；端到端: 气泡拼接 == 完整回答、条数 ≤ max+1、无重复 |
+| S5 | `1ab8193` | 2026-10-12 | `BlockSegmenter`(段落/换行/句末/逗号/硬切 + 代码围栏保护)；`OneBot11Adapter` block 模式(首块阈值 + 最小间隔 + 条数封顶 + 水位线补发)；`qq_stream_first_chars/min_chars/min_interval/max_messages/hard_chars` 配置；`TypingKeepAlive` 改协作式停止(修复无限等待)；新增 test_streaming(+16)/test_onebot11(+6)/QQ 集成(+2)/config(+6) | ruff 通过；全量回归；端到端: 气泡拼接 == 完整回答、条数 ≤ max+1、无重复 |
 | S6 | — | — | — | — |
 
 ### 12.2 真机实测结论

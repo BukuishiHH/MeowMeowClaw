@@ -307,7 +307,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 
 | 阶段 | 状态 | 提交 | 备注 |
 |---|---|---|---|
-| A1 | 已完成 | 待回填 | metrics + `stats()` + 基准脚本；新增 22 用例；实测偏差 ≤11% |
+| A1 | 已完成 | `4f4d0bc` | metrics + `stats()` + 基准脚本；新增 28 用例；实测偏差 ≤11% |
 | A2 | 待实现 | — | 依赖 A1 |
 | A3 | 待实现 | — | 依赖 A2 |
 | A4 | 待实现 | — | 依赖 A1（可与 A2/A3 并行） |
@@ -324,7 +324,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 | `meowmeowclaw/memory/__init__.py` | 导出 `LatencyStats / StoreMetrics / DEFAULT_MAX_SAMPLES` |
 | `meowmeowclaw/conversation.py` | 新增 `ConversationService.stats()`（`cached_agents / locks / evictions / store / rss_mb`）与 `current_rss_mb()` |
 | `scripts/bench_session_store.py` | 新增：50/200/500/1000/2000 轮基准脚本（生成 + 三项主路径 avg/p95，输出与 §2.1 对照），不进 CI |
-| `tests/memory/test_metrics.py` / `test_jsonl_store_stats.py` / `tests/test_conversation.py` | 新增 22 用例（分位/有界/异常也记录/stats 契约/观测降级） |
+| `tests/memory/test_metrics.py` / `test_jsonl_store_stats.py` / `tests/test_conversation.py` | 新增 28 用例（分位/有界/异常也记录/stats 契约/观测降级） |
 
 **基准复测（本机 WSL2 / Python 3.11 / 20 次采样）**
 

@@ -88,15 +88,24 @@ def action_texts(action: dict[str, Any]) -> list[str]:
     return [segment["data"]["text"] for segment in action["params"]["message"]]
 
 
-async def build_gateway(tmp_path, provider, *, idle_timeout_ms: int = 6 * 60 * 60 * 1000):
+async def build_gateway(
+    tmp_path,
+    provider,
+    *,
+    idle_timeout_ms: int = 6 * 60 * 60 * 1000,
+    stream_enabled: bool = False,
+    adapter_factory=None,
+):
     conversation = build_conversation(tmp_path / "memory", provider)
     active_store = QqPrivateActiveStore(tmp_path / "memory")
     clock = Clock()
     policy = QqPolicy(conversation, active_store, OWNER, idle_timeout_ms=idle_timeout_ms, clock=clock)
     port = free_port()
     transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
-    adapter = OneBot11Adapter(transport)
-    gateway = Gateway(conversation=conversation, policies={"qq": policy})
+    adapter = adapter_factory(transport) if adapter_factory is not None else OneBot11Adapter(transport)
+    gateway = Gateway(
+        conversation=conversation, policies={"qq": policy}, stream_enabled=stream_enabled
+    )
     await gateway.start(adapters=[adapter])
     return gateway, transport, conversation, active_store, clock
 
@@ -250,5 +259,85 @@ class TestNapCatTransportErrors:
                 await send_event(websocket, private_event("再来", message_id=2, time_ms=clock.now))
                 action2 = await next_action(websocket)
                 assert action2["action"] == "send_private_msg"
+        finally:
+            await gateway.stop()
+
+
+# --------------------------------------------------- QQ 流式: typing 指示器(S4)
+
+
+class TestNapCatTypingIndicator:
+    @pytest.mark.asyncio
+    async def test_typing_sent_before_reply_and_deltas_do_not_bubble(self, tmp_path):
+        """真实链路: start → set_input_status(1); 最终回复 1 条; delta 不产生气泡."""
+        provider = ScriptedProvider(["你好呀"], delay=0.2)
+        gateway, transport, _, _, clock = await build_gateway(
+            tmp_path,
+            provider,
+            stream_enabled=True,
+            adapter_factory=lambda item: OneBot11Adapter(
+                item, stream_mode="typing", typing_refresh_seconds=30
+            ),
+        )
+        try:
+            async with napcat_client(transport.port) as websocket:
+                assert await wait_connected(transport)
+                await send_event(websocket, private_event("在吗", time_ms=clock.now))
+
+                typing_frame = await next_action(websocket)
+                assert typing_frame["action"] == "set_input_status"
+                assert typing_frame["params"] == {"user_id": int(OWNER), "event_type": 1}
+                await ack(websocket, typing_frame)
+
+                reply_frame = await next_action(websocket)
+                assert reply_frame["action"] == "send_private_msg"
+                assert action_texts(reply_frame) == ["你好呀"]  # 单条完整气泡
+                await ack(websocket, reply_frame)
+
+                # delta(整段被当作一个增量)不产生额外气泡, typing 也已停止
+                with pytest.raises(asyncio.TimeoutError):
+                    await next_action(websocket, timeout=0.4)
+        finally:
+            await gateway.stop()
+
+    @pytest.mark.asyncio
+    async def test_typing_disabled_by_config_sends_no_typing(self, tmp_path):
+        provider = ScriptedProvider(["回答"], delay=0.1)
+        gateway, transport, _, _, clock = await build_gateway(
+            tmp_path,
+            provider,
+            stream_enabled=True,
+            adapter_factory=lambda item: OneBot11Adapter(
+                item, stream_mode="typing", typing_enabled=False
+            ),
+        )
+        try:
+            async with napcat_client(transport.port) as websocket:
+                assert await wait_connected(transport)
+                await send_event(websocket, private_event("在吗", time_ms=clock.now))
+
+                frame = await next_action(websocket)
+                assert frame["action"] == "send_private_msg"  # 直接就是最终回复
+                await ack(websocket, frame)
+        finally:
+            await gateway.stop()
+
+    @pytest.mark.asyncio
+    async def test_off_mode_streams_nothing(self, tmp_path):
+        provider = ScriptedProvider(["回答"], delay=0.05)
+        gateway, transport, _, _, clock = await build_gateway(
+            tmp_path,
+            provider,
+            stream_enabled=True,
+            adapter_factory=lambda item: OneBot11Adapter(item, stream_mode="off"),
+        )
+        try:
+            async with napcat_client(transport.port) as websocket:
+                assert await wait_connected(transport)
+                await send_event(websocket, private_event("在吗", time_ms=clock.now))
+
+                frame = await next_action(websocket)
+                assert frame["action"] == "send_private_msg"
+                await ack(websocket, frame)
         finally:
             await gateway.stop()

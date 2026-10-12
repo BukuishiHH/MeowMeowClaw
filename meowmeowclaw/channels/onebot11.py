@@ -33,11 +33,17 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
-from meowmeowclaw.gateway import Envelope, MessageBus
+from meowmeowclaw.gateway import (
+    KIND_STREAM,
+    STREAM_PHASE_END,
+    STREAM_PHASE_START,
+    Envelope,
+    MessageBus,
+)
 
 from .base import IncomingMessage
 from .qq_adapter import QqAdapter
-from .streaming import DEFAULT_MAX_TEXT_CHARS, chunk_text
+from .streaming import DEFAULT_MAX_TEXT_CHARS, TypingKeepAlive, chunk_text
 
 logger = logging.getLogger(__name__)
 
@@ -448,8 +454,16 @@ class OneBot11Transport:
         websocket: Any,
         action: str,
         params: dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+        quiet: bool = False,
     ) -> Optional[dict[str, Any]]:
-        """发送动作并等待 ``echo`` 响应; 超时/失败返回 None(已记日志)."""
+        """发送动作并等待 ``echo`` 响应; 超时/失败返回 None(已记日志).
+
+        ``quiet=True`` 时失败降到 debug 级(输入状态等 best-effort 动作专用)。
+        """
+        budget = self.action_timeout if timeout is None else float(timeout)
+        log = logger.debug if quiet else logger.warning
         echo = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -458,22 +472,22 @@ class OneBot11Transport:
             await websocket.send(
                 json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False)
             )
-            response = await asyncio.wait_for(future, timeout=self.action_timeout)
+            response = await asyncio.wait_for(future, timeout=budget)
         except asyncio.TimeoutError:
-            logger.warning("OneBot 动作超时(%.1fs): %s", self.action_timeout, action)
+            log("OneBot 动作超时(%.1fs): %s", budget, action)
             return None
         except ConnectionClosed as exc:
-            logger.warning("OneBot 动作发送失败(连接已关闭): %s (%s)", action, exc)
+            log("OneBot 动作发送失败(连接已关闭): %s (%s)", action, exc)
             return None
         except Exception as exc:  # noqa: BLE001 发送失败只影响本条消息
-            logger.warning("OneBot 动作发送失败: %s (%r)", action, exc)
+            log("OneBot 动作发送失败: %s (%r)", action, exc)
             return None
         finally:
             self._pending.pop(echo, None)
 
         retcode = response.get("retcode")
         if response.get("status") != "ok" and retcode != 0:
-            logger.warning(
+            log(
                 "OneBot 动作返回失败: %s retcode=%s message=%s",
                 action,
                 retcode,
@@ -481,6 +495,27 @@ class OneBot11Transport:
             )
             return None
         return response
+
+    async def set_input_status(
+        self, user_id: Any, event_type: int = 1, *, timeout: float = 3.0
+    ) -> bool:
+        """NapCat 扩展接口: 设置对某好友的"正在输入"状态(见 docs/STREAMING_DESIGN.md §4.7).
+
+        - best-effort: 未连接/超时/不支持都只是返回 False 并记 debug, 不影响回复;
+        - ``event_type`` 默认 1(=正在输入), 语义已由真机实测确认(见设计文档 §12)。
+        """
+        websocket = self._active
+        if websocket is None or websocket.state is not State.OPEN:
+            return False
+        target: Any = int(user_id) if str(user_id).isdigit() else user_id
+        result = await self._call_api(
+            websocket,
+            "set_input_status",
+            {"user_id": target, "event_type": int(event_type)},
+            timeout=timeout,
+            quiet=True,
+        )
+        return result is not None
 
     # ------------------------------------------------------------------ 鉴权/工具
 
@@ -514,17 +549,40 @@ class OneBot11Transport:
 
 
 class OneBot11Adapter(QqAdapter):
-    """``QqAdapter`` + ``OneBot11Transport`` 生命周期(实现网关适配器契约).
+    """``QqAdapter`` + ``OneBot11Transport`` 生命周期与流式呈现(实现网关适配器契约).
 
     ``BaseChannelAdapter`` 只管理出站消费循环, 平台连接由本类接管:
     先起出站消费再接收入站(契约要求), 关闭时先停入站(保留连接以送达在途回复),
     最后在 ``stop()`` 里断开连接。
+
+    流式呈现(见 docs/STREAMING_DESIGN.md §4.7):
+
+    - ``KIND_STREAM`` 的 ``start``/``end`` 相位驱动"对方正在输入"续期任务;
+    - ``delta`` 在 S4 只用于维持 typing, **绝不逐条发消息**(否则就是"一字一气泡");
+      ``block`` 分段呈现由 S5 实现。
     """
 
-    def __init__(self, transport: OneBot11Transport, *, channel: str = "qq") -> None:
+    def __init__(
+        self,
+        transport: OneBot11Transport,
+        *,
+        channel: str = "qq",
+        stream_mode: str = "typing",
+        typing_enabled: bool = True,
+        typing_refresh_seconds: float = 5.0,
+        typing_event_type: int = 1,
+    ) -> None:
         super().__init__(channel=channel, transport=transport.send)
+        if stream_mode not in ("off", "typing", "block"):
+            raise ValueError(f"stream_mode 取值不支持: {stream_mode!r}")
         self.onebot = transport
         self.onebot.set_handler(self.feed)
+        self.stream_mode = stream_mode
+        self.typing_enabled = bool(typing_enabled)
+        self.typing_refresh_seconds = float(typing_refresh_seconds)
+        self.typing_event_type = int(typing_event_type)
+        # correlation_id -> 续期任务(仅在 agent 生成期间存在)
+        self._typing: dict[str, TypingKeepAlive] = {}
 
     async def start(self, bus: MessageBus) -> None:
         await super().start(bus)
@@ -539,8 +597,54 @@ class OneBot11Adapter(QqAdapter):
         self.onebot.stop_inbound()
 
     async def stop(self, timeout: float = 5.0) -> None:
+        await self._stop_all_typing()
         await self.onebot.stop(timeout)
         await super().stop(timeout)
+
+    # ------------------------------------------------------------------ 流式呈现
+
+    async def send(self, envelope: Envelope) -> None:
+        """流式信封只在渠道内消化; 真正的回复仍走 ``QqAdapter.send`` → ``send_private_msg``."""
+        if envelope.kind == KIND_STREAM:
+            await self._handle_stream_envelope(envelope)
+            return
+        await super().send(envelope)
+
+    async def _handle_stream_envelope(self, envelope: Envelope) -> None:
+        phase = envelope.metadata.get("phase")
+        if phase == STREAM_PHASE_START:
+            self._start_typing(envelope.correlation_id, envelope)
+        elif phase == STREAM_PHASE_END:
+            await self._stop_typing(envelope.correlation_id)
+        # STREAM_PHASE_DELTA: S4 不产生中间气泡; 逐条 delta 只在 block(S5) 时消费
+
+    def _typing_active(self) -> bool:
+        return self.typing_enabled and self.stream_mode in ("typing", "block")
+
+    def _start_typing(self, correlation_id: str, envelope: Envelope) -> None:
+        if not self._typing_active() or correlation_id in self._typing:
+            return
+        user_id = (envelope.conversation_id or envelope.sender_id or "").strip()
+        if not user_id:
+            return
+        keepalive = TypingKeepAlive(
+            lambda: self.onebot.set_input_status(user_id, self.typing_event_type),
+            label=f"qq:{user_id}",
+            refresh_seconds=self.typing_refresh_seconds,
+        )
+        self._typing[correlation_id] = keepalive
+        keepalive.start()
+
+    async def _stop_typing(self, correlation_id: str) -> None:
+        keepalive = self._typing.pop(correlation_id, None)
+        if keepalive is not None:
+            await keepalive.stop()
+
+    async def _stop_all_typing(self) -> None:
+        keepalives = list(self._typing.values())
+        self._typing.clear()
+        for keepalive in keepalives:
+            await keepalive.stop()
 
 
 __all__ = [
@@ -550,6 +654,7 @@ __all__ = [
     "POST_TYPE_MESSAGE",
     "OneBot11Adapter",
     "OneBot11Transport",
+    "TypingKeepAlive",
     "chunk_text",
     "event_to_incoming",
     "extract_text",

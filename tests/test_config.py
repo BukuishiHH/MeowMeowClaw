@@ -36,6 +36,9 @@ from meowmeowclaw.config import (
     DEFAULT_QQ_WS_HOST,
     DEFAULT_QQ_WS_MODE,
     DEFAULT_QQ_WS_PATH,
+    DEFAULT_QQ_STREAM_MODE,
+    DEFAULT_QQ_TYPING_INDICATOR,
+    DEFAULT_QQ_TYPING_REFRESH_SECONDS,
     DEFAULT_QQ_WS_PORT,
     DEFAULT_STREAM_ENABLED,
     DEFAULT_STREAM_PREAMBLE_GRACE_CHARS,
@@ -115,6 +118,12 @@ ENV_KEYS = (
     "QQ_API_TIMEOUT",
     "QQ_MESSAGE_CHUNK_CHARS",
     "QQ_MAX_MESSAGE_CHARS",
+    "QQ_STREAM_MODE",
+    "QQ_STREAM",
+    "QQ_TYPING_INDICATOR",
+    "QQ_TYPING",
+    "QQ_TYPING_REFRESH_SECONDS",
+    "QQ_TYPING_INTERVAL",
     "STREAM_ENABLED",
     "CLI_STREAM",
     "STREAM_PREAMBLE_GRACE_MS",
@@ -827,6 +836,47 @@ class TestStreamSettings:
 
         assert s.stream_preamble_grace_chars == DEFAULT_STREAM_PREAMBLE_GRACE_CHARS
         assert any("stream_preamble_grace_chars" in record.message for record in caplog.records)
+
+    def test_qq_stream_mode_defaults_and_values(self, tmp_path):
+        assert (
+            load_settings(write_env(tmp_path, "model=m\n")).qq_stream_mode
+            == DEFAULT_QQ_STREAM_MODE
+        )
+        assert (
+            load_settings(write_env(tmp_path, "qq_stream_mode=off\n")).qq_stream_mode == "off"
+        )
+        assert (
+            load_settings(write_env(tmp_path, "qq_stream_mode=BLOCK\n")).qq_stream_mode == "block"
+        )
+
+    def test_qq_stream_mode_rejects_unimplemented_draft(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, "qq_stream_mode=draft\n"))
+
+        assert s.qq_stream_mode == DEFAULT_QQ_STREAM_MODE
+        assert any("qq_stream_mode" in record.message for record in caplog.records)
+
+    def test_qq_typing_settings(self, tmp_path):
+        s = load_settings(
+            write_env(tmp_path, "qq_typing_indicator=false\nqq_typing_refresh_seconds=2.5\n")
+        )
+
+        assert s.qq_typing_indicator is False
+        assert s.qq_typing_refresh_seconds == 2.5
+
+    def test_qq_typing_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.qq_typing_indicator is DEFAULT_QQ_TYPING_INDICATOR
+        assert s.qq_typing_refresh_seconds == DEFAULT_QQ_TYPING_REFRESH_SECONDS
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "abc"])
+    def test_qq_typing_refresh_invalid_falls_back(self, tmp_path, caplog, raw):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, f"qq_typing_refresh_seconds={raw}\n"))
+
+        assert s.qq_typing_refresh_seconds == DEFAULT_QQ_TYPING_REFRESH_SECONDS
+        assert any("qq_typing_refresh_seconds" in record.message for record in caplog.records)
 
     def test_repr_contains_stream_flags(self):
         text = repr(Settings(stream_enabled=True, cli_stream=False))

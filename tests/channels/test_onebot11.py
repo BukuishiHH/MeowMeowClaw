@@ -23,7 +23,15 @@ from meowmeowclaw.channels.onebot11 import (
     extract_text,
     strip_cq_codes,
 )
-from meowmeowclaw.gateway import AsyncioQueueBus, Envelope, outbound_queue
+from meowmeowclaw.gateway import (
+    STREAM_PHASE_DELTA,
+    STREAM_PHASE_END,
+    STREAM_PHASE_START,
+    AsyncioQueueBus,
+    Envelope,
+    make_stream_event,
+    outbound_queue,
+)
 
 TOKEN = "meowclaw-test"
 PATH = "/onebot/v11/ws"
@@ -380,3 +388,183 @@ class TestOneBot11Adapter:
             blocker.close()
             await blocker.wait_closed()
             await bus.close()
+
+
+# ------------------------------------------------------------------ 输入状态(S4)
+
+
+class TestSetInputStatus:
+    @pytest.mark.asyncio
+    async def test_sends_action_with_expected_params(self):
+        port = free_port()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+
+                task = asyncio.create_task(transport.set_input_status("2328428288"))
+                payload = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                assert payload["action"] == "set_input_status"
+                assert payload["params"] == {"user_id": 2328428288, "event_type": 1}
+                await websocket.send(
+                    json.dumps({"status": "ok", "retcode": 0, "echo": payload["echo"]})
+                )
+
+                assert await asyncio.wait_for(task, timeout=5) is True
+        finally:
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_custom_event_type_and_string_user_id(self):
+        port = free_port()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+
+                task = asyncio.create_task(
+                    transport.set_input_status("not-a-number", event_type=2)
+                )
+                payload = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                assert payload["params"] == {"user_id": "not-a-number", "event_type": 2}
+                await websocket.send(
+                    json.dumps({"status": "ok", "retcode": 0, "echo": payload["echo"]})
+                )
+                assert await asyncio.wait_for(task, timeout=5) is True
+        finally:
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_without_connection_returns_false(self):
+        transport = OneBot11Transport(mode="reverse", port=free_port(), path=PATH, token=TOKEN)
+
+        assert await transport.set_input_status("2328428288") is False
+
+    @pytest.mark.asyncio
+    async def test_napcat_failure_returns_false_without_raising(self):
+        port = free_port()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+
+                task = asyncio.create_task(transport.set_input_status("2328428288"))
+                payload = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                # NapCat 返回失败(例如旧版本不支持该扩展接口)
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "status": "failed",
+                            "retcode": 1404,
+                            "message": "unknown action",
+                            "echo": payload["echo"],
+                        }
+                    )
+                )
+
+                assert await asyncio.wait_for(task, timeout=5) is False
+        finally:
+            await transport.stop()
+
+
+class TestAdapterIgnoresDeltas:
+    @pytest.mark.asyncio
+    async def test_delta_produces_no_message_but_start_sends_typing(self):
+        """核心防线: delta 绝不逐条发消息(否则就是"一字一气泡")."""
+        port = free_port()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = OneBot11Adapter(transport, stream_mode="typing", typing_refresh_seconds=30)
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                request = Envelope(
+                    kind="request",
+                    channel="qq",
+                    target_channel="qq",
+                    conversation_id="2328428288",
+                    sender_id="2328428288",
+                    message_id="m-1",
+                )
+
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_START))
+                typing_frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                assert typing_frame["action"] == "set_input_status"
+                await websocket.send(
+                    json.dumps({"status": "ok", "retcode": 0, "echo": typing_frame["echo"]})
+                )
+
+                await adapter.send(
+                    make_stream_event(request, phase=STREAM_PHASE_DELTA, text="你", seq=1)
+                )
+                await adapter.send(
+                    make_stream_event(request, phase=STREAM_PHASE_DELTA, text="好", seq=2)
+                )
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(websocket.recv(), timeout=0.3)
+
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_END))
+                assert adapter._typing == {}
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_typing_disabled_sends_nothing(self):
+        port = free_port()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = OneBot11Adapter(
+            transport, stream_mode="typing", typing_enabled=False, typing_refresh_seconds=30
+        )
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                request = Envelope(
+                    kind="request",
+                    channel="qq",
+                    target_channel="qq",
+                    conversation_id="2328428288",
+                    message_id="m-1",
+                )
+
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_START))
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(websocket.recv(), timeout=0.3)
+                assert adapter._typing == {}
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    @pytest.mark.asyncio
+    async def test_off_mode_never_starts_typing(self):
+        port = free_port()
+        transport = OneBot11Transport(mode="reverse", port=port, path=PATH, token=TOKEN)
+        adapter = OneBot11Adapter(transport, stream_mode="off")
+        await transport.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?access_token={TOKEN}") as websocket:
+                assert await wait_until(lambda: transport.connected)
+                request = Envelope(
+                    kind="request",
+                    channel="qq",
+                    target_channel="qq",
+                    conversation_id="2328428288",
+                    message_id="m-1",
+                )
+
+                await adapter.send(make_stream_event(request, phase=STREAM_PHASE_START))
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(websocket.recv(), timeout=0.3)
+        finally:
+            await adapter.stop()
+            await transport.stop()
+
+    def test_invalid_stream_mode_rejected(self):
+        transport = OneBot11Transport(mode="reverse", port=free_port(), path=PATH, token=TOKEN)
+
+        with pytest.raises(ValueError):
+            OneBot11Adapter(transport, stream_mode="draft")

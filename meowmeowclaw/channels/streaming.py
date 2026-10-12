@@ -10,8 +10,11 @@
 ``typing`` 模式不产生气泡, 因此不调用它, 最终仍会整段发送。
 """
 
+import asyncio
 import logging
 from collections import OrderedDict
+from contextlib import suppress
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -112,4 +115,75 @@ class StreamAssembler:
         return len(self._sent)
 
 
-__all__ = ["DEFAULT_MAX_ENTRIES", "DEFAULT_MAX_TEXT_CHARS", "StreamAssembler", "chunk_text"]
+class TypingKeepAlive:
+    """QQ 专用: 周期性维持"对方正在输入"状态(``set_input_status``).
+
+    - ``start()`` 立即发一次并起后台任务, 之后每 ``refresh_seconds`` 秒续期
+      (QQ 的输入状态会过期, 长回答需要续期才能一直显示);
+    - ``stop()`` 取消任务(幂等), 异常路径也不会外抛;
+    - 单次发送失败只记 debug(静默降级, 见 S-D4), 不影响主流程。
+    """
+
+    def __init__(
+        self,
+        action: Callable[[], Awaitable[object]],
+        *,
+        label: str = "",
+        refresh_seconds: float = 5.0,
+    ) -> None:
+        if refresh_seconds <= 0:
+            raise ValueError(f"refresh_seconds 必须为正数: {refresh_seconds!r}")
+        self.action = action
+        self.label = label
+        self.refresh_seconds = float(refresh_seconds)
+        self._task: Optional[asyncio.Task] = None
+        self._sent_count = 0
+
+    def __repr__(self) -> str:
+        return (
+            f"<TypingKeepAlive label={self.label!r} refresh={self.refresh_seconds}s "
+            f"running={self._task is not None} sent={self._sent_count}>"
+        )
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    @property
+    def sent_count(self) -> int:
+        return self._sent_count
+
+    def start(self) -> None:
+        """立即启动(不阻塞调用方; 首次发送在后台任务里完成)."""
+        if self._task is not None:
+            return
+        self._task = asyncio.create_task(self._run(), name=f"typing-keepalive-{self.label}")
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                await self.action()
+                self._sent_count += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 输入状态失败必须静默降级
+                logger.debug("设置输入状态失败(已忽略): label=%s", self.label, exc_info=True)
+            await asyncio.sleep(self.refresh_seconds)
+
+    async def stop(self) -> None:
+        """取消续期任务(幂等)."""
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+__all__ = [
+    "DEFAULT_MAX_ENTRIES",
+    "DEFAULT_MAX_TEXT_CHARS",
+    "StreamAssembler",
+    "TypingKeepAlive",
+    "chunk_text",
+]

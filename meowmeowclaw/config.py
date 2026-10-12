@@ -65,6 +65,11 @@ DEFAULT_QQ_TOKEN = ""
 DEFAULT_QQ_ACTION_TIMEOUT = 10.0
 DEFAULT_QQ_MESSAGE_CHUNK_CHARS = 3000
 
+# QQ 流式呈现默认值(设计见 docs/STREAMING_DESIGN.md §6)
+DEFAULT_QQ_STREAM_MODE = "typing"          # off | typing | block(S5 实现)
+DEFAULT_QQ_TYPING_INDICATOR = True
+DEFAULT_QQ_TYPING_REFRESH_SECONDS = 5.0
+
 # 流式输出默认值(设计见 docs/STREAMING_DESIGN.md §6)
 DEFAULT_STREAM_ENABLED = False
 DEFAULT_CLI_STREAM = True
@@ -104,6 +109,9 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "qq_token": ("qq_token", "napcat_token"),
     "qq_action_timeout": ("qq_action_timeout", "qq_api_timeout"),
     "qq_message_chunk_chars": ("qq_message_chunk_chars", "qq_max_message_chars"),
+    "qq_stream_mode": ("qq_stream_mode", "qq_stream"),
+    "qq_typing_indicator": ("qq_typing_indicator", "qq_typing"),
+    "qq_typing_refresh_seconds": ("qq_typing_refresh_seconds", "qq_typing_interval"),
     "stream_enabled": ("stream_enabled",),
     "cli_stream": ("cli_stream",),
     "stream_preamble_grace_ms": ("stream_preamble_grace_ms",),
@@ -246,6 +254,21 @@ def _resolve_non_negative_int(value: Optional[str], default: int, name: str) -> 
     return num
 
 
+def _resolve_qq_stream_mode(value: Optional[str]) -> str:
+    """解析 QQ 流式呈现档位: off/typing/block; 非法或未实现的 draft 回退默认并告警."""
+    if value is None:
+        return DEFAULT_QQ_STREAM_MODE
+    text = str(value).strip().lower()
+    if text in ("off", "typing", "block"):
+        return text
+    logger.warning(
+        "qq_stream_mode 取值不支持(%r), 回退默认值 %s(draft 档位按设计不实现)",
+        value,
+        DEFAULT_QQ_STREAM_MODE,
+    )
+    return DEFAULT_QQ_STREAM_MODE
+
+
 def _resolve_ws_mode(value: Optional[str]) -> str:
     """解析 OneBot11 连接方向: reverse(监听)/forward(主动连); 非法值回退默认."""
     if value is None:
@@ -328,6 +351,10 @@ class Settings:
     qq_token: str = DEFAULT_QQ_TOKEN
     qq_action_timeout: float = DEFAULT_QQ_ACTION_TIMEOUT
     qq_message_chunk_chars: int = DEFAULT_QQ_MESSAGE_CHUNK_CHARS
+    # QQ 流式呈现(§6)
+    qq_stream_mode: str = DEFAULT_QQ_STREAM_MODE
+    qq_typing_indicator: bool = DEFAULT_QQ_TYPING_INDICATOR
+    qq_typing_refresh_seconds: float = DEFAULT_QQ_TYPING_REFRESH_SECONDS
     # 流式输出(§6)
     stream_enabled: bool = DEFAULT_STREAM_ENABLED
     cli_stream: bool = DEFAULT_CLI_STREAM
@@ -359,6 +386,9 @@ class Settings:
             f"qq_ws_path={self.qq_ws_path!r}, qq_token={masked_qq_token}, "
             f"qq_action_timeout={self.qq_action_timeout}, "
             f"qq_message_chunk_chars={self.qq_message_chunk_chars}, "
+            f"qq_stream_mode={self.qq_stream_mode!r}, "
+            f"qq_typing_indicator={self.qq_typing_indicator}, "
+            f"qq_typing_refresh_seconds={self.qq_typing_refresh_seconds}, "
             f"stream_enabled={self.stream_enabled}, cli_stream={self.cli_stream}, "
             f"stream_preamble_grace_ms={self.stream_preamble_grace_ms}, "
             f"stream_preamble_grace_chars={self.stream_preamble_grace_chars}, "
@@ -468,6 +498,17 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["qq_message_chunk_chars"]),
             DEFAULT_QQ_MESSAGE_CHUNK_CHARS,
             "qq_message_chunk_chars",
+        ),
+        qq_stream_mode=_resolve_qq_stream_mode(_get(raw, *_KEY_ALIASES["qq_stream_mode"])),
+        qq_typing_indicator=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["qq_typing_indicator"]),
+            DEFAULT_QQ_TYPING_INDICATOR,
+            "qq_typing_indicator",
+        ),
+        qq_typing_refresh_seconds=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["qq_typing_refresh_seconds"]),
+            DEFAULT_QQ_TYPING_REFRESH_SECONDS,
+            "qq_typing_refresh_seconds",
         ),
         stream_enabled=_resolve_bool(
             _get(raw, *_KEY_ALIASES["stream_enabled"]),

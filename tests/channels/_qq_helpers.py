@@ -1,5 +1,7 @@
 """QQ 渠道测试共用替身(非 test_ 前缀)."""
 
+import asyncio
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,12 +24,15 @@ OWNER = "10001"
 class ScriptedProvider(LLMProvider):
     """按脚本返回回答; 记录每次收到的 messages."""
 
-    def __init__(self, answers: Optional[list[str]] = None) -> None:
+    def __init__(self, answers: Optional[list[str]] = None, *, delay: float = 0.0) -> None:
         self._answers = list(answers or [])
+        self.delay = float(delay)
         self.calls: list[list[dict]] = []
 
     async def chat(self, messages, tools=None, model=None, max_tokens=None) -> LLMResponse:
         self.calls.append([dict(message) for message in messages])
+        if self.delay:
+            await asyncio.sleep(self.delay)
         content = self._answers.pop(0) if self._answers else "默认回答"
         return LLMResponse(content=content, finish_reason=FINISH_REASON_STOP)
 

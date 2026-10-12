@@ -84,6 +84,7 @@ def _print_startup(config: Settings, transport: OneBot11Transport) -> None:
     print(f"  端点      : {transport.endpoint}")
     print(f"  令牌      : {_mask_token(transport.token)}")
     print(f"  主人 QQ   : {config.qq_owner_id}")
+    print(f"  QQ 流式   : {config.qq_stream_mode} (typing={'开' if config.qq_typing_indicator else '关'})")
     print(f"  模型      : {config.model}")
     print(f"  记忆目录  : {config.memory_dir}")
     print("-" * 62)
@@ -103,6 +104,10 @@ def _print_check(config: Settings, transport: OneBot11Transport) -> None:
     print(f"  qq_token               : {_mask_token(config.qq_token)}")
     print(f"  qq_action_timeout      : {config.qq_action_timeout}")
     print(f"  qq_message_chunk_chars : {config.qq_message_chunk_chars}")
+    print(f"  qq_stream_mode         : {config.qq_stream_mode}")
+    print(f"  qq_typing_indicator    : {config.qq_typing_indicator}")
+    print(f"  qq_typing_refresh_s    : {config.qq_typing_refresh_seconds}")
+    print(f"  stream_enabled         : {config.stream_enabled}")
     print(f"  端点                   : {transport.endpoint}")
     print(f"  记忆目录               : {config.memory_dir}")
 
@@ -127,7 +132,12 @@ async def run_qq(
 
     config = app.config
     transport = transport or build_transport(config)
-    adapter = OneBot11Adapter(transport)
+    adapter = OneBot11Adapter(
+        transport,
+        stream_mode=config.qq_stream_mode,
+        typing_enabled=config.qq_typing_indicator,
+        typing_refresh_seconds=config.qq_typing_refresh_seconds,
+    )
     policy = QqPolicy(app.conversation, QqPrivateActiveStore(config.memory_dir), config.qq_owner_id)
 
     stop_event = stop_event or asyncio.Event()
@@ -205,6 +215,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     transport = build_transport(app.config)
+    if app.config.qq_stream_mode == "block":
+        print("[启动警告] qq_stream_mode=block 将在 S5 实现, 当前按 typing 处理(不产生中间气泡)。")
     if not app.config.qq_token:
         print("[启动警告] qq_token 为空: 任何能访问监听端口的本机进程都可冒充 NapCat。")
 

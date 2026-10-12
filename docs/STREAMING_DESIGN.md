@@ -340,7 +340,7 @@ kind=stream(start/end)→ 忽略(start 可选打印 "[生成中...]" 前缀, 由
 |---|---|---|
 | `stream_enabled` | `false` | 全局流式总开关；`false` 时完全走现有非流式路径（零回归） |
 | `cli_stream` | `true` | CLI 逐字打印（仅在 `stream_enabled=true` 时生效） |
-| `qq_stream_mode` | `typing` | `off` / `typing` / `block` / `draft`（`draft` 默认不实现） |
+| `qq_stream_mode` | `typing` | `off` / `typing` / `block`；`draft` 按 S-D2 不实现，配置传入会被拒绝并回退默认 |
 | `qq_typing_indicator` | `true` | 是否调用 `set_input_status` |
 | `qq_typing_refresh_seconds` | `5` | "正在输入"续期间隔 |
 | `qq_stream_first_chars` | `60` | `block` 模式首块最小字数（越小首字越快） |
@@ -428,7 +428,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S1 流式地基 | 已完成 | 待回填 | 2026-10-12 | 新增 31 用例；全量 1127 passed |
 | S2 网关流式通道 | 已完成 | 待回填 | 2026-10-12 | 新增 26 用例；全量 1153 passed |
 | S3 CLI 流式 | 已完成 | 待回填 | 2026-10-12 | 新增 15 用例；全量 1168 passed；管道冒烟通过 |
-| S4 QQ typing | 未开始 | — | — | 依赖真机验证 `event_type` |
+| S4 QQ typing | 已完成 | 待回填 | 2026-10-12 | 新增 18 用例；真机 `set_input_status` 验证通过 |
 | S5 QQ block | 待排期 | — | — | S1–S4 真机验证通过后决定 |
 | S6 收尾 | 待排期 | — | — | 文档/冒烟随 S1–S4 增量同步 |
 
@@ -534,7 +534,7 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | S1 | 待回填 | 2026-10-12 | `llm/base.py` 流式事件与默认回退；`openai_compat.chat_stream`（tool_calls 分片/usage/空流回退/中断保文本/400 重试）；`AgentLoop.run_turn(on_delta)` + 工具轮前导抑制；`ConversationService` 透传；新增 `tests/test_stream_llm.py`(17) / `tests/agent/test_loop_stream.py`(11) / `tests/test_conversation.py`(3) | ruff 通过；1127 passed / 6 skipped / 2 xfailed（基线 1096） |
 | S2 | 待回填 | 2026-10-12 | `gateway/envelope` 新增 `KIND_STREAM`+`delta_seq`+`make_stream_event`；`AsyncioQueueBus.publish_best_effort`(丢弃不写死信)；dispatcher 三相位(start/delta/end)+on_delta 注入；`channels/streaming.py::StreamAssembler`(水位线/前缀补发)；新增 `tests/gateway/test_stream_channel.py`(26) | ruff 通过；1153 passed / 6 skipped / 2 xfailed（S1 基线 1127） |
 | S3 | 待回填 | 2026-10-12 | `config` 新增 `stream_enabled/cli_stream/stream_preamble_grace_*`；`bootstrap` 透传网关与 Agent；`CliAdapter(stream=...)` delta 逐字写出 + 最终只补后缀(水位线)；`cli.py` 启动信息展示流式状态；新增 `tests/channels/test_cli_stream.py`(9) + `test_config.py`(6) | ruff 通过；1168 passed / 6 skipped / 2 xfailed（S2 基线 1153）；真实管道 REPL 冒烟：回答恰好输出一次 |
-| S4 | — | — | — | — |
+| S4 | 待回填 | 2026-10-12 | `config` 新增 qq_stream_mode/qq_typing_indicator/qq_typing_refresh_seconds; `OneBot11Transport.set_input_status`(NapCat 扩展, 静默降级); `TypingKeepAlive` 续期任务; `OneBot11Adapter` 消费 start/end 且 **delta 绝不发消息**; `qq.py` 装配与启动提示; 新增 test_onebot11(+8)/test_streaming(6)/QQ 集成(+3)/config(+7) | ruff 通过；全量回归；真机: 真实 NapCat 连入且 set_input_status(1/0/2) 全部返回 ok |
 | S5 | — | — | — | — |
 | S6 | — | — | — | — |
 
@@ -543,7 +543,9 @@ S1 ──► S2 ──► S3 ──► S4 ──► S5 ──► S6
 | 项 | 结论 | 日期 |
 |---|---|---|
 | NapCat 动作枚举（183 个）中无消息编辑 API | 已确认（源码勘察） | 2026-10-12 |
-| `set_input_status` 的 `event_type` 语义 | 待 S4 实测 | — |
+| `set_input_status` 可用性 | 真实 NapCat（Windows, 机器人 3768130928）连入 WSL2 Agent 后调用成功；`event_type=1/0/2` 均返回 `retcode ok` | 2026-10-12 |
+| `set_input_status` 采用值 | 取 `event_type=1`（与 NapCat 源码 `payloadExample` 及其自身 `input_status` notice 默认值一致）；0/2 的结束态语义暂无差异，保持不发送 | 2026-10-12 |
+| "对方正在输入" 的 QQ 客户端实际观感 | **待用户真机确认**（脚本只能验证接口成功） | — |
 | `block` 模式观感与风控表现 | 待 S5 实测 | — |
 
 ### 12.3 参数标定记录

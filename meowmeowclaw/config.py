@@ -65,6 +65,13 @@ DEFAULT_QQ_TOKEN = ""
 DEFAULT_QQ_ACTION_TIMEOUT = 10.0
 DEFAULT_QQ_MESSAGE_CHUNK_CHARS = 3000
 
+# 流式输出默认值(设计见 docs/STREAMING_DESIGN.md §6)
+DEFAULT_STREAM_ENABLED = False
+DEFAULT_CLI_STREAM = True
+DEFAULT_STREAM_PREAMBLE_GRACE_MS = 1500
+DEFAULT_STREAM_PREAMBLE_GRACE_CHARS = 40
+DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE = True
+
 # 键别名映射
 _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "model": ("model", "model_name"),
@@ -97,6 +104,11 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "qq_token": ("qq_token", "napcat_token"),
     "qq_action_timeout": ("qq_action_timeout", "qq_api_timeout"),
     "qq_message_chunk_chars": ("qq_message_chunk_chars", "qq_max_message_chars"),
+    "stream_enabled": ("stream_enabled",),
+    "cli_stream": ("cli_stream",),
+    "stream_preamble_grace_ms": ("stream_preamble_grace_ms",),
+    "stream_preamble_grace_chars": ("stream_preamble_grace_chars",),
+    "stream_suppress_tool_preamble": ("stream_suppress_tool_preamble",),
 }
 
 # 已废弃配置键: 人设已固定为 <项目根>/identity.md, 出现时警告并忽略
@@ -219,6 +231,21 @@ def _resolve_tokenizer(value: Optional[str]) -> str:
     return DEFAULT_TOKENIZER
 
 
+def _resolve_non_negative_int(value: Optional[str], default: int, name: str) -> int:
+    """解析非负整数(流式宽限等, 0 合法); 非法值回退默认并告警."""
+    if value is None:
+        return default
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("%s 不是整数(%r), 回退默认值 %d", name, value, default)
+        return default
+    if num < 0:
+        logger.warning("%s 不能为负数(%r), 回退默认值 %d", name, value, default)
+        return default
+    return num
+
+
 def _resolve_ws_mode(value: Optional[str]) -> str:
     """解析 OneBot11 连接方向: reverse(监听)/forward(主动连); 非法值回退默认."""
     if value is None:
@@ -301,6 +328,12 @@ class Settings:
     qq_token: str = DEFAULT_QQ_TOKEN
     qq_action_timeout: float = DEFAULT_QQ_ACTION_TIMEOUT
     qq_message_chunk_chars: int = DEFAULT_QQ_MESSAGE_CHUNK_CHARS
+    # 流式输出(§6)
+    stream_enabled: bool = DEFAULT_STREAM_ENABLED
+    cli_stream: bool = DEFAULT_CLI_STREAM
+    stream_preamble_grace_ms: int = DEFAULT_STREAM_PREAMBLE_GRACE_MS
+    stream_preamble_grace_chars: int = DEFAULT_STREAM_PREAMBLE_GRACE_CHARS
+    stream_suppress_tool_preamble: bool = DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE
     source: str = str(ENV_FILE)
 
     def __repr__(self) -> str:
@@ -326,6 +359,10 @@ class Settings:
             f"qq_ws_path={self.qq_ws_path!r}, qq_token={masked_qq_token}, "
             f"qq_action_timeout={self.qq_action_timeout}, "
             f"qq_message_chunk_chars={self.qq_message_chunk_chars}, "
+            f"stream_enabled={self.stream_enabled}, cli_stream={self.cli_stream}, "
+            f"stream_preamble_grace_ms={self.stream_preamble_grace_ms}, "
+            f"stream_preamble_grace_chars={self.stream_preamble_grace_chars}, "
+            f"stream_suppress_tool_preamble={self.stream_suppress_tool_preamble}, "
             f"api_key={masked_key}, source={self.source!r})"
         )
 
@@ -431,6 +468,31 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["qq_message_chunk_chars"]),
             DEFAULT_QQ_MESSAGE_CHUNK_CHARS,
             "qq_message_chunk_chars",
+        ),
+        stream_enabled=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["stream_enabled"]),
+            DEFAULT_STREAM_ENABLED,
+            "stream_enabled",
+        ),
+        cli_stream=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["cli_stream"]),
+            DEFAULT_CLI_STREAM,
+            "cli_stream",
+        ),
+        stream_preamble_grace_ms=_resolve_non_negative_int(
+            _get(raw, *_KEY_ALIASES["stream_preamble_grace_ms"]),
+            DEFAULT_STREAM_PREAMBLE_GRACE_MS,
+            "stream_preamble_grace_ms",
+        ),
+        stream_preamble_grace_chars=_resolve_non_negative_int(
+            _get(raw, *_KEY_ALIASES["stream_preamble_grace_chars"]),
+            DEFAULT_STREAM_PREAMBLE_GRACE_CHARS,
+            "stream_preamble_grace_chars",
+        ),
+        stream_suppress_tool_preamble=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["stream_suppress_tool_preamble"]),
+            DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE,
+            "stream_suppress_tool_preamble",
         ),
         source=str(path),
     )

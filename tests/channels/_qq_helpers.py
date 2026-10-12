@@ -52,7 +52,9 @@ class PolicyStack:
     policy: QqPolicy
 
 
-def build_conversation(memory_dir: Path, provider: LLMProvider) -> ConversationService:
+def build_conversation(
+    memory_dir: Path, provider: LLMProvider, **loop_kwargs
+) -> ConversationService:
     registry = MagicMock(spec=ToolRegistry)
     registry.get_definitions.return_value = []
     registry.list_tools.return_value = []
@@ -64,7 +66,8 @@ def build_conversation(memory_dir: Path, provider: LLMProvider) -> ConversationS
     )
 
     def agent_factory(session_key: SessionKey) -> AgentLoop:
-        return AgentLoop(provider=provider, tools=registry, context=context)
+        # loop_kwargs 透传(如流式前导抑制宽限), 默认不传时行为与旧版一致
+        return AgentLoop(provider=provider, tools=registry, context=context, **loop_kwargs)
 
     return ConversationService(JsonlSessionStore(memory_dir), agent_factory)
 

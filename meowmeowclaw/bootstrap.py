@@ -100,6 +100,7 @@ def build_gateway(application: Application) -> Optional[Gateway]:
         bus_maxsize=application.config.gateway_bus_maxsize,
         publish_timeout=application.config.gateway_publish_timeout,
         shutdown_timeout=application.config.gateway_shutdown_timeout,
+        stream_enabled=application.config.stream_enabled,
     )
 
 
@@ -182,6 +183,10 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
             model=config.model,
             max_iterations=config.max_iterations,
             compressor=compressor,
+            # 流式前导抑制参数(生产路径由 .env 注入, 见 docs/STREAMING_DESIGN.md §4.3)
+            stream_preamble_grace_ms=config.stream_preamble_grace_ms,
+            stream_preamble_grace_chars=config.stream_preamble_grace_chars,
+            suppress_tool_preamble=config.stream_suppress_tool_preamble,
         )
 
     session_store = JsonlSessionStore(config.memory_dir)

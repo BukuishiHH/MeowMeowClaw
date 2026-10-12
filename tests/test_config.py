@@ -37,6 +37,11 @@ from meowmeowclaw.config import (
     DEFAULT_QQ_WS_MODE,
     DEFAULT_QQ_WS_PATH,
     DEFAULT_QQ_WS_PORT,
+    DEFAULT_STREAM_ENABLED,
+    DEFAULT_STREAM_PREAMBLE_GRACE_CHARS,
+    DEFAULT_STREAM_PREAMBLE_GRACE_MS,
+    DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE,
+    DEFAULT_CLI_STREAM,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_TIMEOUT,
     DEFAULT_TOKEN_BUDGET,
@@ -110,6 +115,11 @@ ENV_KEYS = (
     "QQ_API_TIMEOUT",
     "QQ_MESSAGE_CHUNK_CHARS",
     "QQ_MAX_MESSAGE_CHARS",
+    "STREAM_ENABLED",
+    "CLI_STREAM",
+    "STREAM_PREAMBLE_GRACE_MS",
+    "STREAM_PREAMBLE_GRACE_CHARS",
+    "STREAM_SUPPRESS_TOOL_PREAMBLE",
 )
 
 
@@ -770,6 +780,59 @@ class TestQqSettings:
 
         assert "meowclaw-3100" not in text
         assert "qq_token=***" in text
+
+
+# ------------------------------------------------------------ 流式配置(S3)
+
+
+class TestStreamSettings:
+    def test_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.stream_enabled is DEFAULT_STREAM_ENABLED
+        assert s.cli_stream is DEFAULT_CLI_STREAM
+        assert s.stream_preamble_grace_ms == DEFAULT_STREAM_PREAMBLE_GRACE_MS
+        assert s.stream_preamble_grace_chars == DEFAULT_STREAM_PREAMBLE_GRACE_CHARS
+        assert s.stream_suppress_tool_preamble is DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE
+
+    def test_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "stream_enabled=true\n"
+            "cli_stream=false\n"
+            "stream_preamble_grace_ms=0\n"
+            "stream_preamble_grace_chars=7\n"
+            "stream_suppress_tool_preamble=false\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.stream_enabled is True
+        assert s.cli_stream is False
+        assert s.stream_preamble_grace_ms == 0  # 0 合法(立即放行)
+        assert s.stream_preamble_grace_chars == 7
+        assert s.stream_suppress_tool_preamble is False
+
+    def test_invalid_bool_falls_back(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, "stream_enabled=maybe\n"))
+
+        assert s.stream_enabled is DEFAULT_STREAM_ENABLED
+        assert any("stream_enabled" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize("raw", ["-1", "abc"])
+    def test_invalid_grace_falls_back(self, tmp_path, caplog, raw):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, f"stream_preamble_grace_chars={raw}\n"))
+
+        assert s.stream_preamble_grace_chars == DEFAULT_STREAM_PREAMBLE_GRACE_CHARS
+        assert any("stream_preamble_grace_chars" in record.message for record in caplog.records)
+
+    def test_repr_contains_stream_flags(self):
+        text = repr(Settings(stream_enabled=True, cli_stream=False))
+
+        assert "stream_enabled=True" in text
+        assert "cli_stream=False" in text
 
 
 # ------------------------------------------------- 模块级副作用护栏

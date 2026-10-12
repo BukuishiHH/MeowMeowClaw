@@ -53,6 +53,8 @@ def _print_startup_info(config: Settings, session: SessionKey) -> None:
     print(f"  记忆目录  : {config.memory_dir}")
     print(f"  人设文件  : {IDENTITY_FILE}")
     print(f"  最大迭代  : {config.max_iterations}")
+    stream_state = "开(逐字输出)" if config.stream_enabled and config.cli_stream else "关"
+    print(f"  流式输出  : {stream_state}")
     print(f"  会话      : {session.canonical}")
     print(f"  会话短ID  : {session_short_id(session)}")
     print(f"  配置文件  : {config.source}")
@@ -318,7 +320,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     _print_tools(app.registry)
 
     if app.gateway is not None and policy is not None:
-        adapter = CliAdapter()
+        # 流式需同时满足: 全局开关 + CLI 开关(见 docs/STREAMING_DESIGN.md §4.8)
+        adapter = CliAdapter(stream=app.config.stream_enabled and app.config.cli_stream)
         try:
             asyncio.run(_run_gateway_repl(app, policy, adapter))
         except KeyboardInterrupt:  # 输入/回答过程中 Ctrl+C: 不打印堆栈

@@ -20,6 +20,7 @@ from typing import Optional, Union
 
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.llm.base import LLMProvider
+from meowmeowclaw.tools.mutation import ReadVersionTracker
 from meowmeowclaw.tools.registry import ToolRegistry
 
 from .models import (
@@ -76,6 +77,7 @@ class SubagentFactory:
         max_total_per_turn: int = 6,
         tool_names: tuple[str, ...] = DEFAULT_CHILD_TOOL_NAMES,
         read_only: bool = True,
+        allow_exec: bool = False,
         stats: Optional[SubagentStats] = None,
     ) -> None:
         if max_depth < 2:
@@ -103,6 +105,7 @@ class SubagentFactory:
         self.max_children_per_turn = int(max_children_per_turn)
         self.max_total_per_turn = int(max_total_per_turn)
         self.read_only = bool(read_only)
+        self.allow_exec = bool(allow_exec)
         self.stats = stats if stats is not None else SubagentStats(enabled=self.enabled)
         self._scheduler = asyncio.Lock()
 
@@ -113,9 +116,13 @@ class SubagentFactory:
             names = tuple(name for name in names if name in allowed)
             if dropped:
                 logger.warning(
-                    "SA2 子代理暂不支持写/执行工具, 已忽略: %s (SA3/SA4 完成护栏后放开)",
+                    "子代理当前为只读模式, 已忽略写/执行工具: %s",
                     ", ".join(dropped),
                 )
+        elif not self.allow_exec and "exec" in names:
+            # SA3: write_file 已开放; exec 仍待 SA4 安全策略
+            names = tuple(name for name in names if name != "exec")
+            logger.warning("SA3 暂未开放子代理 exec, 已忽略 (SA4 完成安全策略后放开)")
         # 未注册的工具在 base_registry 中不存在, 启动时一次性过滤(避免每次 spawn 重复 warning)
         available = set(base_registry.list_tools())
         missing = [name for name in names if name not in available]
@@ -251,6 +258,19 @@ class SubagentFactory:
         finally:
             _SCHEDULER_HELD.reset(token)
 
+    def _build_child_registry(self, tracker: ReadVersionTracker) -> ToolRegistry:
+        """构造子代理工具集: read/write 克隆为带私有 tracker 的副本, 其他工具复用."""
+        registry = ToolRegistry()
+        for name in self.tool_names:
+            tool = self.base_registry.get(name)
+            if tool is None:
+                continue
+            clone_for_subagent = getattr(tool, "for_subagent", None)
+            if callable(clone_for_subagent):
+                tool = clone_for_subagent(version_tracker=tracker)
+            registry.register(tool)
+        return registry
+
     async def _run_child(
         self,
         request: SubagentRequest,
@@ -259,7 +279,8 @@ class SubagentFactory:
         subagent_id: str,
         started: float,
     ) -> SubagentResult:
-        child_registry = self.base_registry.subset(self.tool_names)
+        tracker = ReadVersionTracker()
+        child_registry = self._build_child_registry(tracker)
         if child_depth + 1 < self.max_depth:
             # 子代理自己还可以再创建一层: 给它配置与 root 共享的 budget/parent
             child_registry.register(

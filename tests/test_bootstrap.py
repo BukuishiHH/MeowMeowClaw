@@ -220,6 +220,8 @@ class TestBuildApplication:
             item for item in definitions if item["function"]["name"] == "spawn_subagent"
         )
         assert set(spawn["function"]["parameters"]["required"]) == {"task"}
+        # SA3: 主代理 write_file 也接入同一把工作区变更锁
+        assert app.registry.get("write_file")._mutation_guard is not None  # noqa: SLF001
 
     def test_load_config_is_called_once(self, monkeypatch):
         loader = MagicMock(return_value=make_settings())

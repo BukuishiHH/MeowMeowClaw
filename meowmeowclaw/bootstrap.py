@@ -10,7 +10,7 @@
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from meowmeowclaw.agent.audit import HistoryAuditLog
 from meowmeowclaw.agent.compression import ContextCompressor
@@ -55,10 +55,13 @@ class Application:
         await self.session_store.close()
 
 
-def build_registry(config: Settings) -> ToolRegistry:
+def build_registry(
+    config: Settings, *, mutation_guard: Optional[Any] = None
+) -> ToolRegistry:
     """集中注册清单: 唯一知道"有哪些具体工具"的地方.
 
     具体工具只在函数内 import, 因此 ``import meowmeowclaw.bootstrap`` 不会拉起全部工具实现。
+    ``mutation_guard`` 仅在 SA3 子代理开启时注入 WriteFileTool。
     """
     from meowmeowclaw.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool
     from meowmeowclaw.tools.shell import ExecTool
@@ -67,7 +70,13 @@ def build_registry(config: Settings) -> ToolRegistry:
 
     registry = ToolRegistry()
     registry.register(ReadFileTool(config.workspace, config.memory_dir))
-    registry.register(WriteFileTool(config.workspace, config.memory_dir))
+    registry.register(
+        WriteFileTool(
+            config.workspace,
+            config.memory_dir,
+            mutation_guard=mutation_guard,
+        )
+    )
     registry.register(ListDirTool(config.workspace, config.memory_dir))
     registry.register(ExecTool(config.workspace))
     registry.register(WebSearchTool())
@@ -124,7 +133,19 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         base_url=config.base_url,
         model=config.model,
     )
-    registry = build_registry(config)
+
+    # SA3: 子代理开启且未关闭锁时, 为主/子代理的 write 注入同一个 workspace 变更锁;
+    # 关闭子代理时 mutation_guard=None, 主代理行为与旧版逐字节一致。
+    mutation_guard: Optional[Any] = None
+    if config.subagent_enabled and config.workspace_mutation_lock_enabled:
+        from meowmeowclaw.tools.mutation import WorkspaceMutationGuard
+
+        mutation_guard = WorkspaceMutationGuard(
+            config.memory_dir / "subagents" / "workspace.lock",
+            timeout=config.workspace_mutation_lock_timeout,
+        )
+
+    registry = build_registry(config, mutation_guard=mutation_guard)
     catalog = SkillCatalog()
 
     skills_summary = catalog.summary()
@@ -142,8 +163,8 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         memory_path=config.memory_dir / "MEMORY.md",
     )
 
-    # 子代理(SA2): 默认关闭; 开启时构造 factory 并把 depth0 spawn 工具注册给主代理。
-    # SA2 临时只读: write_file/exec 由 SubagentFactory(read_only=True) 过滤, SA3/SA4 完成护栏后放开。
+    # 子代理(SA2/SA3): 默认关闭; 开启时构造 factory 并把 depth0 spawn 工具注册给主代理。
+    # SA3 开放 write_file(带独立 tracker/OCC); exec 仍由 factory 过滤, 留待 SA4。
     if config.subagent_enabled:
         from meowmeowclaw.subagent.factory import SubagentFactory
         from meowmeowclaw.subagent.models import SubagentStats
@@ -161,11 +182,12 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
             max_children_per_turn=config.subagent_max_children_per_turn,
             max_total_per_turn=config.subagent_max_total_per_turn,
             tool_names=config.subagent_tools,
-            read_only=True,
+            read_only=False,
+            allow_exec=False,
             stats=SubagentStats(enabled=True),
         )
         registry.register(subagent_factory.make_root_tool())
-        logger.info("子代理已装配: %r (SA2 只读模式)", subagent_factory)
+        logger.info("子代理已装配: %r (SA3: write OCC, exec 待 SA4)", subagent_factory)
 
     # token 计数器无状态, 全局构造一次即可(精确档 lazy 加载, 失败自动回退启发式);
     # 关闭压缩时不构造, 避免无谓的可选依赖探测

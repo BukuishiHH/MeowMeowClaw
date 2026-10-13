@@ -38,6 +38,8 @@ from meowmeowclaw.subagent import (
     SubagentRequest,
 )
 from meowmeowclaw.tools.base import BaseTool
+from meowmeowclaw.tools.filesystem import ReadFileTool, WriteFileTool
+from meowmeowclaw.tools.mutation import ReadVersionTracker, WorkspaceMutationGuard
 from meowmeowclaw.tools.registry import ToolRegistry
 
 
@@ -169,6 +171,51 @@ class TestSpawnOkAndIsolation:
         assert result.depth == 2
         assert tool_names(provider.calls[0]) == ["read_file"]
 
+    @pytest.mark.asyncio
+    async def test_sa3_write_enabled_but_exec_still_filtered(self):
+        provider = CapturingProvider()
+        factory = make_factory(
+            provider,
+            base_registry_with("read_file", "write_file", "exec"),
+            tool_names=("read_file", "write_file", "exec"),
+            read_only=False,
+            allow_exec=False,
+        )
+        ctx = SpawnContext(root_id="root", parent_id="root", depth=0, budget=SubagentBudget())
+
+        result = await factory.spawn(SubagentRequest(task="写入测试"), ctx)
+
+        assert result.status == STATUS_OK
+        names = tool_names(provider.calls[0])
+        assert "read_file" in names
+        assert "write_file" in names
+        assert "exec" not in names
+
+    def test_child_write_tool_gets_independent_tracker_and_shared_guard(self, tmp_path):
+        workspace = tmp_path / "ws"
+        guard = WorkspaceMutationGuard(tmp_path / "workspace.lock")
+        base = ToolRegistry()
+        base.register(ReadFileTool(workspace, workspace / "memory"))
+        base.register(
+            WriteFileTool(workspace, workspace / "memory", mutation_guard=guard)
+        )
+        factory = SubagentFactory(
+            provider=CapturingProvider(),
+            base_registry=base,
+            workspace=workspace,
+            read_only=False,
+            tool_names=("read_file", "write_file"),
+        )
+        tracker = ReadVersionTracker()
+
+        child = factory._build_child_registry(tracker)  # noqa: SLF001 - 验证克隆语义
+
+        child_write = child.get("write_file")
+        parent_write = base.get("write_file")
+        assert child_write is not parent_write
+        assert child_write._version_tracker is tracker  # noqa: SLF001
+        assert child_write._mutation_guard is guard  # noqa: SLF001
+
 
 class TestDepthBudgetFailSoft:
     @pytest.mark.asyncio
@@ -266,6 +313,55 @@ class TestDepthBudgetFailSoft:
         assert result.status == STATUS_ERROR
         assert result.error_code == ERROR_ENABLED
         assert provider.calls == []
+
+
+class TestChildWriteExecution:
+    @pytest.mark.asyncio
+    async def test_child_write_file_executes_through_clone_and_tracker(self, tmp_path):
+        class WriteProvider(CapturingProvider):
+            async def chat(self, messages, tools=None, model=None, max_tokens=None):
+                self.calls.append(
+                    {
+                        "messages": [dict(message) for message in messages],
+                        "tools": list(tools or []),
+                        "model": model,
+                    }
+                )
+                if len(self.calls) == 1:
+                    assert "write_file" in [item["function"]["name"] for item in tools or []]
+                    return LLMResponse(
+                        content="",
+                        tool_calls=[
+                            ToolCallRequest(
+                                id="call_write",
+                                name="write_file",
+                                arguments={"file_path": "a.txt", "content": "hello"},
+                            )
+                        ],
+                        finish_reason=FINISH_REASON_TOOL_CALLS,
+                    )
+                return LLMResponse(content="写完了", finish_reason=FINISH_REASON_STOP)
+
+        workspace = tmp_path / "ws"
+        memory = workspace / "memory"
+        guard = WorkspaceMutationGuard(tmp_path / "workspace.lock", timeout=2.0)
+        base = ToolRegistry()
+        base.register(ReadFileTool(workspace, memory))
+        base.register(WriteFileTool(workspace, memory, mutation_guard=guard))
+        factory = SubagentFactory(
+            provider=WriteProvider(),
+            base_registry=base,
+            workspace=workspace,
+            read_only=False,
+            allow_exec=False,
+            tool_names=("read_file", "write_file"),
+        )
+        ctx = SpawnContext(root_id="root", parent_id="root", depth=0, budget=SubagentBudget())
+
+        result = await factory.spawn(SubagentRequest(task="写 a.txt"), ctx)
+
+        assert result.status == STATUS_OK
+        assert (workspace / "a.txt").read_text(encoding="utf-8") == "hello"
 
 
 class TestRootAgentLoopIntegration:

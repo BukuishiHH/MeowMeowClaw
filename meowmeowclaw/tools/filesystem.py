@@ -2,9 +2,11 @@
 
 防护分两层:
 - 工作区路径校验: 先归一化绝对路径, 再用 ``os.path.commonpath`` 判定 (见 ``resolve_in_workspace``);
-- 记忆目录策略(D27): ``<memory_dir>/sessions|active|archive`` 对三件套全禁;
+- 记忆目录策略(D27): ``<memory_dir>/sessions|active|archive|subagents`` 对三件套全禁;
   ``memory/MEMORY.md`` 可读可写, 且 ``write_file`` 覆盖前会把上一版滚动备份为
-  ``MEMORY.md.bak``(D32), 避免模型一次覆盖清空长期记忆。
+  ``MEMORY.md.bak``(D32), 避免模型一次覆盖清空长期记忆;
+- SA3 竞态护栏: 可选 ``WorkspaceMutationGuard``(write 全局变更锁) +
+  可选 ``ReadVersionTracker``(子代理读后写 sha256 OCC) + 原子替换。
 """
 
 import os
@@ -12,10 +14,16 @@ import shutil
 from typing import Any, Optional, Union
 
 from .base import BaseTool
+from .mutation import (
+    MutationLockError,
+    ReadVersionTracker,
+    WorkspaceMutationGuard,
+    atomic_write_text,
+)
 
 MEMORY_FILE_NAME = "MEMORY.md"
 MEMORY_BACKUP_NAME = "MEMORY.md.bak"
-RUNTIME_MEMORY_DIRS = ("sessions", "active", "archive")
+RUNTIME_MEMORY_DIRS = ("sessions", "active", "archive", "subagents")
 # 审计日志等运行时文件: 与运行时目录一样对文件工具全禁, 防模型篡改/读取
 RUNTIME_MEMORY_FILE_NAMES = ("HISTORY.md", "HISTORY.md.1", "HISTORY.md.lock")
 
@@ -137,6 +145,25 @@ class ReadFileTool(_MemoryAwareTool):
         memory_dir: 记忆目录(默认 ``<workspace>/memory``); 其运行时子目录禁止读取
     """
 
+    def __init__(
+        self,
+        workspace: Union[str, os.PathLike],
+        memory_dir: Optional[Union[str, os.PathLike]] = None,
+        *,
+        version_tracker: Optional[ReadVersionTracker] = None,
+    ) -> None:
+        super().__init__(workspace, memory_dir)
+        # 子代理实例携带私有 tracker; 主代理默认 None(行为与旧版一致)
+        self._version_tracker = version_tracker
+
+    def for_subagent(self, *, version_tracker: ReadVersionTracker) -> "ReadFileTool":
+        """构造子代理专用副本(共享 workspace/memory_dir, 携带独立读版本表)."""
+        return ReadFileTool(
+            self.workspace,
+            self.memory_dir,
+            version_tracker=version_tracker,
+        )
+
     @property
     def name(self) -> str:
         return "read_file"
@@ -174,11 +201,16 @@ class ReadFileTool(_MemoryAwareTool):
         try:
             with open(absolute_path, "r", encoding="utf-8") as f:
                 content = f.read()
+            if self._version_tracker is not None:
+                # 记录完整内容指纹(截断只影响返回给模型的内容, 不影响 OCC)
+                self._version_tracker.record_read(absolute_path, content)
             max_len = 16000
             if len(content) > max_len:
                 content = content[:max_len] + "\n\n==== 内容已截断, 超过16000字符 ===="
             return content
         except FileNotFoundError:
+            if self._version_tracker is not None:
+                self._version_tracker.record_absent(absolute_path)
             return f"[错误] 文件不存在: {absolute_path}"
         except IsADirectoryError:
             return f"[错误]给定路径是目录, 不是文件: {absolute_path}"
@@ -195,7 +227,30 @@ class WriteFileTool(_MemoryAwareTool):
     Args:
         workspace: 工作区根目录, 所有文件均限制于该目录下
         memory_dir: 记忆目录(默认 ``<workspace>/memory``)
+        mutation_guard: 可选工作区变更锁(SA3); None 时保持旧写入语义
+        version_tracker: 可选子代理私有读后写版本表; None 时不做 OCC(主代理)
     """
+
+    def __init__(
+        self,
+        workspace: Union[str, os.PathLike],
+        memory_dir: Optional[Union[str, os.PathLike]] = None,
+        *,
+        mutation_guard: Optional[WorkspaceMutationGuard] = None,
+        version_tracker: Optional[ReadVersionTracker] = None,
+    ) -> None:
+        super().__init__(workspace, memory_dir)
+        self._mutation_guard = mutation_guard
+        self._version_tracker = version_tracker
+
+    def for_subagent(self, *, version_tracker: ReadVersionTracker) -> "WriteFileTool":
+        """构造子代理专用副本: 共享变更锁, 携带独立读版本表(SA3)."""
+        return WriteFileTool(
+            self.workspace,
+            self.memory_dir,
+            mutation_guard=self._mutation_guard,
+            version_tracker=version_tracker,
+        )
 
     @property
     def name(self) -> str:
@@ -236,14 +291,42 @@ class WriteFileTool(_MemoryAwareTool):
         if self._denied(absolute_path):
             return f"[安全拦截] 禁止写入记忆运行时目录, 请求路径: {file_rel_path}"
 
+        if self._mutation_guard is not None:
+            try:
+                async with self._mutation_guard.mutate(
+                    reason="write_file", tool=self.name
+                ):
+                    return self._write_file(absolute_path, content, file_rel_path)
+            except MutationLockError as exc:
+                return f"[变更锁超时] {exc}"
+        return self._write_file(absolute_path, content, file_rel_path)
+
+    def _write_file(self, absolute_path: str, content: Any, file_rel_path: Any) -> str:
+        """实际写入; 必须已在变更锁内(若配置了 guard)."""
+        if os.path.isdir(absolute_path):
+            return f"[错误] 目标路径是目录, 不能作为文件: {absolute_path}"
+
         try:
+            conflict = self._occ_conflict(absolute_path)
+            if conflict is not None:
+                return conflict
+
             if self._is_memory_file(absolute_path):
                 # 备份失败则不写入, 避免无保护地清空长期记忆
                 backup_existing_memory(absolute_path)
-            parent_dir = os.path.dirname(absolute_path)
-            os.makedirs(parent_dir, exist_ok=True)
-            with open(absolute_path, "w", encoding="utf-8") as f:
-                f.write(content)
+
+            if self._mutation_guard is not None:
+                # SA3: 同目录临时文件 + fsync + os.replace, 崩溃/取消不留半截文件
+                atomic_write_text(absolute_path, content)
+            else:
+                parent_dir = os.path.dirname(absolute_path)
+                os.makedirs(parent_dir, exist_ok=True)
+                with open(absolute_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+            if self._version_tracker is not None:
+                self._version_tracker.record_read(absolute_path, str(content))
+
             if self._is_memory_file(absolute_path):
                 return f"[成功] 长期记忆已写入(上一版备份为 {MEMORY_BACKUP_NAME}): {file_rel_path}"
             return f"[成功] 文件已写入: {file_rel_path}"
@@ -251,6 +334,42 @@ class WriteFileTool(_MemoryAwareTool):
             return f"[错误] 目标路径是目录, 不能作为文件: {absolute_path}"
         except Exception as e:
             return f"[写入文件异常] {repr(e)}"
+
+    def _occ_conflict(self, absolute_path: str) -> Optional[str]:
+        """子代理读后写校验; 主代理(tracker=None)直接返回 None."""
+        tracker = self._version_tracker
+        if tracker is None:
+            return None
+
+        if not os.path.exists(absolute_path):
+            if not tracker.is_tracked(absolute_path):
+                return None  # 未读且不存在: 允许新建
+            expected = tracker.expected(absolute_path)
+            if expected is not None:
+                return (
+                    "[并发冲突] 目标文件已不存在或已被替换, "
+                    "请重新 read_file 确认后再写."
+                )
+            return None  # 读时不存在, 现在仍不存在: 允许新建
+
+        if not tracker.is_tracked(absolute_path):
+            return (
+                "[写入冲突] 目标文件已存在且未读取过, "
+                "请先 read_file 确认当前内容再覆盖."
+            )
+        try:
+            with open(absolute_path, "rb") as f:
+                actual = ReadVersionTracker.digest_bytes(f.read())
+        except OSError as exc:
+            return f"[写入文件异常] {repr(exc)}"
+
+        expected = tracker.expected(absolute_path)
+        if expected != actual:
+            return (
+                "[并发冲突] 文件已被其他会话或进程修改, "
+                "请重新 read_file 合并后再写."
+            )
+        return None
 
 
 class ListDirTool(_MemoryAwareTool):

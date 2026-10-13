@@ -1,6 +1,6 @@
 # MeowMeowClaw 子代理协同设计（SpawnSubagentTool / v1）
 
-> 状态：**设计已评审；SA1–SA2 已实现（2026-10-13）**，SA3–SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
+> 状态：**设计已评审；SA1–SA3 已实现（2026-10-13）**，SA4–SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
 > 竞态/安全方案、配置、测试与里程碑，**不改 JSONL 文件格式、不改主代理既有语义**；
 > 实现按 §11 里程碑推进，每阶段独立提交，默认 `subagent_enabled=false`。
 > 关联：`docs/A_PLUS_OPTIMIZATION.md`（运行时生命周期）、`docs/GATEWAY_DESIGN.md`、
@@ -1152,7 +1152,7 @@ meowmeowclaw/
 |---|---|---|---|
 | SA1 | 已完成 | `3ed6b98` | 领域模型 + 全部配置键；新增 54 用例；默认关闭零行为变化 |
 | SA2 | 已完成 | `86e0a07` | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
-| SA3 | 待实现 | — | 依赖 SA1；变更锁/OCC/原子写 |
+| SA3 | 已完成 | 待回填 | 变更锁/OCC/原子写；主+子 write 接锁；新增 19 用例；exec 仍待 SA4 |
 | SA4 | 待实现 | — | 依赖 SA2+SA3；exec 安全与审计 |
 | SA5 | 待实现 | — | 依赖 SA2+SA3+SA4；预算/统计/装配 |
 | SA6 | 待实现 | — | 依赖 SA5；全量验收、冒烟与收尾 |
@@ -1199,6 +1199,28 @@ meowmeowclaw/
 - 嵌套 spawn 在可重入调度器下通过，未自我死锁；
 - 全量回归 **1631 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
 - 本阶段不做：变更锁/OCC/原子写、exec 环境与命令策略、审计（SA3/SA4）。
+
+#### SA3 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/tools/mutation.py`（新增） | `WorkspaceMutationGuard`（进程内 asyncio.Lock + 跨进程 FileLock，超时 → `MutationLockError`）；`ReadVersionTracker`（sha256 读后写版本表）；`atomic_write_text`（临时文件 + fsync + `os.replace` + 失败清理） |
+| `meowmeowclaw/tools/filesystem.py` | `ReadFileTool`/`WriteFileTool` 支持可选 tracker/guard；子代理副本 clone 共享 guard、持有独立 tracker；子代理覆盖已存在文件必须“先读后写”，sha256 不一致返回并发冲突；原子替换仅在配置 guard 时启用；运行时目录拒绝名单加入 `subagents/` |
+| `meowmeowclaw/tools/registry.py` | 新增 `get(name)` 供子代理克隆原工具 |
+| `meowmeowclaw/subagent/factory.py` | SA3 开放 `write_file`（`read_only=False`），仍过滤 `exec`；每个子代理生成独立 `ReadVersionTracker`，read/write 克隆为带 tracker 的副本，其他工具复用 |
+| `meowmeowclaw/bootstrap.py` | `subagent_enabled=true` 且 `workspace_mutation_lock_enabled=true` 时创建 workspace 变更锁并注入主/子 `write_file`；关闭子代理时 `mutation_guard=None`，主代理行为不变 |
+| `tests/tools/test_mutation.py` / `test_filesystem_mutation.py` / `tests/subagent/test_subagent_factory.py` | 新增 19 个用例：锁互斥/超时、tracker、原子写成功/失败、主代理旧语义、未读拒绝、stale 冲突、read absent、自有写入更新 tracker、子代理 write 开放但 exec 仍过滤、clone 语义、子代理 write 端到端 |
+
+**验证**
+
+- 变更锁覆盖主代理与子代理的 `write_file`；读工具与 LLM 调用不经过锁；
+- 子代理 OCC：未读拒绝、read v1 → 外部改 v2 → 写入拒绝并保留 v2、read absent 后外部创建拒绝、自己的连续写入可继续；
+- 原子写成功/失败路径均不留下 `.meow-*.tmp`，失败时目标文件保持旧内容；
+- `exec` 仍被 SA3 factory 过滤（warning），留待 SA4 安全策略；
+- 全量回归 **1650 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 本阶段不做：exec 环境清洗/命令策略/取消杀进程组、敏感路径、审计（SA4）。
 
 
 ---
@@ -1278,5 +1300,5 @@ workspace_mutation_lock_timeout=90
 
 ---
 
-> 本文是 v1 实现依据；SA1–SA2 已实现，SA3–SA6 按 §11 里程碑逐阶段推进，每阶段完成后更新“实现记录”并提交。
+> 本文是 v1 实现依据；SA1–SA3 已实现，SA4–SA6 按 §11 里程碑逐阶段推进，每阶段完成后更新“实现记录”并提交。
 

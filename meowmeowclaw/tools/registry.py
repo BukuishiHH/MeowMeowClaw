@@ -59,6 +59,10 @@ class ToolRegistry:
         """返回所有已注册工具名称列表"""
         return list(self._tools.keys())
 
+    def get(self, name: str) -> BaseTool | None:
+        """按名字取工具实例; 不存在返回 None."""
+        return self._tools.get(name)
+
     def subset(self, names: Iterable[str]) -> "ToolRegistry":
         """构造只包含指定工具的新注册表(SA2 子代理工具集).
 

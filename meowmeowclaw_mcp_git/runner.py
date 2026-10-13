@@ -4,8 +4,10 @@
   ``git --no-pager -C <repo_path> <subcommand> [args...]``;
 - 统一环境清洗: 防分页/防弹编辑器/防凭证卡死/固定 ``LC_ALL=C``;
 - 硬超时: 超时后杀进程组(POSIX ``killpg`` / Windows ``taskkill`` 兜底);
-- 输出上限: 边读边计数, 只保留前 ``max_output_bytes`` 字节; 超限立即终止进程组
+- 输出上限: 边读边计数, 只保留前 ``max_output_bytes`` 字节; 默认超限立即终止进程组
   并标记 ``truncated``(GM2 起, 避免大 diff/log 撑爆内存, T7);
+- ``kill_on_limit=False``: 继续读完并丢弃超限部分(如 ``git fetch`` 这类有副作用的命令
+  不能被半途杀死), 输出仍标记 ``truncated``;
 - 非零退出**默认不抛异常**, 由工具层决定映射为哪个错误码(``check=True`` 可切换)。
 
 本模块不 import MCP SDK, 可独立单测。
@@ -180,8 +182,12 @@ class GitRunner:
         timeout: Optional[float] = None,
         max_output_bytes: Optional[int] = None,
         check: bool = False,
+        kill_on_limit: bool = True,
     ) -> GitResult:
-        """执行一次 git 命令并返回 :class:`GitResult`."""
+        """执行一次 git 命令并返回 :class:`GitResult`.
+
+        ``kill_on_limit=False`` 用于 fetch 等有副作用的命令: 超限只截断输出, 不终止进程。
+        """
         effective_timeout = self.timeout_seconds if timeout is None else float(timeout)
         if effective_timeout <= 0:
             raise InvalidArgumentError("timeout 必须 > 0")
@@ -201,8 +207,8 @@ class GitRunner:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,  # type: ignore[attr-defined]
         )
         # 边读边截断: 每个流最多保留 cap 字节, 超限即杀进程组(不把大输出读进内存)
-        stdout_reader = _BoundedReader(process.stdout, cap, process=process)
-        stderr_reader = _BoundedReader(process.stderr, cap, process=process)
+        stdout_reader = _BoundedReader(process.stdout, cap, process=process, kill_on_limit=kill_on_limit)
+        stderr_reader = _BoundedReader(process.stderr, cap, process=process, kill_on_limit=kill_on_limit)
         stdout_reader.start()
         stderr_reader.start()
         timed_out = False
@@ -267,11 +273,19 @@ class _BoundedReader(threading.Thread):
     - ``total`` 记录完整字节数(用于 meta/诊断), ``data`` 只保留前 cap 字节。
     """
 
-    def __init__(self, stream: Any, cap: int, *, process: subprocess.Popen[bytes]) -> None:
+    def __init__(
+        self,
+        stream: Any,
+        cap: int,
+        *,
+        process: subprocess.Popen[bytes],
+        kill_on_limit: bool = True,
+    ) -> None:
         super().__init__(daemon=True)
         self._stream = stream
         self._cap = cap
         self._process = process
+        self._kill_on_limit = kill_on_limit
         self.data: bytes = b""
         self.total: int = 0
         self.limit_hit: bool = False
@@ -292,7 +306,7 @@ class _BoundedReader(threading.Thread):
                     kept += take
                 if total > self._cap and not self.limit_hit:
                     self.limit_hit = True
-                    if self._process.poll() is None:
+                    if self._kill_on_limit and self._process.poll() is None:
                         _kill_process_group(self._process)
         except (OSError, ValueError):
             # 进程被杀/管道关闭属预期路径

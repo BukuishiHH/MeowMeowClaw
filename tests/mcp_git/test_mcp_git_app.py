@@ -101,11 +101,12 @@ class TestAppWiring:
         assert app.tool_names() == ("git_commit",)
 
     def test_real_write_tools_registered_when_read_only_false(self, repo: Path):
-        from meowmeowclaw_mcp_git.tools import build_available_tools, build_write_tools
+        from meowmeowclaw_mcp_git.tools import build_read_tools, build_write_tools
 
         app = GitMcpApp(ServerConfig(roots=(str(repo),), read_only=False))
 
-        assert app.tool_names() == tuple(spec.name for spec in build_available_tools())
+        # allow_remote 未开启: 只读 + 写 = 21 个(git_fetch 不注册)
+        assert app.tool_names() == tuple(spec.name for spec in (*build_read_tools(), *build_write_tools()))
         assert len(app.tool_names()) == 21
         assert {spec.name for spec in build_write_tools()} <= set(app.tool_names())
 

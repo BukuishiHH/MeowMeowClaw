@@ -163,3 +163,57 @@ def write_repo(tmp_path: Path, git: Callable[..., Any]) -> Path:
     git(repo, "add", "app.py")
     git(repo, "commit", "-qm", "chore: init")
     return repo
+
+
+@pytest.fixture
+def remote_pair(tmp_path: Path, git: Callable[..., Any]) -> tuple[Path, Path, Path]:
+    """GM4 fetch 测试: ``(work, remote, other)`` 三个仓库.
+
+    - ``remote`` 是 bare 仓库(内含 origin/main);
+    - ``work``/``other`` 都 clone 自 remote, work 的 main 已 push 并设置 upstream;
+    - 在 ``other`` 里提交并 push 即可模拟“远端有新提交”。
+    """
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "init", "--bare", "-q", "-b", "main", str(remote))
+
+    work = tmp_path / "work"
+    git(tmp_path, "clone", "-q", str(remote), str(work))
+    git(work, "config", "user.name", "Worker")
+    git(work, "config", "user.email", "worker@example.com")
+    git(work, "config", "commit.gpgsign", "false")
+    (work / "a.txt").write_text("a\n", encoding="utf-8")
+    git(work, "add", ".")
+    git(work, "commit", "-qm", "chore: init")
+    git(work, "push", "-qu", "origin", "main")
+
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(remote), str(other))
+    git(other, "config", "user.name", "Other")
+    git(other, "config", "user.email", "other@example.com")
+    git(other, "config", "commit.gpgsign", "false")
+    return work, remote, other
+
+
+@pytest.fixture
+def conflict_repo(tmp_path: Path, git: Callable[..., Any]) -> Path:
+    """带真实 merge 冲突的仓库(用于 explain_conflict prompt)."""
+    repo = tmp_path / "conflict-repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "Conflicter")
+    git(repo, "config", "user.email", "conflicter@example.com")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "app.py").write_text("shared\nbase\n", encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "chore: base")
+    git(repo, "checkout", "-qb", "other")
+    (repo / "app.py").write_text("shared\nother side\n", encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "feat: other side")
+    git(repo, "checkout", "-q", "main")
+    (repo / "app.py").write_text("shared\nmain side\n", encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "feat: main side")
+    merged = git(repo, "merge", "other", check=False)
+    assert merged.returncode != 0, "fixture 期望制造 merge 冲突"
+    return repo

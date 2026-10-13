@@ -54,9 +54,16 @@ async def run_git(
     args: Sequence[str],
     *,
     max_output_bytes: Optional[int] = None,
+    kill_on_limit: bool = True,
 ) -> GitResult:
     """在事件循环外执行 git(读命令可能达秒级, 不阻塞 MCP 心跳/取消)."""
-    return await asyncio.to_thread(ctx.runner.run, args, cwd=entry.path, max_output_bytes=max_output_bytes)
+    return await asyncio.to_thread(
+        ctx.runner.run,
+        args,
+        cwd=entry.path,
+        max_output_bytes=max_output_bytes,
+        kill_on_limit=kill_on_limit,
+    )
 
 
 def resolve_entry(ctx: ToolContext, repo: Any) -> RepoEntry:

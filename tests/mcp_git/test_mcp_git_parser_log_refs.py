@@ -13,6 +13,7 @@ from meowmeowclaw_mcp_git.parsers.refs import (
     parse_remotes,
     parse_tags,
     parse_upstream_track,
+    sanitize_text,
     sanitize_url,
 )
 
@@ -204,3 +205,11 @@ class TestSanitizeUrl:
     def test_credentials_in_scp_like_path_left_to_caller(self):
         # scp 形式只有用户名, 不视为 secret
         assert sanitize_url("user@host:path/repo.git") == "user@host:path/repo.git"
+
+    def test_sanitize_text_masks_urls_inside_messages(self):
+        raw = "From https://user:tok3n@example.com/repo.git?token=abc into main"
+
+        masked = sanitize_text(raw)
+
+        assert masked == "From https://***@example.com/repo.git?token=*** into main"
+        assert "tok3n" not in masked

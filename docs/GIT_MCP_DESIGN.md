@@ -1,6 +1,6 @@
 # MeowMeowClaw Git MCP Server 设计（v1）
 
-> 状态：**评审通过，GM1–GM3 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> 状态：**评审通过，GM1–GM4 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
 > Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
 > 按 §10 里程碑（GM1–GM6）逐步实现，每阶段独立提交；实施状态与实现记录见 §14。
 > 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
@@ -109,6 +109,8 @@ meowmeowclaw_mcp_git/      # 顶层独立包(不并入主 Agent; 主项目运行
 ├── config.py              # 启动参数与环境变量(CLI > env > 默认)
 ├── registry.py            # RepoRegistry(alias/允许根/工作树顶层/路径校验)
 ├── runner.py              # GitRunner(参数列表/环境清洗/硬超时/有界流式截断)
+├── prompts.py             # MCP Prompts(提交信息/评审/分支汇总/冲突解释)
+├── resources.py           # MCP Resources(git://<repo>/status|head|log|file)
 ├── policy.py              # PolicyEngine(只读开关/保护分支/dirty/删除保护)
 ├── locks.py               # RepoLockManager(每 repo asyncio.Lock + 可选跨进程锁)
 ├── budget.py              # 文本/列表输出预算(字节/行裁剪 + truncated)
@@ -128,10 +130,11 @@ meowmeowclaw_mcp_git/      # 顶层独立包(不并入主 Agent; 主项目运行
     ├── read.py            # status/diff/log/show/blame/file_at_revision
     ├── refs.py            # list_branches/list_tags/list_remotes/rev_parse/config_get
     ├── search.py          # grep/search_history
-    └── write.py           # stage/unstage/restore/commit/branch_create/branch_switch/branch_delete/stash
+    ├── write.py           # stage/unstage/restore/commit/branch_create/branch_switch/branch_delete/stash
+    └── remote.py          # git_fetch(仅 --allow-remote=true 注册)
 ```
 
-> GM4 新增 `remote.py`/`prompts.py`/`resources.py`、GM6 新增 `audit.py`; 目录按里程碑增量演进。
+> GM6 新增 `audit.py`; 目录按里程碑增量演进。
 
 ### 2.4 与 MeowMeowClaw 主项目的关系
 
@@ -227,11 +230,12 @@ GM1 实现补充：
 | `git_branch_switch` | 切换分支 | `repo`、`name`、`force` | 默认 dirty 拒绝；**GM3 已实现** |
 | `git_branch_delete` | 删除分支 | `repo`、`name`、`force` | 默认拒绝未合并/当前分支；**GM3 已实现** |
 | `git_stash` | stash 管理 | `repo`、`action(list/push/pop/apply/drop)`、`message`、`paths` | drop 需显式确认；**GM3 已实现** |
-| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase；**GM4 待实现** |
+| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase；**GM4 已实现** |
 
 > 写工具默认不注册（`--read-only=true` 时 `tools/list` 只有 13 个只读工具）；
 > `--read-only=false` 后出现上述 8 个写工具，Cline 应保持逐次确认（`autoApprove` 只放只读工具）。
-> 除 `git_stash action=list` 外，写操作都会在仓库锁内执行并返回 `before`/`after` 状态摘要。
+> `git_fetch` 由 `--allow-remote=true` 单独开启（与 read_only 无关），默认不注册。
+> 除 `git_stash action=list` 外，写/fetch 操作都会在仓库锁内执行并返回 `before`/`after` 状态摘要。
 
 #### C. 预留 v2（v1 不实现或默认关闭）
 
@@ -309,6 +313,18 @@ MCP Resources 适合低频、可读、可订阅的资源，但 Git 工作区变�
 
 Resources 仅作为补充；Cline 的主路径仍是 Tools。
 
+GM4 实现细节：
+
+- 静态资源按已配置仓库展开：`git://<alias>/status`、`git://<alias>/head`；
+  另注册两个 **Resource Template**：`git://{repo}/log/{ref}`、`git://{repo}/file/{ref}/{path}`；
+- `status`/`head`/`log` 返回紧凑 JSON（`application/json`）；`file` 在文本且未截断时返回
+  `text/plain`，二进制或超预算时返回 JSON 元信息（`binary`/`size`/`truncated`，不含原始二进制）；
+- `ref` 可含 `/`（如 `origin/main`、`feature/x`）：按“最长可解析前缀”切分 `ref`/`path`，
+  也支持 URL 编码 `%2F`；`log` 额外支持 range（如 `HEAD~1..HEAD`）；
+- alias 匹配大小写不敏感（URL host 会被规范化），存在大小写歧义时报错；
+- 路径经 `RepoRegistry.resolve_path` 校验，拒绝绝对路径/`..`/符号链接逃逸；
+- 读取只走只读命令，不修改 index/工作区/refs。
+
 ### 4.4 Prompts
 
 | Prompt | 参数 | 用途 |
@@ -319,6 +335,16 @@ Resources 仅作为补充；Cline 的主路径仍是 Tools。
 | `explain_conflict` | `repo`、`path` | 解释冲突文件与解决思路（不自动写） |
 
 Prompts 只生成消息内容，不执行写操作。
+
+GM4 实现细节：
+
+- `write_commit_message`：`staged_only` 默认 `true`（只看 index），`false` 时看工作区；
+  输出 = 变更统计 + diff(受 16KB 预算裁剪) + conventional commits 要求；
+- `review_staged_changes`：staged diff + 严重度分级/风险点/测试缺口要求；
+- `summarize_branch`：`base` 必填（ref 校验）；提交列表(`base..HEAD`, 最多 30 条)+ numstat + diff；
+- `explain_conflict`：读取冲突文件(预算 16KB), 展示冲突标记与上下文, 要求只解释不修改;
+- 参数按 MCP 约定是字符串, 布尔参数接受 `true/false/1/0/yes/no`;
+- 提示词文本统一受 24KB 字节预算(超出截断并注明); 全部为只读查询。
 
 ---
 
@@ -415,7 +441,7 @@ GM3 已实现：每 repo 一把进程内 `asyncio.Lock`（按 realpath 隔离）
 |---|---|---|
 | 只读 tools | ✅ 开放 | 默认 |
 | 写 tools | ❌ 关闭 | `--read-only=false`；Cline 逐次确认 |
-| fetch | ❌ 默认关闭 | `--allow-remote=true` |
+| fetch | ❌ 默认关闭 | `--allow-remote=true`（GM4 已实现） |
 | push/pull | ❌ 不实现 | v2 |
 | destructive | ❌ 不实现 | v2 独立高权限开关 |
 | resources | ✅ 只读 | 默认 |
@@ -450,6 +476,7 @@ GM3 实现补充：
 > GM2 已实现：`git_list_remotes` / `git_config_get` 的 URL 统一经 `sanitize_url`（去 userinfo +
 > token/password 查询参数打码）；`http.*.extraheader`、`credential.*` 及键名含 token/password/secret
 > 的配置只返回 `redacted=true`；含 `://` 的 URL 作用域配置键 v1 不支持（返回 `invalid_argument`）。
+> GM4 补充：`git_fetch` 的进度输出与失败消息经 `sanitize_text` 做同样的整段脱敏。
 > `--audit-log` 仍未接入（GM6）。
 
 ### 6.5 worktree / submodule / 路径
@@ -475,7 +502,8 @@ GM3 实现补充：
 - v1 采用 **stdio**：Cline 启动 Server 进程，通过 stdin/stdout 交换 JSON-RPC；
 - Server 的 **stdout 只允许 MCP 协议消息**；日志/调试输出一律走 stderr；
 - Server 收到 SIGINT/SIGTERM 时优雅退出，不遗留 git 子进程；
-- 首次握手由 MCP SDK 负责，Server 声明 `tools`、`resources`、`prompts` 能力。
+- 首次握手由 MCP SDK 负责，Server 声明 `tools`、`resources`（含 resource templates）、`prompts` 能力
+  （GM1 起 tools；GM4 起 resources/prompts）。
 
 ### 7.2 Cline 配置示例
 
@@ -697,6 +725,10 @@ dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护
 
 **提交建议**：`feat(mcp-git): GM4 fetch 与 prompts/resources`
 
+**验收结果（2026-10-13）**：已落地。默认不注册 `git_fetch`，`--allow-remote=true` 后对本地 bare
+remote 可 fetch/prune 并返回 ref 变化；4 个 prompts 可列出与构建（staged diff/分支汇总/冲突解释）；
+resources 静态项与模板可列出并可读取，读取不修改仓库。详见 §14.1 GM4 实现记录。
+
 ### 10.6 GM5：Cline 接入与文档（1–1.5d）
 
 **交付物**
@@ -739,7 +771,7 @@ dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护
 - [x] GM1：MCP 握手/工具列表/`git_status` 通过（2026-10-13，见 §14.1）；
 - [x] GM2：只读工具齐全、结构化、有输出预算（2026-10-13，见 §14.1）；
 - [x] GM3：写工具默认关闭、dirty/保护分支/锁生效（2026-10-13，见 §14.1）；
-- [ ] GM4：fetch 默认关闭、prompts/resources 可用；
+- [x] GM4：fetch 默认关闭、prompts/resources 可用（2026-10-13，见 §14.1）；
 - [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认；
 - [ ] GM6：全量 pytest + ruff + 人工冒烟记录；
 - [ ] 所有路径参数在 allowlist 根内；
@@ -784,7 +816,7 @@ dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护
 | GM1 | 已完成 | `d010f63` | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
 | GM2 | 已完成 | `43391ea` | 13 个只读工具 + 6 个解析器 + 输出预算/有界截断；新增 141 用例 |
 | GM3 | 已完成 | `8b187d5` | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
-| GM4 | 待实现 | — | fetch + prompts/resources |
+| GM4 | 已完成 | 待回填 | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
 | GM5 | 待实现 | — | Cline 接入 + 文档 |
 | GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |
 
@@ -956,6 +988,56 @@ dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护
   meowmeowclaw_mcp_git tests` 通过；
 - 本阶段不做：fetch/prompts/resources（GM4）、Cline 配置模板与真实 GUI 冒烟（GM5/GM6）、审计（GM6）。
 
+#### GM4 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw_mcp_git/tools/remote.py`（新增） | `git_fetch`：仅 `--allow-remote=true` 注册；仓库锁内执行；`--prune` 可选；返回 before/after + remote ref 变化（created/updated/deleted）；输出与错误经 `sanitize_text` 脱敏 |
+| `meowmeowclaw_mcp_git/prompts.py`（新增） | 4 个 MCP Prompts：`write_commit_message`/`review_staged_changes`/`summarize_branch`/`explain_conflict`；只读取数 + 24KB 字节预算 |
+| `meowmeowclaw_mcp_git/resources.py`（新增） | 静态资源（status/head，按仓库展开）+ 资源模板（log/file）；只读读取，路径经 registry 校验，ref 支持含 `/` 与 range |
+| `meowmeowclaw_mcp_git/server.py` | 注册 `list_prompts`/`get_prompt`/`list_resources`/`list_resource_templates`/`read_resource`；instructions 补充能力说明 |
+| `meowmeowclaw_mcp_git/app.py` | prompts/resources 的协议无关装配与派发 |
+| `meowmeowclaw_mcp_git/policy.py` | `ensure_remote_enabled`：`allow_remote=false` 的二次防线 |
+| `meowmeowclaw_mcp_git/runner.py` | 新增 `kill_on_limit`：fetch 等有副作用命令完整执行、仅截断输出（不被早停杀死） |
+| `meowmeowclaw_mcp_git/parsers/refs.py` | `sanitize_text`：整段文本（进度/报错）URL 脱敏；userinfo 正则改为非锚定（可匹配句子中的 URL） |
+| `tests/mcp_git/*`（新增 3 个文件 + 扩充协议/runner/parser） | 52 用例：fetch（本地 bare remote/prune/脱敏）、prompts（含真实冲突）、resources（状态/文件/日志/越界）、协议与 runner |
+| `README.md` / 本文 | 工具/prompt/resource 说明、目录树、实施状态同步 |
+
+**关键实现决策**
+
+- **fetch 等级与开关**：`git_fetch` 属 `remote` 等级，仅 `--allow-remote=true` 注册（与 `read_only`
+  无关，只读模式下也可显式开启远端）；handler 内 `ensure_remote_enabled` 二次校验；
+- **只拉不合并**：只执行 `git fetch [--prune] [remote]`，不动工作区/本地分支；用 fetch 前后的
+  remote-tracking refs 对比生成结构化 `refs`（created/updated/deleted），比解析进度文本更稳定；
+- **fetch 不被早停杀死**：GM2 的有界流式读取默认超限杀进程组；fetch 有副作用，改用
+  `kill_on_limit=False`（读完、只截断输出），避免半更新状态；
+- **脱敏**：fetch 的进度输出与失败消息统一 `sanitize_text`（userinfo → `***`，token/password
+  查询参数打码）；
+- **Prompts 只读**：四个 prompt 只调用只读工具/解析器收集上下文并拼文本，不做任何写操作；
+  MCP prompt 参数是字符串，布尔按 `true/false/1/0/yes/no` 解析；提示词文本 24KB 预算，
+  diff/文件各自 16KB 预算；
+- **Resources 只读**：status/head 静态列出，log/file 以 Resource Template 暴露；`file` 文本未截断
+  时直接回原文，二进制/截断时回 JSON 元信息；`ref`/`path` 用“最长可解析前缀”切分以支持
+  `origin/main` 这类含 `/` 的 ref；
+- **错误语义**：tools 仍是 `{ok,...}` 信封；prompts/resources 走 MCP 协议错误（消息保留业务错误
+  文案，如 `repo_not_found`/`invalid_path`）。
+
+**验证**
+
+- fetch：本地 bare remote 场景下 fetch 更新 `origin/main`、prune 删除远端已删分支、无变更时
+  `refs_changed=0`；凭证不会出现在工具返回（错误消息经脱敏）；`--allow-remote=false` 时工具不注册；
+- prompts：staged diff 提示词包含文件/改动/要求；真实 merge 冲突下 `explain_conflict` 展示冲突
+  标记与解决要求；大 diff 触发 24KB 预算截断；调用后仓库 HEAD/status 不变；
+- resources：status/head/log/file 可读；含 `/` 的 ref、range、二进制、超 64KB 文本、中文路径、
+  大小写 alias 均按预期；`..` 越界 → `invalid_path`；读取前后仓库状态不变；
+- 真实 stdio 会话（`--allow-remote=true`）：`tools/list` 14 个工具、4 个 prompts、2 个 resources
+  + 2 个 templates，`git_fetch`/`get_prompt`/`read_resource` 全部可用；
+- 全量回归 **2106 passed / 6 skipped / 2 xfailed**（新增 52 用例）；`ruff check meowmeowclaw
+  meowmeowclaw_mcp_git tests` 通过；
+- 本阶段不做：Cline 配置模板与真实 GUI 冒烟（GM5）、审计与全量验收收尾（GM6）。
+
 ---
 
 ## 附录 A：只读模式 Cline 配置模板
@@ -1015,4 +1097,4 @@ dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护
 
 > 本文是 Git MCP Server 的实现依据。按 §10 里程碑（GM1–GM6）推进；
 > 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
-> **GM1–GM3 已完成（2026-10-13），实现记录见 §14.1；GM4 待评审确认后启动。**
+> **GM1–GM4 已完成（2026-10-13），实现记录见 §14.1；GM5 待评审确认后启动。**

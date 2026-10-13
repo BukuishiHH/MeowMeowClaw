@@ -21,7 +21,9 @@ from .envelope import dumps, failure, ok
 from .errors import ERROR_INTERNAL, ERROR_INVALID_ARGUMENT, ERROR_OUTPUT_TRUNCATED, GitMcpError
 from .locks import RepoLockManager
 from .policy import PolicyEngine
+from .prompts import PromptSpec, build_prompt_specs
 from .registry import RepoRegistry
+from .resources import ResourcePayload, read_git_resource, resource_listing
 from .runner import GitRunner
 from .tools import build_available_tools
 from .tools.base import (
@@ -74,6 +76,7 @@ class GitMcpApp:
         self.locks = locks or RepoLockManager(lock_dir=config.lock_dir)
         available = tuple(build_available_tools()) if specs is None else tuple(specs)
         self._specs: dict[str, ToolSpec] = {spec.name: spec for spec in select_tools(config, available)}
+        self._prompts: dict[str, PromptSpec] = {spec.name: spec for spec in build_prompt_specs()}
         self._context = ToolContext(
             config=config,
             registry=self.registry,
@@ -105,6 +108,30 @@ class GitMcpApp:
     def tool_definitions(self) -> list[dict[str, Any]]:
         """``list_tools`` 用的协议无关描述列表."""
         return [spec.definition() for spec in self._specs.values()]
+
+    # ---- Prompts / Resources (§4.3/§4.4) --------------------------------
+
+    def prompt_definitions(self) -> list[dict[str, Any]]:
+        """``list_prompts`` 用的协议无关描述列表."""
+        return [spec.definition() for spec in self._prompts.values()]
+
+    def prompt_names(self) -> tuple[str, ...]:
+        return tuple(self._prompts)
+
+    async def build_prompt(self, name: str, arguments: Any = None) -> str:
+        """构建 prompt 文本(只读查询, 不执行写操作)."""
+        spec = self._prompts.get(name)
+        if spec is None:
+            allowed = ", ".join(sorted(self._prompts)) or "无"
+            raise ValueError(f"未知 prompt: {name!r}; 可用: {allowed}")
+        return await spec.builder(self._context, dict(arguments or {}))
+
+    def resource_definitions(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """``(静态资源, 资源模板)``; 读取不修改仓库状态."""
+        return resource_listing(self._context)
+
+    async def read_resource(self, uri: str) -> ResourcePayload:
+        return await read_git_resource(self._context, uri)
 
     # ---- 派发 ------------------------------------------------------------
 

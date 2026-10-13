@@ -15,8 +15,19 @@ import sys
 from typing import Any, Mapping, Optional, Sequence
 
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import (
+    GetPromptResult,
+    Prompt,
+    PromptArgument,
+    PromptMessage,
+    Resource,
+    ResourceTemplate,
+    TextContent,
+    Tool,
+)
+from pydantic import AnyUrl
 
 from . import __version__
 from .app import GitMcpApp
@@ -25,8 +36,10 @@ from .errors import ConfigError
 
 SERVER_NAME = "meowmeowclaw-git"
 SERVER_INSTRUCTIONS = (
-    "MeowMeowClaw Git MCP Server: 通过 git CLI 提供结构化只读 Git 工具(默认 read_only=true)。"
-    "仓库以 alias 暴露, 返回值统一为 {ok,data,meta} JSON; 失败为 {ok:false,error_code,message,meta}。"
+    "MeowMeowClaw Git MCP Server: 通过 git CLI 提供结构化 Git 工具(默认 read_only=true, 只读工具开放)。"
+    "仓库以 alias 暴露, 工具返回值统一为 {ok,data,meta} JSON; 失败为 {ok:false,error_code,message,meta}。"
+    "另提供只读 Prompts(提交信息/评审/分支汇总/冲突解释)与 Resources"
+    "(git://<repo>/status|head|log/<ref>|file/<ref>/<path>)。"
 )
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 logger = logging.getLogger("meowmeowclaw_mcp_git")
@@ -66,6 +79,49 @@ def build_server(app: GitMcpApp) -> Server:
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         text = await app.call_tool(name, arguments)
         return [TextContent(type="text", text=text)]
+
+    @server.list_prompts()
+    async def _list_prompts() -> list[Prompt]:
+        return [
+            Prompt(
+                name=item["name"],
+                title=item.get("title"),
+                description=item["description"],
+                arguments=[
+                    PromptArgument(
+                        name=arg["name"],
+                        description=arg.get("description"),
+                        required=arg.get("required", False),
+                    )
+                    for arg in item["arguments"]
+                ],
+            )
+            for item in app.prompt_definitions()
+        ]
+
+    @server.get_prompt()
+    async def _get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptResult:
+        text = await app.build_prompt(name, arguments or {})
+        definition = next((item for item in app.prompt_definitions() if item["name"] == name), None)
+        return GetPromptResult(
+            description=definition["description"] if definition else None,
+            messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))],
+        )
+
+    resources, templates = app.resource_definitions()
+
+    @server.list_resources()
+    async def _list_resources() -> list[Resource]:
+        return [Resource(**item) for item in resources]
+
+    @server.list_resource_templates()
+    async def _list_resource_templates() -> list[ResourceTemplate]:
+        return [ResourceTemplate(**item) for item in templates]
+
+    @server.read_resource()
+    async def _read_resource(uri: AnyUrl) -> list[ReadResourceContents]:
+        payload = await app.read_resource(str(uri))
+        return [ReadResourceContents(content=payload.text, mime_type=payload.mime_type)]
 
     return server
 

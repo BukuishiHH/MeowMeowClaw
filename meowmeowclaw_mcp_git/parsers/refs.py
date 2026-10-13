@@ -36,7 +36,8 @@ _AHEAD_RE = re.compile(r"^\[ahead (\d+)(?:, behind (\d+))?\]$")
 _BEHIND_RE = re.compile(r"^\[behind (\d+)\]$")
 
 # URL 脱敏: scheme://userinfo@host -> scheme://***@host; 查询串里的 token/password 等同样打码
-_URL_USERINFO_RE = re.compile(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<userinfo>[^/@]+)@")
+# 不锚定 ^: sanitize_text 需要在整段进度/报错里匹配任意位置出现的 URL userinfo
+_URL_USERINFO_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@")
 _SENSITIVE_QUERY_RE = re.compile(
     r"(?P<prefix>[?&](?:access_token|private_token|token|password|passwd|authkey|apikey|key)=)[^&#\s]*",
     re.IGNORECASE,
@@ -205,6 +206,12 @@ def parse_upstream_track(raw: str) -> tuple[int, int, bool]:
 def sanitize_url(url: str) -> str:
     """去掉 URL userinfo, 并对 token/password 查询参数打码(§6.4)."""
     sanitized = _URL_USERINFO_RE.sub(r"\g<scheme>***@", url)
+    return _SENSITIVE_QUERY_RE.sub(r"\g<prefix>***", sanitized)
+
+
+def sanitize_text(text: str) -> str:
+    """对整段文本(如 ``git fetch`` 的进度/报错)做同样的 URL 脱敏."""
+    sanitized = _URL_USERINFO_RE.sub(r"\g<scheme>***@", text)
     return _SENSITIVE_QUERY_RE.sub(r"\g<prefix>***", sanitized)
 
 

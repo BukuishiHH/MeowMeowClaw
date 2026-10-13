@@ -21,6 +21,7 @@ from .refs import (
     parse_stash_list,
     parse_tags,
     parse_upstream_track,
+    sanitize_text,
     sanitize_url,
 )
 from .status import RenameEntry, StatusSummary, parse_porcelain_v2
@@ -53,5 +54,6 @@ __all__ = [
     "parse_stash_list",
     "parse_tags",
     "parse_upstream_track",
+    "sanitize_text",
     "sanitize_url",
 ]

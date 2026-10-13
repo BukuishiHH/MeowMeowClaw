@@ -31,6 +31,13 @@ class PolicyEngine:
                 f"服务器以只读模式运行(--read-only=true), 禁止 {action}; 需要显式 --read-only=false"
             )
 
+    def ensure_remote_enabled(self, *, action: str = "远端操作") -> None:
+        """``--allow-remote=false``(默认)时任何远端操作都应被拒绝(远端工具不会注册)."""
+        if not self.config.allow_remote:
+            raise PolicyDeniedError(
+                f"远端能力未开启, 禁止 {action}; 需要显式 --allow-remote=true"
+            )
+
     # ---- 分支保护 --------------------------------------------------------
 
     def is_protected(self, branch: Optional[str]) -> bool:

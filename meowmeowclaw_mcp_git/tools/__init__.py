@@ -17,6 +17,7 @@ from .base import (
 )
 from .read import build_core_tools
 from .refs import build_ref_tools
+from .remote import build_remote_tools
 from .search import build_search_tools
 from .write import build_write_tools
 
@@ -33,6 +34,7 @@ __all__ = [
     "build_available_tools",
     "build_read_tools",
     "build_ref_tools",
+    "build_remote_tools",
     "build_search_tools",
     "build_write_tools",
 ]
@@ -44,5 +46,5 @@ def build_read_tools() -> tuple[ToolSpec, ...]:
 
 
 def build_available_tools() -> tuple[ToolSpec, ...]:
-    """服务器可提供的全部工具(只读 + 写); 由 ``app.select_tools`` 按权限矩阵过滤."""
-    return build_read_tools() + build_write_tools()
+    """服务器可提供的全部工具(只读 + 写 + 远端); 由 ``app.select_tools`` 按权限矩阵过滤."""
+    return build_read_tools() + build_write_tools() + build_remote_tools()

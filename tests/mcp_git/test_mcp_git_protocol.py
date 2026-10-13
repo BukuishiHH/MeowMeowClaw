@@ -24,7 +24,7 @@ from meowmeowclaw_mcp_git import __version__  # noqa: E402
 from meowmeowclaw_mcp_git.app import GitMcpApp  # noqa: E402
 from meowmeowclaw_mcp_git.config import ServerConfig  # noqa: E402
 from meowmeowclaw_mcp_git.server import SERVER_NAME, build_server  # noqa: E402
-from meowmeowclaw_mcp_git.tools import build_available_tools, build_read_tools  # noqa: E402
+from meowmeowclaw_mcp_git.tools import build_read_tools  # noqa: E402
 from meowmeowclaw_mcp_git.tools.base import LEVEL_READ, LEVEL_WRITE, ToolOutcome, ToolSpec  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -100,8 +100,10 @@ class TestInProcessProtocol:
             await session.initialize()
             tools = await session.list_tools()
 
+        from meowmeowclaw_mcp_git.tools import build_read_tools, build_write_tools
+
         names = [tool.name for tool in tools.tools]
-        assert names == [spec.name for spec in build_available_tools()]
+        assert names == [spec.name for spec in (*build_read_tools(), *build_write_tools())]
         assert {"git_stage", "git_commit", "git_branch_switch", "git_stash"} <= set(names)
 
     @pytest.mark.asyncio
@@ -177,3 +179,74 @@ class TestStdioProcess:
         assert completed.returncode == 2
         assert completed.stdout == b""
         assert "配置错误" in completed.stderr.decode("utf-8", errors="replace")
+
+
+class TestPromptsAndResourcesProtocol:
+    """GM4: prompts/resources 通过真 SDK 客户端可见可读(§7.1 能力声明)."""
+
+    @pytest.mark.asyncio
+    async def test_list_and_get_prompts(self, repo: Path):
+        server = build_server(make_app(repo))
+
+        async with create_connected_server_and_client_session(server) as session:
+            await session.initialize()
+            prompts = await session.list_prompts()
+            result = await session.get_prompt("write_commit_message", {"staged_only": "false"})
+
+        assert [item.name for item in prompts.prompts] == [
+            "write_commit_message",
+            "review_staged_changes",
+            "summarize_branch",
+            "explain_conflict",
+        ]
+        arguments = {arg.name: arg for arg in prompts.prompts[0].arguments or []}
+        assert set(arguments) == {"repo", "staged_only"}
+        text = result.messages[0].content.text
+        assert "提交信息" in text
+        assert result.messages[0].role == "user"
+
+    @pytest.mark.asyncio
+    async def test_list_and_read_resources(self, repo: Path):
+        server = build_server(make_app(repo))
+
+        async with create_connected_server_and_client_session(server) as session:
+            await session.initialize()
+            resources = await session.list_resources()
+            templates = await session.list_resource_templates()
+            status = await session.read_resource(f"git://{repo.name}/status")
+            head = await session.read_resource(f"git://{repo.name}/head")
+
+        assert [str(item.uri) for item in resources.resources] == [
+            f"git://{repo.name}/status",
+            f"git://{repo.name}/head",
+        ]
+        assert [item.uriTemplate for item in templates.resourceTemplates] == [
+            "git://{repo}/log/{ref}",
+            "git://{repo}/file/{ref}/{path}",
+        ]
+        assert json.loads(status.contents[0].text)["branch"] == "main"
+        assert json.loads(head.contents[0].text)["head_oid"]
+
+    @pytest.mark.asyncio
+    async def test_resource_error_surfaces_as_protocol_error(self, repo: Path):
+        from mcp.shared.exceptions import McpError
+
+        server = build_server(make_app(repo))
+
+        async with create_connected_server_and_client_session(server) as session:
+            await session.initialize()
+            with pytest.raises(McpError):
+                await session.read_resource("git://ghost/status")
+
+    @pytest.mark.asyncio
+    async def test_fetch_registered_when_allow_remote(self, repo: Path):
+        app = GitMcpApp(ServerConfig(roots=(str(repo),), allow_remote=True))
+        server = build_server(app)
+
+        async with create_connected_server_and_client_session(server) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+
+        names = [tool.name for tool in tools.tools]
+        assert "git_fetch" in names
+        assert len(names) == 14

@@ -217,3 +217,29 @@ class TestStreamingTruncation:
         assert result.truncated is False
         assert result.stdout == b"hello"
         assert result.stdout_total_bytes == 5
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell 脚本")
+class TestNoKillOnLimit:
+    """GM4: ``kill_on_limit=False`` 用于 fetch 等有副作用的命令(完整执行, 仅截断输出)."""
+
+    def test_command_runs_to_completion_while_output_is_capped(self, tmp_path: Path):
+        marker = tmp_path / "completed.marker"
+        script = tmp_path / "fake-git"
+        script.write_text(
+            "#!/bin/sh\n"
+            "i=0\n"
+            "while [ $i -lt 200000 ]; do printf 'x'; i=$((i+1)); done\n"
+            f"touch {marker}\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        runner = GitRunner(git_binary=str(script), max_output_bytes=1000)
+
+        result = runner.run(["fetch"], cwd=tmp_path, kill_on_limit=False)
+
+        assert result.truncated is True
+        assert len(result.stdout) == 1000
+        assert result.stdout_total_bytes > 1000
+        assert result.exit_code == 0
+        assert marker.exists()  # 命令完整执行完, 没有被中途杀死

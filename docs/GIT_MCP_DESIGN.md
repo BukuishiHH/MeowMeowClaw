@@ -1,6 +1,6 @@
 # MeowMeowClaw Git MCP Server 设计（v1）
 
-> 状态：**评审通过，GM1 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> 状态：**评审通过，GM1–GM2 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
 > Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
 > 按 §10 里程碑（GM1–GM6）逐步实现，每阶段独立提交；实施状态与实现记录见 §14。
 > 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
@@ -98,25 +98,34 @@ Tools / Resources / Prompts 能力。当前 MeowMeowClaw 主项目提供了 `rea
 | `LockManager` | 每 repo 进程内锁 + 可选跨进程锁 | 业务 |
 | `AuditSink` | 可选 JSONL 审计：工具、repo、参数摘要、结果、耗时 | 业务决策 |
 
-### 2.3 目录结构（GM1 已落地部分）
+### 2.3 目录结构（GM1–GM2 已落地部分）
 
 ```
 meowmeowclaw_mcp_git/      # 顶层独立包(不并入主 Agent; 主项目运行时不依赖 mcp)
 ├── __init__.py            # 版本与分层说明(import 无副作用)
 ├── __main__.py            # python -m ... 入口(缺 SDK 时 stderr 提示 + 退出码 3)
-├── app.py                 # 协议无关核心: 装配 + 权限矩阵 + 统一信封 + 派发
+├── app.py                 # 协议无关核心: 装配 + 权限矩阵 + 统一信封 + 派发 + 信封兜底
 ├── server.py              # MCP stdio 适配(唯一 import mcp 的模块)
 ├── config.py              # 启动参数与环境变量(CLI > env > 默认)
 ├── registry.py            # RepoRegistry(alias/允许根/工作树顶层/路径校验)
-├── runner.py              # GitRunner(subprocess/timeout/截断/环境清洗)
+├── runner.py              # GitRunner(参数列表/环境清洗/硬超时/有界流式截断)
+├── budget.py              # 文本/列表输出预算(字节/行裁剪 + truncated)
 ├── validation.py          # 工具参数校验(JSON Schema 子集)
 ├── envelope.py            # {ok,data,meta} / {ok,error_code,message,meta}
 ├── errors.py              # 错误码与异常类型
 ├── parsers/
-│   └── status.py          # git status porcelain v2(GM2 追加 diff/log/...)
+│   ├── status.py          # git status porcelain v2
+│   ├── diff.py            # diff/show --numstat -z
+│   ├── log.py             # log/search 记录(US/RS 分隔)
+│   ├── refs.py            # for-each-ref / tag / remote + URL 脱敏
+│   ├── grep.py            # git grep -z
+│   └── blame.py           # blame --line-porcelain
 └── tools/
     ├── base.py            # ToolSpec / ToolContext / ToolOutcome
-    └── read.py            # git_status(GM2 追加其余只读工具)
+    ├── common.py          # git 调用/错误映射/meta/路径与自由参数防护
+    ├── read.py            # status/diff/log/show/blame/file_at_revision
+    ├── refs.py            # list_branches/list_tags/list_remotes/rev_parse/config_get
+    └── search.py          # grep/search_history
 ```
 
 > GM3 起新增 `policy.py`(PolicyEngine)/ `locks.py`(每仓库锁)、GM4 新增 `remote.py`/
@@ -187,22 +196,22 @@ GM1 实现补充：
 | 工具 | 作用 | 关键参数 | 备注 |
 |---|---|---|---|
 | `git_status` | 工作区/暂存区/分支状态 | `repo`、`short` | porcelain v2 结构化；**GM1 已实现** |
-| `git_diff` | 工作区/暂存/commit/range 差异 | `repo`、`mode`、`base`、`head`、`paths`、`stat_only`、`context_lines` | 默认限制输出 |
-| `git_log` | 提交历史 | `repo`、`max_count`、`author`、`since`、`until`、`path`、`grep` | 默认 20 条 |
-| `git_show` | 单个 commit/tag/对象 | `repo`、`ref`、`stat_only` | 限制大小 |
-| `git_blame` | 行级 blame | `repo`、`file`、`start_line`、`end_line` | 大文件需范围 |
-| `git_file_at_revision` | 指定 ref 的文件内容 | `repo`、`ref`、`path` | 返回文本+编码/大小 |
-| `git_list_branches` | 分支列表 | `repo`、`remote`、`verbose` | 含 tracking |
-| `git_list_tags` | tag 列表 | `repo`、`pattern` | — |
-| `git_list_remotes` | remote 列表 | `repo` | URL 脱敏 |
-| `git_grep` | 仓库内文本搜索 | `repo`、`pattern`、`paths`、`ref` | 正则/大小写选项 |
-| `git_search_history` | 历史 diff 搜索 | `repo`、`pattern`、`pickaxe`、`max_count` | `-S`/`-G` |
-| `git_rev_parse` | ref 解析 | `repo`、`ref`、`short` | — |
-| `git_config_get` | 读取配置 | `repo`、`key` | 只读 |
+| `git_diff` | 工作区/暂存/commit/range 差异 | `repo`、`mode`、`base`、`head`、`paths`、`stat_only`、`context_lines` | 默认限制输出；**GM2 已实现** |
+| `git_log` | 提交历史 | `repo`、`max_count`、`author`、`since`、`until`、`path`、`grep` | 默认 20 条；**GM2 已实现** |
+| `git_show` | 单个 commit/tag/对象 | `repo`、`ref`、`stat_only` | 限制大小；**GM2 已实现** |
+| `git_blame` | 行级 blame | `repo`、`file`、`start_line`、`end_line` | 大文件需范围；**GM2 已实现** |
+| `git_file_at_revision` | 指定 ref 的文件内容 | `repo`、`ref`、`path` | 返回文本+编码/大小；**GM2 已实现** |
+| `git_list_branches` | 分支列表 | `repo`、`remote`、`verbose` | 含 tracking；**GM2 已实现** |
+| `git_list_tags` | tag 列表 | `repo`、`pattern` | —；**GM2 已实现** |
+| `git_list_remotes` | remote 列表 | `repo` | URL 脱敏；**GM2 已实现** |
+| `git_grep` | 仓库内文本搜索 | `repo`、`pattern`、`paths`、`ref` | 正则/大小写选项；**GM2 已实现** |
+| `git_search_history` | 历史 diff 搜索 | `repo`、`pattern`、`pickaxe`、`max_count` | `-S`/`-G`；**GM2 已实现** |
+| `git_rev_parse` | ref 解析 | `repo`、`ref`、`short` | —；**GM2 已实现** |
+| `git_config_get` | 读取配置 | `repo`、`key` | 只读；**GM2 已实现** |
 
-> GM1 只注册 `git_status`（其余 A 组工具 GM2 补齐）。`short=true` 只返回分支信息与各组计数、
-> 省略逐文件列表，用于大工作区的上下文预算；`short=false`（默认）返回 staged/unstaged/
-> untracked/conflicts/renames 结构化路径列表。
+> GM1–GM2 已注册全部 A 组只读工具。`short=true` 只返回分支信息与各组计数、省略逐文件列表，
+> 用于大工作区的上下文预算；`short=false`（默认）返回 staged/unstaged/untracked/conflicts/
+> renames 结构化路径列表。
 
 #### B. 安全写类（默认不 autoApprove；需 `read_only=false`）
 
@@ -272,6 +281,11 @@ GM1 实现补充：
 > （可能为空对象）；新增 `parse_failed`（git 输出无法解析，§5.3）与 `internal_error`
 > （未处理异常兜底，绝不把堆栈泄漏给协议层）。可选参数显式传 `null` 视为未提供。
 
+> GM2 实现补充：文本类工具（diff/show patch、file、blame、grep）统一受 `max_bytes`/`max_lines`
+> 预算裁剪并在 data/meta 置 `truncated=true`；`git_log`/`git_search_history` 用 `has_more` 标记
+> 还有更多；工具自身预算之外，app 层对最终信封再做一次 `--max-output-bytes` 兜底（超限返回
+> `output_truncated`，不把巨型 JSON 交给模型）。
+
 ### 4.3 Resources
 
 MCP Resources 适合低频、可读、可订阅的资源，但 Git 工作区变化频繁，v1 只做少量只读资源：
@@ -332,12 +346,14 @@ git --no-pager -C <repo_path> <subcommand> [args...]
 | 数据 | 解析方式 |
 |---|---|
 | status | `git status --porcelain=v2 --branch -z`（NUL 分隔，文件名含空格/换行不被误切） |
-| diff | `git diff --stat` / `--numstat` + 可选原始 patch |
-| log | `git log --pretty=format:%H%x00%h%x00%an%x00%aI%x00%s%x00` 等稳定的 NUL 分隔格式 |
-| branch | `git for-each-ref --format=...` |
-| tag | `git tag --format=...` |
-| blame | `git blame --line-porcelain`（按行范围采样） |
-| 文件内容 | `git show <ref>:<path>` + 编码/大小检查 |
+| diff | `git diff --numstat -z`（结构化 files，rename 为 `\0old\0new`）+ `--patch`（预算内片段） |
+| log | `git log --pretty=format:%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1f%D%x1e`（字段 US、记录 RS，空 subject 不歧义） |
+| branch | `git for-each-ref --format=%(refname:short)%x1f…%x1e`（tracking/ahead/behind/symref/subject） |
+| tag | `git tag --format=%(refname:short)%x1f%(objecttype)%x1f…%x1e` |
+| blame | `git blame --line-porcelain -L <start>,<end>`（按行窗口采样） |
+| grep | `git grep -n -z`（`<path>\0<line>\0<content>`，固定串 `-F` / 扩展正则 `-E`） |
+| remote | `git remote -v` + `sanitize_url`（URL 脱敏，§6.4） |
+| 文件内容 | `git cat-file -s`（尺寸）+ `git show <ref>:<path>` + NUL 二进制判定 + 编码探测 |
 
 解析失败时保留原始 stdout/stderr，返回 `command_failed` 或 `parse_failed`，不做静默丢数据。
 
@@ -345,6 +361,8 @@ git --no-pager -C <repo_path> <subcommand> [args...]
 
 - 所有命令有硬超时；超时后 kill 进程组（POSIX `killpg` / Windows `taskkill` 兜底）；
 - 输出超过 `max-output-bytes` 时截断并设置 `meta.truncated=true`；
+- GM2 起改为**有界流式读取**：内存只保留前 `max-output-bytes` 字节，超限立即终止进程组（不等命令
+  写完），`stdout_total_bytes`/`stderr_total_bytes` 仍记录完整尺寸；
 - 大 diff/log 默认优先返回结构化/stat 摘要，完整 patch 由参数显式请求；
 - MCP 请求取消时不留下后台 git 进程。
 
@@ -400,6 +418,11 @@ git --no-pager -C <repo_path> <subcommand> [args...]
 - 不打印 `git config` 中的 `http.*.extraheader`、credential 配置值；
 - 审计记录只存命令摘要与结果状态，不存完整环境变量；
 - 若用户显式配置 `--audit-log`，审计文件权限 0o600。
+
+> GM2 已实现：`git_list_remotes` / `git_config_get` 的 URL 统一经 `sanitize_url`（去 userinfo +
+> token/password 查询参数打码）；`http.*.extraheader`、`credential.*` 及键名含 token/password/secret
+> 的配置只返回 `redacted=true`；含 `://` 的 URL 作用域配置键 v1 不支持（返回 `invalid_argument`）。
+> `--audit-log` 仍未接入（GM6）。
 
 ### 6.5 worktree / submodule / 路径
 
@@ -476,9 +499,13 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 ### 7.3 上下文预算
 
-- Cline 也有上下文窗口限制：默认 `git_log` 20 条、`git_diff` 优先 stat/数值、完整 patch 需显式参数；
-- 工具返回保留 `truncated` 与 `next_cursor`（如支持分页）；
-- 对超大文件/大 diff，返回摘要 + 可选的 `git_show` 分段读取。
+- `git_log`/`git_search_history` 默认 20 条，多取 1 条探测并用 `has_more` 标记还有更多；
+- `git_diff`/`git_show` 始终返回 numstat 结构化 `files`，默认只附带 32KB 以内的 patch 片段；
+  需要完整 patch 时显式放大 `max_bytes`（≤ `--max-output-bytes`）或按 `paths`/range 分段；
+- `git_blame` 默认前 200 行（`max_lines`）、`git_grep` 默认 100 条匹配，超出置 `truncated=true`；
+- `git_file_at_revision` 默认 64KB，二进制文件只回 `size/binary`；
+- 工具返回保留 `truncated`/`has_more`；app 层对最终信封再做 `--max-output-bytes` 兜底；
+- 对超大文件/大 diff：先拿摘要（stat_only/numstat），再按行/字节窗口分段读取。
 
 ### 7.4 常见接入问题排查
 
@@ -595,6 +622,11 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 
 **提交建议**：`feat(mcp-git): GM2 只读工具集与结构化解析`
 
+**验收结果（2026-10-13）**：已落地。13 个只读工具全部注册可调用；numstat/log/refs/grep/blame
+结构化解析；大 diff/文件按 `max_bytes`/`max_lines` 裁剪并标记 `truncated`，app 层
+`--max-output-bytes` 兜底；路径越界统一 `invalid_path`；`read_only=true` 下无写工具注册。
+详见 §14.1 GM2 实现记录。
+
 ### 10.4 GM3：安全写工具（2d）
 
 **交付物**
@@ -673,7 +705,7 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 ## 11. 验收清单
 
 - [x] GM1：MCP 握手/工具列表/`git_status` 通过（2026-10-13，见 §14.1）；
-- [ ] GM2：只读工具齐全、结构化、有输出预算；
+- [x] GM2：只读工具齐全、结构化、有输出预算（2026-10-13，见 §14.1）；
 - [ ] GM3：写工具默认关闭、dirty/保护分支/锁生效；
 - [ ] GM4：fetch 默认关闭、prompts/resources 可用；
 - [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认；
@@ -718,7 +750,7 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 | 里程碑 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | GM1 | 已完成 | `d010f63` | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
-| GM2 | 待实现 | — | 只读工具集 + 解析 + 输出预算 |
+| GM2 | 已完成 | 待回填 | 13 个只读工具 + 6 个解析器 + 输出预算/有界截断；新增 141 用例 |
 | GM3 | 待实现 | — | 安全写 + dirty/分支保护 + 锁 |
 | GM4 | 待实现 | — | fetch + prompts/resources |
 | GM5 | 待实现 | — | Cline 接入 + 文档 |
@@ -789,6 +821,57 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 **备注**：`python -m` 需要包可导入（源码运行需项目根在 `PYTHONPATH`，或执行
 `pip install -e ".[mcp-git]"`）；`--audit-log`/`--lock-dir` 当前只记录并提示未接入。
 
+#### GM2 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw_mcp_git/parsers/{diff,log,refs,grep,blame}.py`（新增） | numstat(-z)/log(US+RS)/for-each-ref/tag/remote(URL 脱敏)/grep(-z)/blame(porcelain) 结构化解析；截断尾段统一丢弃，未知格式报 `parse_failed` |
+| `meowmeowclaw_mcp_git/budget.py`（新增） | `fit_text`/`fit_items`：按字节/行裁剪并返回 total/returned 尺寸；UTF-8 边界安全（不产生半个字符） |
+| `meowmeowclaw_mcp_git/runner.py` | 输出改为**有界流式读取**（`_BoundedReader`）：内存只保留前 cap 字节，超限立即终止进程组；`truncated`/`stdout_total_bytes` 语义保留 |
+| `meowmeowclaw_mcp_git/tools/common.py`（新增） | 只读工具共享件：git 调用/错误映射/meta/相对路径校验/ref 与 pattern 防选项注入/预算取小 |
+| `meowmeowclaw_mcp_git/tools/read.py` | `git_diff`（worktree/staged/commit/range + paths/stat_only/context_lines/max_bytes）、`git_log`（默认 20 + has_more + author/since/until/path/grep）、`git_show`（commit 元信息 + numstat + patch）、`git_blame`（行窗口，默认 200 行）、`git_file_at_revision`（编码/大小/二进制/截断） |
+| `meowmeowclaw_mcp_git/tools/refs.py`（新增） | `git_list_branches`（tracking/remote 作用域）、`git_list_tags`、`git_list_remotes`（URL 脱敏）、`git_rev_parse`、`git_config_get`（敏感键 `redacted`） |
+| `meowmeowclaw_mcp_git/tools/search.py`（新增） | `git_grep`（正则/固定串、大小写、ref/路径、行/字节预算）、`git_search_history`（-S/-G + has_more） |
+| `meowmeowclaw_mcp_git/app.py` | 注册全部只读工具；成功信封超过 `--max-output-bytes` 时返回 `output_truncated` 兜底 |
+| `tests/mcp_git/*`（新增 6 个文件 + 扩充 runner） | 141 用例：解析器、diff/log/show/blame/file 端到端、refs/config、grep/历史搜索、有界截断、信封兜底 |
+| `README.md` / 本文 | 工具表、解析格式、预算策略、目录树、实施状态同步 |
+
+**关键实现决策**
+
+- **输出预算分层**：工具参数（`max_bytes`/`max_lines`/`max_count`/`stat_only`）→ 工具级裁剪并标记
+  → runner 有界流式截断（内存有界、超限早停）→ app 层 `--max-output-bytes` 信封兜底（超限报
+  `output_truncated`，不截 JSON）；
+- **patch 默认受限**：`git_diff`/`git_show` 始终回 numstat 结构化 `files`，默认附带 32KB 以内 patch；
+  完整 patch 需显式放大 `max_bytes` 或按 paths/range 分段；
+- **分页标记**：`git_log`/`git_search_history` 多取 1 条，用 `has_more` 表示还有更多（不引入
+  next_cursor；模型用过滤条件/`max_count` 收敛）；
+- **blame 行窗口**：未给 `end_line` 时用 `-L start,+max_lines`，取满才标 `truncated`；显式范围超过
+  `max_lines` 时自动收窄并标记；
+- **文本编码**：`git_file_at_revision` 按 NUL 判二进制，文本依次尝试 UTF-8/GB18030，返回
+  `encoding/size`；字节裁剪后尾字符用替换符兜底；
+- **选项注入防护**：ref 类参数拒绝 `-` 开头/空白；pattern 以 `-e`/`-S` 粘连传递；tag pattern 拒绝
+  `-` 开头；config key 限字符集，含 `://` 的 URL 作用域键 v1 不支持；
+- **敏感信息**：remote/config URL 去 userinfo 并打码 token 查询参数；`http.*.extraheader`、
+  `credential.*`、键名含 token/password/secret 的配置只回 `redacted=true`；
+- **错误码稳定**：路径越界 `invalid_path`；参数组合/枚举/边界 `invalid_argument`；git 非零退出
+  `command_failed`；输出截断 `output_truncated`；解析失败 `parse_failed`。
+
+**验证**
+
+- 13 个只读工具在临时仓库全部可调用，结构化字段与 git 原始输出对照一致（numstat rename/binary、
+  tag 类型与主题、upstream track 的 ahead/behind/gone、blame 行/作者/时间、grep 行号/内容）；
+- 大输出：500KB 假 git 输出在 1000 字节上限下 1 秒内被截断并终止进程组；patch/file/grep 的
+  `truncated` 生效；400 字节上限下 app 层兜底返回 `output_truncated`；
+- 路径/参数安全：`..`/绝对路径/符号链接逃逸 → `invalid_path`；`-` 开头的 ref/pattern 不会成为
+  git 选项；二进制/GB18030 文件按预期返回；
+- `read_only=true` 下写工具仍不注册（GM3 才引入写工具）；
+- 全量回归 **1969 passed / 6 skipped / 2 xfailed**（新增 141 用例）；`ruff check meowmeowclaw
+  meowmeowclaw_mcp_git tests` 通过；
+- 本阶段不做：写工具与锁（GM3）、fetch/prompts/resources（GM4）、Cline GUI 冒烟（GM5/GM6）、
+  `git_list_worktrees`/`git_list_submodules`（§6.5 可选，未排期）。
+
 ---
 
 ## 附录 A：只读模式 Cline 配置模板
@@ -848,4 +931,4 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 
 > 本文是 Git MCP Server 的实现依据。按 §10 里程碑（GM1–GM6）推进；
 > 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
-> **GM1 已完成（2026-10-13），实现记录见 §14.1；GM2 待评审确认后启动。**
+> **GM1–GM2 已完成（2026-10-13），实现记录见 §14.1；GM3 待评审确认后启动。**

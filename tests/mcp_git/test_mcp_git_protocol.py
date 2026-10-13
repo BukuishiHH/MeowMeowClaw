@@ -24,6 +24,7 @@ from meowmeowclaw_mcp_git import __version__  # noqa: E402
 from meowmeowclaw_mcp_git.app import GitMcpApp  # noqa: E402
 from meowmeowclaw_mcp_git.config import ServerConfig  # noqa: E402
 from meowmeowclaw_mcp_git.server import SERVER_NAME, build_server  # noqa: E402
+from meowmeowclaw_mcp_git.tools import build_read_tools  # noqa: E402
 from meowmeowclaw_mcp_git.tools.base import LEVEL_READ, LEVEL_WRITE, ToolOutcome, ToolSpec  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -59,7 +60,7 @@ class TestInProcessProtocol:
 
         assert info.serverInfo.name == SERVER_NAME
         assert info.serverInfo.version == __version__
-        assert [tool.name for tool in tools.tools] == ["git_status"]
+        assert [tool.name for tool in tools.tools] == [spec.name for spec in build_read_tools()]
         schema = tools.tools[0].inputSchema
         assert schema["type"] == "object"
         assert set(schema["properties"]) == {"repo", "short"}
@@ -134,7 +135,7 @@ class TestStdioProcess:
                 tools = await session.list_tools()
                 result = await session.call_tool("git_status", {})
 
-        assert [tool.name for tool in tools.tools] == ["git_status"]
+        assert [tool.name for tool in tools.tools] == [spec.name for spec in build_read_tools()]
         payload = json.loads(result.content[0].text)
         assert payload["ok"] is True
         assert payload["meta"]["repo"] == repo.name

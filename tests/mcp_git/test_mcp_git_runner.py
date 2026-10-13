@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from meowmeowclaw_mcp_git.errors import InvalidArgumentError
+from meowmeowclaw_mcp_git.errors import InvalidArgumentError, OutputTruncatedError
 from meowmeowclaw_mcp_git.runner import (
     CommandTimeoutError,
     GitCommandError,
@@ -169,3 +169,51 @@ class TestEnvironment:
 
         assert isinstance(result.stdout, bytes)
         assert isinstance(result.stderr, bytes)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell 脚本")
+class TestStreamingTruncation:
+    """GM2: 边读边截断 + 早停(大输出不读进内存, T7/§5.4)."""
+
+    def fake_git(self, tmp_path: Path, body: str) -> str:
+        script = tmp_path / "fake-git"
+        script.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        script.chmod(0o755)
+        return str(script)
+
+    def test_large_output_is_capped_and_stops_early(self, tmp_path: Path):
+        big = self.fake_git(
+            tmp_path,
+            "i=0\nwhile [ $i -lt 500000 ]; do printf 'x'; i=$((i+1)); done",
+        )
+        runner = GitRunner(git_binary=big, max_output_bytes=1000)
+        started = time.monotonic()
+
+        result = runner.run(["log"], cwd=tmp_path)
+
+        assert result.truncated is True
+        assert len(result.stdout) == 1000  # 只保留前 1000 字节
+        assert result.stdout_total_bytes > 1000  # 完整尺寸仍被记录
+        assert result.timed_out is False
+        assert time.monotonic() - started < 30  # 没有等 500KB 全部写完
+
+    def test_check_true_raises_output_truncated(self, tmp_path: Path):
+        big = self.fake_git(
+            tmp_path,
+            "i=0\nwhile [ $i -lt 500000 ]; do printf 'x'; i=$((i+1)); done",
+        )
+        runner = GitRunner(git_binary=big, max_output_bytes=500)
+
+        with pytest.raises(OutputTruncatedError) as excinfo:
+            runner.run(["log"], cwd=tmp_path, check=True)
+
+        assert excinfo.value.code == "output_truncated"
+
+    def test_small_output_is_not_truncated(self, tmp_path: Path):
+        small = self.fake_git(tmp_path, "printf 'hello'")
+
+        result = GitRunner(git_binary=small, max_output_bytes=1000).run(["log"], cwd=tmp_path)
+
+        assert result.truncated is False
+        assert result.stdout == b"hello"
+        assert result.stdout_total_bytes == 5

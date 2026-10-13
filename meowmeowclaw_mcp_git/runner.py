@@ -4,7 +4,8 @@
   ``git --no-pager -C <repo_path> <subcommand> [args...]``;
 - 统一环境清洗: 防分页/防弹编辑器/防凭证卡死/固定 ``LC_ALL=C``;
 - 硬超时: 超时后杀进程组(POSIX ``killpg`` / Windows ``taskkill`` 兜底);
-- 输出上限: 超出 ``max_output_bytes`` 截断并标记 ``truncated``;
+- 输出上限: 边读边计数, 只保留前 ``max_output_bytes`` 字节; 超限立即终止进程组
+  并标记 ``truncated``(GM2 起, 避免大 diff/log 撑爆内存, T7);
 - 非零退出**默认不抛异常**, 由工具层决定映射为哪个错误码(``check=True`` 可切换)。
 
 本模块不 import MCP SDK, 可独立单测。
@@ -15,15 +16,24 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from .errors import ERROR_COMMAND_FAILED, ERROR_COMMAND_TIMEOUT, GitMcpError, InvalidArgumentError
+from .errors import (
+    ERROR_COMMAND_FAILED,
+    ERROR_COMMAND_TIMEOUT,
+    GitMcpError,
+    InvalidArgumentError,
+    OutputTruncatedError,
+)
 
 GIT_BINARY = "git"
 _TEXT_ENCODING = "utf-8"
 _STDERR_SUMMARY_CHARS = 400
+_READ_CHUNK_BYTES = 65_536
+_READER_JOIN_SECONDS = 5.0
 
 
 def build_git_env(environ: Optional[Mapping[str, str]] = None) -> dict[str, str]:
@@ -190,17 +200,28 @@ class GitRunner:
             start_new_session=os.name == "posix",
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,  # type: ignore[attr-defined]
         )
+        # 边读边截断: 每个流最多保留 cap 字节, 超限即杀进程组(不把大输出读进内存)
+        stdout_reader = _BoundedReader(process.stdout, cap, process=process)
+        stderr_reader = _BoundedReader(process.stderr, cap, process=process)
+        stdout_reader.start()
+        stderr_reader.start()
         timed_out = False
         try:
-            raw_stdout, raw_stderr = process.communicate(timeout=effective_timeout)
+            process.wait(timeout=effective_timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_process_group(process)
-            raw_stdout, raw_stderr = process.communicate()
+            try:
+                process.wait(timeout=_READER_JOIN_SECONDS)
+            except subprocess.TimeoutExpired:  # pragma: no cover - 极端情况兜底
+                pass
+        stdout_reader.join(_READER_JOIN_SECONDS)
+        stderr_reader.join(_READER_JOIN_SECONDS)
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
-        stdout_total, stderr_total = len(raw_stdout), len(raw_stderr)
-        truncated = stdout_total > cap or stderr_total > cap
+        raw_stdout, raw_stderr = stdout_reader.data, stderr_reader.data
+        stdout_total, stderr_total = stdout_reader.total, stderr_reader.total
+        truncated = stdout_reader.limit_hit or stderr_reader.limit_hit or stdout_total > cap or stderr_total > cap
         result = GitResult(
             command=tuple(command),
             cwd=os.fspath(cwd),
@@ -216,6 +237,12 @@ class GitRunner:
         if check:
             if result.timed_out:
                 raise CommandTimeoutError(result, timeout_seconds=effective_timeout)
+            if result.truncated:
+                # 超限时我们主动终止了进程组, exit_code=-9 不代表 git 失败
+                raise OutputTruncatedError(
+                    f"git 输出超过 {cap} 字节上限(已截断并终止): {' '.join(command)}",
+                    meta=result.meta(),
+                )
             if result.exit_code != 0:
                 raise GitCommandError(result)
         return result
@@ -230,6 +257,49 @@ class GitRunner:
     ) -> str:
         """便捷方法: 执行并返回 stdout 文本(默认非零即抛)."""
         return self.run(args, cwd=cwd, check=check, **kwargs).stdout_text()
+
+
+class _BoundedReader(threading.Thread):
+    """读取子进程管道, 最多保留 ``cap`` 字节; 超限时终止进程组(协作式早停).
+
+    - 内存有界: 超出上限的数据边读边丢, 不会把 GB 级 diff 读进内存(T7/§5.4);
+    - 早停: 超过上限立刻杀进程组, 避免继续生产无用输出;
+    - ``total`` 记录完整字节数(用于 meta/诊断), ``data`` 只保留前 cap 字节。
+    """
+
+    def __init__(self, stream: Any, cap: int, *, process: subprocess.Popen[bytes]) -> None:
+        super().__init__(daemon=True)
+        self._stream = stream
+        self._cap = cap
+        self._process = process
+        self.data: bytes = b""
+        self.total: int = 0
+        self.limit_hit: bool = False
+
+    def run(self) -> None:  # pragma: no cover - 线程体, 由 run() 的集成用例覆盖
+        chunks: list[bytes] = []
+        kept = 0
+        total = 0
+        try:
+            while True:
+                chunk = self._stream.read(_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if kept < self._cap:
+                    take = min(self._cap - kept, len(chunk))
+                    chunks.append(chunk[:take])
+                    kept += take
+                if total > self._cap and not self.limit_hit:
+                    self.limit_hit = True
+                    if self._process.poll() is None:
+                        _kill_process_group(self._process)
+        except (OSError, ValueError):
+            # 进程被杀/管道关闭属预期路径
+            pass
+        finally:
+            self.data = b"".join(chunks)
+            self.total = total
 
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:

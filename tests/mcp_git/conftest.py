@@ -107,3 +107,44 @@ def config_for() -> Callable[..., Any]:
         return ServerConfig(roots=tuple(roots), repos=repos, **overrides)
 
     return _make
+
+
+@pytest.fixture
+def history_repo(tmp_path: Path, git: Callable[..., Any]) -> Path:
+    """多提交/多分支/多 tag/多文件的仓库(GM2 工具测试通用 fixture).
+
+    内容约定(供断言使用):
+
+    - ``app.py`` 初次为 ``print("hello")``, 最后一个提交改为 ``print("hello world")``;
+    - ``bin.dat`` 含 NUL(二进制); ``data/中文.txt`` UTF-8; ``data/gbk.txt`` GB18030;
+    - tag: 轻量 ``v0.1`` + 附注 ``v0.2``; 分支: ``main`` + ``feature/login``;
+    - 远端由需要的用例自行用 ``remote_setup`` 或 ``git remote add`` 构造。
+    """
+    repo = tmp_path / "history-repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "Alice")
+    git(repo, "config", "user.email", "alice@example.com")
+    git(repo, "config", "commit.gpgsign", "false")
+
+    (repo / "app.py").write_text('def main():\n    print("hello")\n', encoding="utf-8")
+    (repo / "README.md").write_text("hello repo\n", encoding="utf-8")
+    (repo / "bin.dat").write_bytes(b"binary\x00payload\n")
+    (repo / "data").mkdir()
+    (repo / "data" / "中文.txt").write_text("你好, 世界\n", encoding="utf-8")
+    (repo / "data" / "gbk.txt").write_bytes("你好, 世界\n".encode("gb18030"))
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "feat: initial commit")
+    git(repo, "tag", "v0.1")
+    git(repo, "tag", "-a", "v0.2", "-m", "release v0.2")
+
+    git(repo, "checkout", "-q", "-b", "feature/login")
+    (repo / "login.py").write_text("def login(user):\n    return user is not None\n", encoding="utf-8")
+    git(repo, "add", "login.py")
+    git(repo, "commit", "-qm", "feat: add login")
+
+    git(repo, "checkout", "-q", "main")
+    (repo / "app.py").write_text('def main():\n    print("hello world")\n', encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "fix: update greeting")
+    return repo

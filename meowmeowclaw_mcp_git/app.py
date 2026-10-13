@@ -18,9 +18,10 @@ from typing import Any, Iterable, Optional, Sequence
 
 from .config import ServerConfig
 from .envelope import dumps, failure, ok
-from .errors import ERROR_INTERNAL, ERROR_INVALID_ARGUMENT, GitMcpError
+from .errors import ERROR_INTERNAL, ERROR_INVALID_ARGUMENT, ERROR_OUTPUT_TRUNCATED, GitMcpError
 from .registry import RepoRegistry
 from .runner import GitRunner
+from .tools import build_read_tools
 from .tools.base import (
     LEVEL_DESTRUCTIVE,
     LEVEL_READ,
@@ -30,7 +31,6 @@ from .tools.base import (
     ToolOutcome,
     ToolSpec,
 )
-from .tools.read import build_read_tools
 from .validation import validate_arguments
 
 logger = logging.getLogger("meowmeowclaw_mcp_git")
@@ -118,4 +118,25 @@ class GitMcpApp:
         except Exception as exc:  # noqa: BLE001 - 兜底: 不把未处理异常泄漏给协议层
             self.logger.exception("工具 %s 内部错误", name)
             return dumps(failure(ERROR_INTERNAL, f"内部错误: {exc!r}"))
-        return dumps(ok(outcome.data, outcome.meta))
+        return self._dump_success(name, outcome)
+
+    def _dump_success(self, name: str, outcome: ToolOutcome) -> str:
+        """序列化成功信封, 并对最终输出做一次硬上限兜底(§3.1/G3).
+
+        工具自身已按预算裁剪文本/列表; 这里是最后一道保险: 若信封仍超过
+        ``--max-output-bytes``, 返回 ``output_truncated`` 错误而不是把巨型 JSON
+        塞给模型(错误信封不参与该检查, 消息本身有界)。
+        """
+        text = dumps(ok(outcome.data, outcome.meta))
+        size = len(text.encode("utf-8"))
+        if size <= self.config.max_output_bytes:
+            return text
+        self.logger.warning("工具 %s 输出 %d 字节, 超过上限 %d", name, size, self.config.max_output_bytes)
+        return dumps(
+            failure(
+                ERROR_OUTPUT_TRUNCATED,
+                f"工具输出 {size} 字节, 超过 --max-output-bytes={self.config.max_output_bytes}; "
+                "请缩小查询范围(如 max_count/paths/max_bytes)后重试",
+                {"size_bytes": size, "limit_bytes": self.config.max_output_bytes},
+            )
+        )

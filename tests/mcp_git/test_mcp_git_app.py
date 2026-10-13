@@ -66,13 +66,23 @@ class TestToolSelection:
 
 
 class TestAppWiring:
-    def test_default_app_registers_only_read_tools(self, repo: Path):
+    def test_default_app_registers_all_read_tools(self, repo: Path):
+        from meowmeowclaw_mcp_git.tools import build_read_tools
+
         app = GitMcpApp(ServerConfig(roots=(str(repo),)))
 
-        assert app.tool_names() == ("git_status",)
+        assert app.tool_names() == tuple(spec.name for spec in build_read_tools())
+        assert len(app.tool_names()) == 13
         definitions = app.tool_definitions()
         assert definitions[0]["name"] == "git_status"
         assert definitions[0]["inputSchema"]["properties"]["repo"]["type"] == "string"
+        assert {item["name"] for item in definitions} >= {
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_grep",
+            "git_config_get",
+        }
 
     def test_write_spec_not_registered_in_read_only_mode(self, repo: Path):
         app = GitMcpApp(
@@ -135,3 +145,36 @@ class TestEnvelope:
         assert "\n" not in text
         assert '"error_code":"repo_not_found"' in text
         assert "未知仓库" in text  # 中文不转义, 便于模型阅读
+
+
+class TestOutputBackstop:
+    """GM2: 工具自身预算之外, app 层对最终信封再做一次硬上限兜底(§3.1/G3)."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_success_output_becomes_output_truncated(self, history_repo: Path):
+        app = GitMcpApp(ServerConfig(roots=(str(history_repo),), max_output_bytes=400))
+
+        payload = json.loads(await app.call_tool("git_log", {}))
+
+        assert payload["ok"] is False
+        assert payload["error_code"] == "output_truncated"
+        assert payload["meta"]["size_bytes"] > 400
+        assert payload["meta"]["limit_bytes"] == 400
+
+    @pytest.mark.asyncio
+    async def test_normal_output_under_limit_passes(self, history_repo: Path):
+        app = GitMcpApp(ServerConfig(roots=(str(history_repo),), max_output_bytes=100_000))
+
+        payload = json.loads(await app.call_tool("git_log", {}))
+
+        assert payload["ok"] is True
+        assert payload["data"]["count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_error_envelope_is_not_replaced_by_backstop(self, history_repo: Path):
+        app = GitMcpApp(ServerConfig(roots=(str(history_repo),), max_output_bytes=50))
+
+        payload = json.loads(await app.call_tool("git_log", {"repo": "ghost"}))
+
+        assert payload["ok"] is False
+        assert payload["error_code"] == "repo_not_found"

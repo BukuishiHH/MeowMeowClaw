@@ -38,6 +38,9 @@ DEFAULT_MAX_ITERATIONS = 32
 # (120k 中文字符 ≈ 60k token, 可触达默认 48000 输入预算, 使 L1 摘要可用)
 DEFAULT_MEMORY_MAX_TURNS = 50
 DEFAULT_MEMORY_MAX_CHARS = 120_000
+# A+ A4/A5: 会话运行时缓存(agent + lock)的容量与空闲 TTL
+DEFAULT_MEMORY_MAX_CACHED_SESSIONS = 256
+DEFAULT_MEMORY_CACHE_IDLE_SECONDS = 0.0
 
 # 上下文 token 压缩默认值(设计见 docs/CONTEXT_COMPRESSION_DESIGN.md §8)
 DEFAULT_COMPRESSION_ENABLED = True
@@ -97,6 +100,14 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "memory_dir": ("memory_dir", "memory_path", "session_dir"),
     "memory_max_turns": ("memory_max_turns", "history_max_turns"),
     "memory_max_chars": ("memory_max_chars", "history_max_chars"),
+    "memory_max_cached_sessions": (
+        "memory_max_cached_sessions",
+        "max_cached_sessions",
+    ),
+    "memory_cache_idle_seconds": (
+        "memory_cache_idle_seconds",
+        "cache_idle_seconds",
+    ),
     "compression_enabled": ("compression_enabled",),
     "token_budget": ("token_budget",),
     "tokenizer": ("tokenizer",),
@@ -197,6 +208,17 @@ def _resolve_positive_int(value: Optional[str], default: int, name: str) -> int:
         logger.warning("%s 必须为正整数(%r), 回退默认值 %d", name, value, default)
         return default
     return num
+
+
+def _resolve_session_cache_size(value: Optional[str], default: int, name: str) -> int:
+    """解析会话运行时缓存上限(A4): 任意整数合法, <=0 表示不限制; 非法回退默认."""
+    if value is None:
+        return default
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("%s 不是整数(%r), 回退默认值 %d", name, value, default)
+        return default
 
 
 def _resolve_bool(value: Optional[str], default: bool, name: str) -> bool:
@@ -360,6 +382,9 @@ class Settings:
     memory_dir: Path = DEFAULT_WORKSPACE / "memory"
     memory_max_turns: int = DEFAULT_MEMORY_MAX_TURNS
     memory_max_chars: int = DEFAULT_MEMORY_MAX_CHARS
+    # A+ A4/A5: 会话运行时(agent + lock)缓存容量与空闲 TTL
+    memory_max_cached_sessions: int = DEFAULT_MEMORY_MAX_CACHED_SESSIONS
+    memory_cache_idle_seconds: float = DEFAULT_MEMORY_CACHE_IDLE_SECONDS
     # 上下文 token 压缩(§8)
     compression_enabled: bool = DEFAULT_COMPRESSION_ENABLED
     token_budget: int = DEFAULT_TOKEN_BUDGET
@@ -414,6 +439,8 @@ class Settings:
             f"workspace={str(self.workspace)!r}, max_iterations={self.max_iterations}, "
             f"memory_dir={str(self.memory_dir)!r}, memory_max_turns={self.memory_max_turns}, "
             f"memory_max_chars={self.memory_max_chars}, "
+            f"memory_max_cached_sessions={self.memory_max_cached_sessions}, "
+            f"memory_cache_idle_seconds={self.memory_cache_idle_seconds}, "
             f"compression_enabled={self.compression_enabled}, token_budget={self.token_budget}, "
             f"tokenizer={self.tokenizer!r}, hf_tokenizer_path={self.hf_tokenizer_path!r}, "
             f"keep_recent_turns={self.keep_recent_turns}, summary_model={self.summary_model!r}, "
@@ -484,6 +511,16 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             _get(raw, *_KEY_ALIASES["memory_max_chars"]),
             DEFAULT_MEMORY_MAX_CHARS,
             "memory_max_chars",
+        ),
+        memory_max_cached_sessions=_resolve_session_cache_size(
+            _get(raw, *_KEY_ALIASES["memory_max_cached_sessions"]),
+            DEFAULT_MEMORY_MAX_CACHED_SESSIONS,
+            "memory_max_cached_sessions",
+        ),
+        memory_cache_idle_seconds=_resolve_non_negative_float(
+            _get(raw, *_KEY_ALIASES["memory_cache_idle_seconds"]),
+            DEFAULT_MEMORY_CACHE_IDLE_SECONDS,
+            "memory_cache_idle_seconds",
         ),
         compression_enabled=_resolve_bool(
             _get(raw, *_KEY_ALIASES["compression_enabled"]),

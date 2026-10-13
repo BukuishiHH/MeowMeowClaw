@@ -175,10 +175,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     checked = [deviation for _, _, _, deviation in results if deviation == deviation]  # 非 NaN
     if checked:
         worst = max(abs(value) for value in checked)
+        worst_positive = max(checked)  # 负偏差 = 提速, 不应触发告警
         if worst <= 20.0:
             verdict = "✅ 与 §2.1 基线一致(±20% 内)"
-        elif all(value <= 0 for value in checked):
-            verdict = "✅ 显著优于 §2.1 基线(A+ 尾读生效, 负偏差为提速)"
+        elif worst_positive <= 20.0:
+            verdict = "✅ 整体优于 §2.1 基线(小文件持平, 长会话显著提速)"
         else:
             verdict = "⚠️ 与 §2.1 偏差 >20%, 请确认机器负载"
         print()

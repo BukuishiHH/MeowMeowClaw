@@ -195,6 +195,8 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         agent_factory,
         max_turns=config.memory_max_turns,
         max_chars=config.memory_max_chars,
+        max_cached_sessions=config.memory_max_cached_sessions,
+        cache_idle_seconds=config.memory_cache_idle_seconds,
     )
 
     application = Application(

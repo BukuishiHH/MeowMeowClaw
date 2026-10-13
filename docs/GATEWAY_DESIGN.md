@@ -556,7 +556,7 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 
 ### 15.8 A+ 中间路线（现在可做，低成本）
 
-> 详细设计、接口、阶段与验收见 **`docs/A_PLUS_OPTIMIZATION.md`**（已确认，待实现）。
+> 详细设计、接口、阶段与验收见 **`docs/A_PLUS_OPTIMIZATION.md`**；**A1–A5 已落地（2026-10-12）**，实施记录见该文 §8，接入小结见 §16.7。
 
 1. **把装载从 O(总会话长度) 降到 O(窗口)**：JSONL 尾部读取或按 turn 维护 offset 索引，避免每次全文件解析
    ——这是 A 当前最大性能短板，修好后多数场景无需 B；
@@ -642,8 +642,9 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 - 流式输出后续项（`qq_stream_mode=block` 的观感调参、群聊/多模态流式）见
   `docs/STREAMING_DESIGN.md` §12.3 / §16.5；
 - QQ 群聊策略与多模态（图片/语音）；正向 WS 模式的真实 NapCat 冒烟（代码已实现，当前真机用的是反向）；
-- A+（会话运行时生命周期 API 与 JSONL 尾读优化）设计已确认，实施排期见 `docs/A_PLUS_OPTIMIZATION.md`；
-  在当前文档中按既定约定于网关整体功能完成后启动。
+- A+（会话运行时生命周期 API 与 JSONL 尾读优化）**已落地 A1–A5（2026-10-12）**：JSONL 尾读/窗口装载 O(窗口)、
+  `close_session / evict_idle / max_cached_sessions / memory_cache_idle_seconds`、归档/轮换/关停释放钩子与观测指标；
+  详见 `docs/A_PLUS_OPTIMIZATION.md` §8 与本文 §16.7。
 
 ### 16.6 流式输出接入（S1–S5.1，2026-10-12）
 
@@ -657,3 +658,18 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
 - 实测：722 字 → `[137,159,148,125,145]`（5 条，极差 34）、288 字 → `[144,142]`；
   与模型吐字节奏无关；全量回归 1244 passed。
 - 详见 `docs/STREAMING_DESIGN.md`。
+
+### 16.7 A+ 接入小结（A1–A5，2026-10-13）
+
+- **配置**：`memory_max_cached_sessions=256`（<=0 不限制）、`memory_cache_idle_seconds=0`（0 关闭自动 TTL），
+  由 `bootstrap.build_application()` 透传到 `ConversationService`（`.env.example` / README 已同步）；
+- **JSONL 尾读/窗口**：`get_meta / append_turn / list_sessions` 走尾读；`load_recent` 反向块读 + 窗口裁剪，
+  2000 轮 p95 1.66ms、50→2000 轮 p95 差值 0.23ms（详见 `docs/A_PLUS_OPTIMIZATION.md` §8.3/§8.5）；
+- **生命周期**：`_SessionRuntime(agent + lock + refcount)`；`close_session` / `evict_idle` / 容量 LRU / TTL；
+  归档、purge、QQ 轮换、CLI `/new`·`/clear` 与进程关停均触发释放，且只淘汰 `refcount == 0` 的运行时；
+- **观测**：`ConversationService.stats()`（`cached_agents / locks / evictions / store / rss_mb`）
+  与 `JsonlSessionStore.stats()`；
+- **验证**：全量回归 1556 passed / 6 skipped / 2 xfailed；真实进程 CLI 冒烟（本地假 OpenAI 兼容端点，
+  管道输入 + `/exit`，回答与 JSONL 落盘正常）；QQ 进程级冒烟（真实 `python -m meowmeowclaw.qq` +
+  假 NapCat：`/help` 经 WS 往返、SIGINT 优雅关闭、端口释放；当前环境无真机 NapCat，W5 真机链路见 §16.4）；
+- 详细实现记录见 `docs/A_PLUS_OPTIMIZATION.md` §8。

@@ -1,7 +1,7 @@
 # MeowMeowClaw A+ 优化设计：会话 IO 尾读与运行时生命周期（v1）
 
-> 状态：**A1–A4 已完成（2026-10-12），A5 待实现**。本文只定义 A+ 的行为、接口、阶段与验收，
-> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1–§8.4。
+> 状态：**A1–A5 已完成（2026-10-13）**。本文只定义 A+ 的行为、接口、阶段与验收，
+> **不改 JSONL 文件格式、不改 AgentLoop/压缩语义**；实现按 §5 阶段推进，记录见 §8.1–§8.5。
 > 关联：`docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5、`meowmeowclaw/memory/jsonl.py`、
 > `meowmeowclaw/conversation.py`、`meowmeowclaw/bootstrap.py`。
 
@@ -298,12 +298,12 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 - [x] A2：`get_meta/append_turn/list_sessions` 尾读路径通过全部契约与崩溃恢复用例（实测 O(1)，见 §8.2）；
 - [x] A3：2000 轮 `load_recent` p95 ≤3ms 且平坦；差分测试通过（实测 p95 1.57ms、50→2000 差值 0.09ms，见 §8.3）；
 - [x] A4：`close_session/evict_idle/max_cached_sessions` 可用；归档/轮换/关停可释放；无并发回归（实测生命周期用例全绿，见 §8.4）；
-- [ ] A5：配置/README/ADR 同步；全量回归 + 真实 CLI/QQ 冒烟通过；
-- [ ] 更新 `docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5 与本文"实现记录"。
+- [x] A5：配置/README/ADR 同步；全量回归 + 进程级 CLI/QQ 冒烟通过（CLI 用本地假 OpenAI 兼容端点，QQ 用假 NapCat；见 §8.5）；
+- [x] 更新 `docs/GATEWAY_DESIGN.md` ADR-1 §15.8/§16.5 与本文"实现记录"。
 
 ---
 
-## 8. 实施状态（待更新）
+## 8. 实施状态（A1–A5 已完成）
 
 | 阶段 | 状态 | 提交 | 备注 |
 |---|---|---|---|
@@ -311,7 +311,7 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 | A2 | 已完成 | `2fd8cd1` | 尾读工具 + 三路径改造；新增 37 用例；2000 轮 `get_meta` p95 0.53ms |
 | A3 | 已完成 | `bf90797` | `load_recent` 反向块读 + 窗口裁剪；新增 212 用例；2000 轮 p95 1.57ms、50→2000 差值 0.09ms |
 | A4 | 已完成 | `c015089` | `_SessionRuntime` + refcount + 生命周期 API；新增 22 用例；归档/轮换/关停均释放 |
-| A5 | 待实现 | — | 依赖 A3+A4 |
+| A5 | 已完成 | 待回填 | 配置透传 + README/ADR 同步；新增 13 用例；基准复测 + CLI/QQ 冒烟通过 |
 
 ### 8.1 A1 实现记录（2026-10-12）
 
@@ -446,3 +446,55 @@ def stats(self) -> dict[str, Any]: ...   # 见 3.1
 - 生命周期用例覆盖：`close_session`（idle/busy/重复）、refcount 排队不变量、`evict_idle`（显式 0/TTL/在途跳过）、自动 TTL、LRU 容量与无限容量、归档/删除/在途归档/关停释放、非法输入；
 - 渠道钩子用例覆盖 CLI `/new`/`/clear`、QQ `/new`/`/clear`/超时轮换，切走后 `cached_agents` 归零；
 - A5 待办：`memory_max_cached_sessions` / `memory_cache_idle_seconds` 配置键透传 bootstrap、README/ADR 同步与真实 CLI/QQ 冒烟。
+
+### 8.5 A5 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/config.py` | 新增 `DEFAULT_MEMORY_MAX_CACHED_SESSIONS=256` / `DEFAULT_MEMORY_CACHE_IDLE_SECONDS=0`；`memory_max_cached_sessions`（任意整数，`<=0` 不限制）与 `memory_cache_idle_seconds`（非负浮点，`0` 关闭自动 TTL）解析、别名与 `Settings` 字段/`repr` |
+| `meowmeowclaw/bootstrap.py` | `build_application()` 把两个配置透传给 `ConversationService(max_cached_sessions=..., cache_idle_seconds=...)` |
+| `.env.example` | 新增「会话运行时缓存」小节与两个键的默认值/语义注释 |
+| `README.md` | 配置表新增两项 + 会话运行时缓存说明；代码规模/测试清单/Roadmap 更新 |
+| `docs/GATEWAY_DESIGN.md` | §15.8 标注 A1–A5 已落地；§16.5 待后续项更新；新增 §16.7 A+ 接入小结 |
+| `scripts/bench_session_store.py` | 基线判定修正：负偏差视为提速，不再因"小文件持平 + 长会话大幅领先"误报 >20% |
+| `tests/test_config.py` / `test_bootstrap.py` | 新增 13 个用例（默认值/取值/非法兜底/别名/`repr`、装配透传） |
+
+**配置语义**
+
+- `memory_max_cached_sessions`（默认 `256`）：任意整数合法，`<=0` 由 `ConversationService` 视为不限制；非法值 warning 后回退 `256`；
+- `memory_cache_idle_seconds`（默认 `0`）：非负浮点；`0` 关闭自动 TTL（仅容量 LRU + 显式 `evict_idle`）；负数/非数字 warning 后回退 `0`。
+
+**基准复测（同机 WSL2 / Python 3.11 / 20 次采样；窗口 `max_turns=50 / max_chars=120000`）**
+
+| 轮数 | 文件 | `load_recent` avg/p95 (ms) | `get_meta` avg/p95 (ms) | `append_turn` avg/p95 (ms) | `list_sessions` avg/p95 (ms) | §2.1 基线偏差 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 0.36 MB | 1.10 / 1.43 | 0.31 / 0.39 | 0.89 / 1.02 | 0.32 / 0.41 | **-17%** |
+| 200 | 1.42 MB | 1.28 / 1.54 | 0.32 / 0.38 | 0.90 / 1.03 | 0.31 / 0.43 | **-68%** |
+| 500 | 3.56 MB | 1.27 / 1.57 | 0.32 / 0.41 | 1.00 / 1.16 | 0.34 / 0.40 | **-86%** |
+| 1000 | 7.12 MB | 1.35 / 1.90 | 0.34 / 0.45 | 0.98 / 1.17 | 0.35 / 0.43 | **-93%** |
+| 2000 | 14.23 MB | **1.25 / 1.66** | **0.35 / 0.55** | **0.99 / 1.24** | **0.36 / 0.44** | **-97%** |
+
+- **G1/G2/G3 复测达标**：2000 轮 `load_recent` p95 1.66ms（≤3ms）、`get_meta` p95 0.55ms、`append_turn` p95 1.24ms、`list_sessions` p95 0.44ms；
+- 50→2000 轮 `load_recent` p95 差值 **0.23ms**（≤2ms），文件线性增长不再影响窗口读取；
+- 复现命令：`python scripts/bench_session_store.py`。
+
+**进程级冒烟记录（2026-10-13）**
+
+1. **CLI（真实进程 + 本地假 OpenAI 兼容端点）**
+   - 隔离 `workspace/memory`，`GATEWAY_ENABLED=false`，`MEMORY_MAX_CACHED_SESSIONS=2`，`MEMORY_CACHE_IDLE_SECONDS=0`；
+   - 管道输入「你好 → /exit」：进程退出码 `0`，控制台输出完整 banner/启动信息/工具列表与回答
+     `A5 CLI 冒烟回答: 喵`，`sessions/*.jsonl` 落盘 1 条 turn / 2 条 message；
+   - 用途：验证 `.env` → `Settings` → `bootstrap` → 直连 REPL → JSONL 全链路。
+2. **QQ（真实 `python -m meowmeowclaw.qq` + 假 NapCat/OneBot11 WS）**
+   - `GATEWAY_ENABLED=true`、`QQ_WS_MODE=reverse`、临时端口 + Token，`MEMORY_MAX_CACHED_SESSIONS=2`、`MEMORY_CACHE_IDLE_SECONDS=0`；
+   - 假 NapCat 连入后发送 `/help`，成功收到 `send_private_msg` 的完整帮助文本（`可用命令: ...`）；
+   - SIGINT 后进程退出码 `0`，日志出现 `已停止, 再见喵!`，监听端口释放、可用 `SO_REUSEADDR` 重新 bind；
+   - 说明：当前环境无真机 NapCat，本项为**进程级传输冒烟**；真实 NapCat 链路记录见 `docs/GATEWAY_DESIGN.md` §16.4（W5）。
+
+**验证**
+
+- 全量回归 **1556 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 配置用例覆盖默认值、显式取值、`0/负数` 不限制、非法值回退、别名、`repr`、bootstrap 透传；
+- A+ 里程碑 A1–A5 全部落地；JSONL 仍是唯一事实源，淘汰只丢进程内辅助状态。

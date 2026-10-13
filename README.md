@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 49 个源码模块 / 约 11000 行; 测试 52 个文件 / **1551 个用例**(1543 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 49 个源码模块 / 约 11000 行; 测试 52 个文件 / **1564 个用例**(1556 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -50,6 +50,8 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `memory_dir` | `<workspace>/memory` | 记忆存储目录; 留空取默认; 相对路径按项目根解析 |
 | `memory_max_turns` | `50` | 装载历史窗口的轮数上限; 非法或 <=0 回退默认 |
 | `memory_max_chars` | `120000` | 装载历史窗口的字符上限(≈60k 中文 token); 非法或 <=0 回退默认 |
+| `memory_max_cached_sessions` | `256` | 会话运行时(AgentLoop + 串行锁)缓存上限; `<=0` 不限制, 超限按 LRU 淘汰空闲会话 |
+| `memory_cache_idle_seconds` | `0` | 空闲会话运行时自动淘汰秒数; `0` 关闭自动 TTL(仅容量 LRU + 显式清理) |
 | `compression_enabled` | `true` | 上下文 Token 压缩总开关; `false` 时只按轮数/字符窗口装载历史 |
 | `token_budget` | `48000` | 输入 Token 预算(估算 × 1.1 后比较); 超预算触发摘要/硬裁/工具占位 |
 | `tokenizer` | `auto` | `auto` / `heuristic` / `tiktoken[:encoding]` / `hf` |
@@ -86,6 +88,11 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `qq_stream_flush_interval` | `0.3` | 收尾补发块之间的间隔(秒) |
 | `stream_suppress_tool_preamble` | `true` | 工具轮"前导文本"抑制(缓冲+宽限), `false`=过程旁白也发 |
 | `stream_preamble_grace_ms` / `_chars` | `1500` / `40` | 前导抑制的宽限窗口(毫秒 / 字符) |
+
+**会话运行时缓存(A+ A4/A5)**: 每个会话在内存中缓存一个 `AgentLoop` + 串行锁, 保证同会话串行且工具护栏/摘要缓存跨轮复用。
+`memory_max_cached_sessions` 控制容量, 超限时按 LRU 淘汰最久未使用的**空闲**会话; `memory_cache_idle_seconds` 控制空闲
+自动淘汰(`0` 关闭)。在途 turn 通过引用计数保护, 永不换锁/淘汰; `/clear`、purge、QQ 轮换、CLI `/new`·`/clear`
+与进程关停会立即释放。淘汰只丢进程内辅助状态, JSONL 仍是唯一事实源。观测入口: `ConversationService.stats()`。
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
 
@@ -250,7 +257,7 @@ qq_stream_mode=typing        # off | typing | block
 
 | 模块 | 行数 | 职责 | 关键 API |
 | --- | ---: | --- | --- |
-| `meowmeowclaw/config.py` | 184 | 读 `.env`、校验兜底, 纯解析不产生副作用 | `load_config()` / `Settings` |
+| `meowmeowclaw/config.py` | 684 | 读 `.env`、校验兜底, 纯解析不产生副作用; 含记忆窗口与会话运行时缓存(A4/A5)配置 | `load_config()` / `Settings` |
 | `meowmeowclaw/paths.py` | 40 | 项目根 / `.env` / workspace / 人设路径的唯一来源 | `PROJECT_ROOT` / `resolve_workspace()` / `IDENTITY_FILE` |
 | `meowmeowclaw/llm/base.py` | 104 | LLM 接入抽象 + **统一数据契约** + 流式事件 | `LLMProvider.chat()` / `chat_stream()`、`StreamTextDelta` / `StreamFinal` |
 | `meowmeowclaw/llm/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
@@ -292,7 +299,7 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/gateway/worker.py` | 43 | Agent 执行器(包装 ConversationService) | `AgentWorker` |
 | `meowmeowclaw/gateway/dispatcher.py` | 193 | 单任务消费 + 策略路由 + 并发派发 | `GatewayDispatcher` |
 | `meowmeowclaw/gateway/gateway.py` | 153 | 组装、优雅启停、`stats()` 观测 | `Gateway` |
-| `meowmeowclaw/bootstrap.py` | 207 | **组合根**: 配置 -> Provider/工具/技能/记忆/Context/Loop + 可选 Gateway | `build_application()` / `build_gateway()` / `Application` |
+| `meowmeowclaw/bootstrap.py` | 214 | **组合根**: 配置 -> Provider/工具/技能/记忆/Context/Loop + 可选 Gateway; A5 透传运行时缓存配置 | `build_application()` / `build_gateway()` / `Application` |
 | `meowmeowclaw/cli.py` | 338 | **交付层**: banner / REPL; 网关开启时经 CliPolicy + CliAdapter; legacy 路径 /new /clear 同步释放运行时 | `main()` / `interactive_loop()` / `_run_gateway_repl()` |
 
 ### 3.1 契约先行, 实现可换
@@ -482,7 +489,7 @@ RUN_NETWORK_TESTS=1 pytest tests/ -m network -q     # 真实联网用例
 | **持久化 / 断点续跑** | 无内建(`_session_history` 在内存里) | 内建 checkpointer, 可从任意节点恢复 |
 | **人工审批(HITL)** | 需自行在循环里加确认步骤 | 一等公民: 中断/恢复 API |
 | **多 Agent 编排** | 需自己写调度(子 Agent 即另一个 `AgentLoop`) | 天然支持 supervisor / swarm 等拓扑 |
-| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 1045 用例) | 通常要驱动图运行时, 或按节点分别测 |
+| **测试方式** | 换掉 `LLMProvider` 一个替身即可跑全链路(本项目 1556 passed 用例) | 通常要驱动图运行时, 或按节点分别测 |
 | **调试体验** | 断点就在 `run()` 里, 栈短、易读易改 | 需要在框架抽象层之间跳转 |
 | **适合场景** | 单 Agent + 工具调用的主线业务; 想快速看懂/改控制流 | 复杂分支编排、长流程、需要暂停恢复与人工介入 |
 
@@ -532,7 +539,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 
 | 测试文件 | 用例 | 重点 |
 | --- | ---: | --- |
-| `test_bootstrap.py` | 16 | 装配(工具/技能/Context/Loop/网关)、ConfigError/SkillConfigError、导入边界 |
+| `test_bootstrap.py` | 17 | 装配(工具/技能/Context/Loop/网关/运行时缓存透传)、ConfigError/SkillConfigError、导入边界 |
 | `test_cli.py` | 26 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码、网关分流 |
 | `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
 | `channels/test_qq_policy.py` | 14 | QQ 策略: 身份/轮换/指令/跨渠道删除/A4 轮换释放运行时 |
@@ -569,7 +576,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `tools/test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
-| `test_config.py` | 57 | 取值优先级、路径/记忆目录解析、窗口配置、非法值兜底、密钥掩码 |
+| `test_config.py` | 147 | 取值优先级、路径/记忆目录解析、窗口/运行时缓存配置、非法值兜底、密钥掩码 |
 
 ---
 
@@ -583,7 +590,7 @@ MeowMeowClaw/
 │   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 52 个测试文件 / 1551 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 52 个测试文件 / 1564 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -643,7 +650,7 @@ MeowMeowClaw/
 
 ## 11. 已知限制与 Roadmap
 
-- A+（会话 IO 尾读 + 运行时生命周期 + 指标）已落地 **A1–A4**（指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口 / `_SessionRuntime` refcount·LRU·TTL 生命周期）；**A5**（配置透传、README/ADR 同步与真实冒烟）待实现，排期与验收见 `docs/A_PLUS_OPTIMIZATION.md`
+- A+（会话 IO 尾读 + 运行时生命周期 + 指标）**A1–A5 已全部落地（2026-10-13）**：指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口 / `_SessionRuntime` refcount·LRU·TTL 生命周期 / 配置透传与冒烟验收；设计与记录见 `docs/A_PLUS_OPTIMIZATION.md`，网关接入小结见 `docs/GATEWAY_DESIGN.md` §16.7
 - 流式输出已落地 **S1–S5.1**（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式，`stream_enabled` 默认 `false`）；里程碑、实测数据与验收见 `docs/STREAMING_DESIGN.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现

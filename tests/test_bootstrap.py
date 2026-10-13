@@ -177,8 +177,23 @@ class TestBuildApplication:
         assert app.context.memory_path == config.memory_dir / "MEMORY.md"
         assert app.conversation.max_turns == config.memory_max_turns
         assert app.conversation.max_chars == config.memory_max_chars
+        assert app.conversation.max_cached_sessions == config.memory_max_cached_sessions
+        assert app.conversation.cache_idle_seconds == config.memory_cache_idle_seconds
         # 默认关闭网关: 不构造, 行为与旧直连一致
         assert app.gateway is None
+
+    def test_memory_runtime_cache_config_is_passed_through(self, monkeypatch, tmp_path):
+        """A5: memory_max_cached_sessions / memory_cache_idle_seconds 必须透传到 ConversationService."""
+        config = make_settings(
+            workspace=tmp_path,
+            memory_max_cached_sessions=3,
+            memory_cache_idle_seconds=42.5,
+        )
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+        app = build_application()
+
+        assert app.conversation.max_cached_sessions == 3
+        assert app.conversation.cache_idle_seconds == 42.5
 
     def test_load_config_is_called_once(self, monkeypatch):
         loader = MagicMock(return_value=make_settings())

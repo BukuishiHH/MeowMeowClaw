@@ -26,6 +26,8 @@ from meowmeowclaw.config import (
     DEFAULT_HISTORY_LOG_ORIGINAL_CHARS,
     DEFAULT_KEEP_RECENT_TURNS,
     DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MEMORY_CACHE_IDLE_SECONDS,
+    DEFAULT_MEMORY_MAX_CACHED_SESSIONS,
     DEFAULT_MEMORY_MAX_CHARS,
     DEFAULT_MEMORY_MAX_TURNS,
     DEFAULT_MODEL,
@@ -94,6 +96,10 @@ ENV_KEYS = (
     "HISTORY_MAX_TURNS",
     "MEMORY_MAX_CHARS",
     "HISTORY_MAX_CHARS",
+    "MEMORY_MAX_CACHED_SESSIONS",
+    "MAX_CACHED_SESSIONS",
+    "MEMORY_CACHE_IDLE_SECONDS",
+    "CACHE_IDLE_SECONDS",
     "COMPRESSION_ENABLED",
     "TOKEN_BUDGET",
     "TOKENIZER",
@@ -358,6 +364,8 @@ class TestMemorySettings:
 
         assert s.memory_max_turns == DEFAULT_MEMORY_MAX_TURNS
         assert s.memory_max_chars == DEFAULT_MEMORY_MAX_CHARS
+        assert s.memory_max_cached_sessions == DEFAULT_MEMORY_MAX_CACHED_SESSIONS
+        assert s.memory_cache_idle_seconds == DEFAULT_MEMORY_CACHE_IDLE_SECONDS
 
     def test_memory_window_values(self, tmp_path):
         env = write_env(tmp_path, "memory_max_turns=5\nmemory_max_chars=1234\n")
@@ -377,6 +385,54 @@ class TestMemorySettings:
         assert s.memory_max_turns == DEFAULT_MEMORY_MAX_TURNS
         assert s.memory_max_chars == DEFAULT_MEMORY_MAX_CHARS
         assert any("memory_max" in record.message for record in caplog.records)
+
+    def test_memory_runtime_cache_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "memory_max_cached_sessions=8\nmemory_cache_idle_seconds=12.5\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.memory_max_cached_sessions == 8
+        assert s.memory_cache_idle_seconds == 12.5
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "-100"])
+    def test_memory_max_cached_sessions_non_positive_means_unlimited(self, tmp_path, raw):
+        env = write_env(tmp_path, f"memory_max_cached_sessions={raw}\n")
+
+        s = load_settings(env)
+
+        # <=0 原样保留, 由 ConversationService 视为不限制
+        assert s.memory_max_cached_sessions == int(raw)
+
+    @pytest.mark.parametrize("raw", ["abc", "3.5", "1e3"])
+    def test_invalid_memory_max_cached_sessions_falls_back(self, tmp_path, caplog, raw):
+        env = write_env(tmp_path, f"memory_max_cached_sessions={raw}\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.memory_max_cached_sessions == DEFAULT_MEMORY_MAX_CACHED_SESSIONS
+        assert any("memory_max_cached_sessions" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize("raw", ["abc", "-1", "-0.5"])
+    def test_invalid_memory_cache_idle_seconds_falls_back(self, tmp_path, caplog, raw):
+        env = write_env(tmp_path, f"memory_cache_idle_seconds={raw}\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.memory_cache_idle_seconds == DEFAULT_MEMORY_CACHE_IDLE_SECONDS
+        assert any("memory_cache_idle_seconds" in record.message for record in caplog.records)
+
+    def test_memory_runtime_cache_aliases(self, tmp_path):
+        env = write_env(tmp_path, "max_cached_sessions=4\ncache_idle_seconds=2.5\n")
+
+        s = load_settings(env)
+
+        assert s.memory_max_cached_sessions == 4
+        assert s.memory_cache_idle_seconds == 2.5
 
     def test_resolve_memory_dir_helper(self, tmp_path):
         assert resolve_memory_dir(None, tmp_path) == tmp_path / "memory"
@@ -696,6 +752,8 @@ class TestSettingsObject:
         assert s.memory_dir == DEFAULT_WORKSPACE / "memory"
         assert s.memory_max_turns == DEFAULT_MEMORY_MAX_TURNS
         assert s.memory_max_chars == DEFAULT_MEMORY_MAX_CHARS
+        assert s.memory_max_cached_sessions == DEFAULT_MEMORY_MAX_CACHED_SESSIONS
+        assert s.memory_cache_idle_seconds == DEFAULT_MEMORY_CACHE_IDLE_SECONDS
         assert s.has_api_key is False
 
     def test_repr_masks_api_key(self):
@@ -703,6 +761,12 @@ class TestSettingsObject:
 
         assert "sk-super-secret" not in text
         assert "***" in text
+
+    def test_repr_contains_memory_runtime_cache_fields(self):
+        text = repr(Settings(memory_max_cached_sessions=7, memory_cache_idle_seconds=3.5))
+
+        assert "memory_max_cached_sessions=7" in text
+        assert "memory_cache_idle_seconds=3.5" in text
 
     def test_repr_without_api_key(self):
         assert "api_key=None" in repr(Settings())

@@ -19,9 +19,11 @@ from typing import Any, Iterable, Optional, Sequence
 from .config import ServerConfig
 from .envelope import dumps, failure, ok
 from .errors import ERROR_INTERNAL, ERROR_INVALID_ARGUMENT, ERROR_OUTPUT_TRUNCATED, GitMcpError
+from .locks import RepoLockManager
+from .policy import PolicyEngine
 from .registry import RepoRegistry
 from .runner import GitRunner
-from .tools import build_read_tools
+from .tools import build_available_tools
 from .tools.base import (
     LEVEL_DESTRUCTIVE,
     LEVEL_READ,
@@ -62,24 +64,30 @@ class GitMcpApp:
         runner: Optional[GitRunner] = None,
         specs: Optional[Sequence[ToolSpec]] = None,
         logger_: Optional[logging.Logger] = None,
+        locks: Optional[RepoLockManager] = None,
     ) -> None:
         self.config = config
         self.logger = logger_ or logger
         self.runner = runner or GitRunner.from_config(config)
         self.registry = RepoRegistry.build(config, runner=self.runner)
-        available = tuple(build_read_tools()) if specs is None else tuple(specs)
+        self.policy = PolicyEngine(config)
+        self.locks = locks or RepoLockManager(lock_dir=config.lock_dir)
+        available = tuple(build_available_tools()) if specs is None else tuple(specs)
         self._specs: dict[str, ToolSpec] = {spec.name: spec for spec in select_tools(config, available)}
         self._context = ToolContext(
             config=config,
             registry=self.registry,
             runner=self.runner,
             logger=self.logger,
+            policy=self.policy,
+            locks=self.locks,
         )
         self.logger.info(
-            "装配完成: repos=%s tools=%s read_only=%s",
+            "装配完成: repos=%s tools=%s read_only=%s lock_dir=%s",
             [entry.alias for entry in self.registry.list_repos()],
             sorted(self._specs),
             config.read_only,
+            config.lock_dir or "(进程内)",
         )
 
     @classmethod
@@ -114,11 +122,24 @@ class GitMcpApp:
             outcome: ToolOutcome = await spec.handler(self._context, params)
         except GitMcpError as exc:
             self.logger.warning("工具 %s 失败(%s): %s", name, exc.code, exc)
-            return dumps(failure(exc.code, str(exc), exc.meta))
+            return dumps(failure(exc.code, str(exc), self._error_meta(exc, params)))
         except Exception as exc:  # noqa: BLE001 - 兜底: 不把未处理异常泄漏给协议层
             self.logger.exception("工具 %s 内部错误", name)
             return dumps(failure(ERROR_INTERNAL, f"内部错误: {exc!r}"))
         return self._dump_success(name, outcome)
+
+    def _error_meta(self, exc: GitMcpError, params: Any) -> dict[str, Any]:
+        """失败信封的 meta: 至少带上 repo alias, 便于客户端定位是哪个仓库被拒绝."""
+        meta = dict(exc.meta)
+        if "repo" in meta or not isinstance(params, dict):
+            return meta
+        requested = params.get("repo")
+        try:
+            meta["repo"] = self.registry.resolve(requested).alias
+        except GitMcpError:
+            if isinstance(requested, str) and requested:
+                meta["repo"] = requested
+        return meta
 
     def _dump_success(self, name: str, outcome: ToolOutcome) -> str:
         """序列化成功信封, 并对最终输出做一次硬上限兜底(§3.1/G3).

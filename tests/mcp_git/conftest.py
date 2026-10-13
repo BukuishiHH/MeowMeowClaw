@@ -148,3 +148,18 @@ def history_repo(tmp_path: Path, git: Callable[..., Any]) -> Path:
     git(repo, "add", "app.py")
     git(repo, "commit", "-qm", "fix: update greeting")
     return repo
+
+
+@pytest.fixture
+def write_repo(tmp_path: Path, git: Callable[..., Any]) -> Path:
+    """GM3 写工具专用仓库: 分支 ``work``(非保护分支) + 一次提交, 工作区干净."""
+    repo = tmp_path / "write-repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "work")
+    git(repo, "config", "user.name", "Writer")
+    git(repo, "config", "user.email", "writer@example.com")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "app.py").write_text("line1\nline2\n", encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "chore: init")
+    return repo

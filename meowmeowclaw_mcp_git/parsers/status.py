@@ -68,6 +68,32 @@ class StatusSummary:
     def clean(self) -> bool:
         return not (self.staged or self.unstaged or self.untracked or self.conflicts or self.renames)
 
+    @property
+    def dirty_paths(self) -> tuple[str, ...]:
+        """去重后的 dirty 路径(staged/unstaged/untracked/conflicts 的并集)."""
+        merged: dict[str, None] = {}
+        for path in (*self.staged, *self.unstaged, *self.untracked, *self.conflicts):
+            merged.setdefault(path, None)
+        return tuple(merged)
+
+    @property
+    def dirty_count(self) -> int:
+        return len(self.dirty_paths)
+
+    def to_state_dict(self) -> dict[str, Any]:
+        """写工具 before/after 摘要(§4.2: 分支/HEAD/dirty 文件数)."""
+        return {
+            "branch": self.branch,
+            "head_oid": self.head_oid,
+            "detached": self.detached,
+            "unborn": self.unborn,
+            "dirty_files": self.dirty_count,
+            "staged": len(self.staged),
+            "unstaged": len(self.unstaged),
+            "untracked": len(self.untracked),
+            "conflicts": len(self.conflicts),
+        }
+
     def counts(self) -> dict[str, int]:
         return {
             "staged": len(self.staged),

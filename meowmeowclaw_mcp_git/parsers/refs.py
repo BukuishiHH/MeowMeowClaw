@@ -28,6 +28,10 @@ TAG_FORMAT = (
     f"%(creatordate:iso-strict){FIELD_SEP}%(contents:subject){RECORD_SEP}"
 )
 
+# %gd 选择符(stash@{0}) %H 提交 hash %gs 主题
+# 注意: git stash list 只支持 %gd 风格占位符, 不支持 %(gd) 风格
+STASH_FORMAT = f"%gd%x1f%H%x1f%gs{RECORD_SEP}"
+
 _AHEAD_RE = re.compile(r"^\[ahead (\d+)(?:, behind (\d+))?\]$")
 _BEHIND_RE = re.compile(r"^\[behind (\d+)\]$")
 
@@ -89,6 +93,18 @@ class TagInfo:
             "created_at": self.created_at,
             "subject": self.subject,
         }
+
+
+@dataclass(frozen=True)
+class StashEntry:
+    """一条 stash(选择符/提交 hash/主题)."""
+
+    selector: str
+    hash: str
+    subject: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"selector": self.selector, "hash": self.hash, "subject": self.subject}
 
 
 @dataclass
@@ -160,6 +176,14 @@ def parse_remotes(raw: Union[bytes, str]) -> list[RemoteInfo]:
         if masked not in target:
             target.append(masked)
     return list(remotes.values())
+
+
+def parse_stash_list(raw: Union[bytes, str]) -> list[StashEntry]:
+    """解析 ``git stash list --format=<STASH_FORMAT>``."""
+    return [
+        StashEntry(selector=fields[0], hash=fields[1], subject=fields[2])
+        for fields in _iter_records(raw, expected=3, what="stash")
+    ]
 
 
 def parse_upstream_track(raw: str) -> tuple[int, int, bool]:

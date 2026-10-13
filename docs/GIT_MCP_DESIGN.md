@@ -1,6 +1,6 @@
 # MeowMeowClaw Git MCP Server 设计（v1）
 
-> 状态：**评审通过，GM1–GM2 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> 状态：**评审通过，GM1–GM3 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
 > Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
 > 按 §10 里程碑（GM1–GM6）逐步实现，每阶段独立提交；实施状态与实现记录见 §14。
 > 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
@@ -109,6 +109,8 @@ meowmeowclaw_mcp_git/      # 顶层独立包(不并入主 Agent; 主项目运行
 ├── config.py              # 启动参数与环境变量(CLI > env > 默认)
 ├── registry.py            # RepoRegistry(alias/允许根/工作树顶层/路径校验)
 ├── runner.py              # GitRunner(参数列表/环境清洗/硬超时/有界流式截断)
+├── policy.py              # PolicyEngine(只读开关/保护分支/dirty/删除保护)
+├── locks.py               # RepoLockManager(每 repo asyncio.Lock + 可选跨进程锁)
 ├── budget.py              # 文本/列表输出预算(字节/行裁剪 + truncated)
 ├── validation.py          # 工具参数校验(JSON Schema 子集)
 ├── envelope.py            # {ok,data,meta} / {ok,error_code,message,meta}
@@ -125,11 +127,11 @@ meowmeowclaw_mcp_git/      # 顶层独立包(不并入主 Agent; 主项目运行
     ├── common.py          # git 调用/错误映射/meta/路径与自由参数防护
     ├── read.py            # status/diff/log/show/blame/file_at_revision
     ├── refs.py            # list_branches/list_tags/list_remotes/rev_parse/config_get
-    └── search.py          # grep/search_history
+    ├── search.py          # grep/search_history
+    └── write.py           # stage/unstage/restore/commit/branch_create/branch_switch/branch_delete/stash
 ```
 
-> GM3 起新增 `policy.py`(PolicyEngine)/ `locks.py`(每仓库锁)、GM4 新增 `remote.py`/
-> `prompts.py`/`resources.py`、GM6 新增 `audit.py`; 目录按里程碑增量演进。
+> GM4 新增 `remote.py`/`prompts.py`/`resources.py`、GM6 新增 `audit.py`; 目录按里程碑增量演进。
 
 ### 2.4 与 MeowMeowClaw 主项目的关系
 
@@ -217,15 +219,19 @@ GM1 实现补充：
 
 | 工具 | 作用 | 关键参数 | 安全约束 |
 |---|---|---|---|
-| `git_stage` | 暂存文件 | `repo`、`paths`、`all` | 路径必须在 repo 内 |
-| `git_unstage` | 取消暂存 | `repo`、`paths` | — |
-| `git_restore` | 恢复工作区/暂存区 | `repo`、`paths`、`staged`、`force` | dirty 检查；默认拒绝覆盖 |
-| `git_commit` | 创建提交 | `repo`、`message`、`paths`、`amend`、`signoff`、`allow_empty` | 禁止空 message；保护分支策略 |
-| `git_branch_create` | 创建分支 | `repo`、`name`、`start_point`、`switch` | 名字校验 |
-| `git_branch_switch` | 切换分支 | `repo`、`name`、`force` | 默认 dirty 拒绝 |
-| `git_branch_delete` | 删除分支 | `repo`、`name`、`force` | 默认拒绝未合并/当前分支 |
-| `git_stash` | stash 管理 | `repo`、`action(list/push/pop/apply/drop)`、`message`、`paths` | drop 需显式确认 |
-| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase |
+| `git_stage` | 暂存文件 | `repo`、`paths`、`all` | 路径必须在 repo 内；**GM3 已实现** |
+| `git_unstage` | 取消暂存 | `repo`、`paths` | —；**GM3 已实现** |
+| `git_restore` | 恢复工作区/暂存区 | `repo`、`paths`、`staged`、`force` | dirty 检查；默认拒绝覆盖；**GM3 已实现** |
+| `git_commit` | 创建提交 | `repo`、`message`、`paths`、`amend`、`signoff`、`allow_empty` | 禁止空 message；保护分支策略；**GM3 已实现** |
+| `git_branch_create` | 创建分支 | `repo`、`name`、`start_point`、`switch` | 名字校验；**GM3 已实现** |
+| `git_branch_switch` | 切换分支 | `repo`、`name`、`force` | 默认 dirty 拒绝；**GM3 已实现** |
+| `git_branch_delete` | 删除分支 | `repo`、`name`、`force` | 默认拒绝未合并/当前分支；**GM3 已实现** |
+| `git_stash` | stash 管理 | `repo`、`action(list/push/pop/apply/drop)`、`message`、`paths` | drop 需显式确认；**GM3 已实现** |
+| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase；**GM4 待实现** |
+
+> 写工具默认不注册（`--read-only=true` 时 `tools/list` 只有 13 个只读工具）；
+> `--read-only=false` 后出现上述 8 个写工具，Cline 应保持逐次确认（`autoApprove` 只放只读工具）。
+> 除 `git_stash action=list` 外，写操作都会在仓库锁内执行并返回 `before`/`after` 状态摘要。
 
 #### C. 预留 v2（v1 不实现或默认关闭）
 
@@ -275,7 +281,7 @@ GM1 实现补充：
 
 `not_a_repo` / `repo_not_found` / `policy_denied` / `dirty_worktree` / `protected_branch` /
 `invalid_path` / `invalid_argument` / `command_timeout` / `command_failed` / `output_truncated` /
-`unsupported_in_v1`。
+`unsupported_in_v1` / `lock_timeout`（GM3 新增：等待仓库写锁超时）。
 
 > GM1 实现补充：失败信封为**扁平结构** `{ok:false, error_code, message, meta}`，`meta` 恒存在
 > （可能为空对象）；新增 `parse_failed`（git 输出无法解析，§5.3）与 `internal_error`
@@ -285,6 +291,10 @@ GM1 实现补充：
 > 预算裁剪并在 data/meta 置 `truncated=true`；`git_log`/`git_search_history` 用 `has_more` 标记
 > 还有更多；工具自身预算之外，app 层对最终信封再做一次 `--max-output-bytes` 兜底（超限返回
 > `output_truncated`，不把巨型 JSON 交给模型）。
+
+> GM3 实现补充：写工具统一返回 `data.action` 与 `data.before`/`data.after`（`branch`/`head_oid`/
+> `dirty_files` + 分组计数）；策略类失败（`protected_branch`/`dirty_worktree`/`policy_denied`/
+> `lock_timeout`）的 `meta` 至少带 `repo` alias，便于客户端定位被拒绝的仓库。
 
 ### 4.3 Resources
 
@@ -374,6 +384,13 @@ git --no-pager -C <repo_path> <subcommand> [args...]
   会互相排队；v1 只提供配置接口，不强制耦合；
 - 只读操作不持锁（避免大仓 log/diff 阻塞）。
 
+GM3 已实现：每 repo 一把进程内 `asyncio.Lock`（按 realpath 隔离）；`--lock-dir` 配置后叠加跨进程
+文件锁（POSIX `flock` / Windows `msvcrt`，锁文件按 repo realpath 哈希命名、权限 0600），
+获取超时（默认 10s）返回 `lock_timeout`。dirty 检查与写命令在同一把锁内原子执行。
+> 备注：MeowMeowClaw 子代理的锁文件是 `<memory_dir>/subagents/workspace.lock`，与本实现的
+> 按仓库哈希命名不同；同一 `--lock-dir` 的多个 MCP Server 进程可互斥，与主项目 workspace 锁
+> 完全打通（共用同一文件）仍属 §12 优化项。
+
 ---
 
 ## 6. 安全设计
@@ -411,6 +428,17 @@ git --no-pager -C <repo_path> <subcommand> [args...]
 - `git_branch_switch` / `git_restore` / `git_stash apply`：工作区 dirty 时默认拒绝；
 - `git_branch_delete`：当前分支、未合并分支默认拒绝；
 - `git_commit --amend` 默认关闭，需显式参数。
+
+GM3 实现补充：
+
+- 保护分支上拒绝 `git_commit`（含 `amend`）与 `git_branch_delete`；
+- `git_restore`（工作区覆盖）与 `git_branch_switch`：dirty 时拒绝，`force=true` 才放行
+  （分别对应覆盖工作区 / `git switch --discard-changes`）；`git_stash pop|apply` 无 force 参数，dirty 一律拒绝；
+- `git_branch_delete`：当前分支/保护分支拒绝；未合并分支用 `git merge-base --is-ancestor` 预检后
+  `policy_denied`，`force=true` 才 `git branch -D`；
+- `git_commit` staged 为空时要求 `allow_empty=true`（`amend` 与 `paths` 模式不受限）；message
+  去空白后必须非空；新分支名经 `git check-ref-format --branch` 校验；
+- `git_stash drop` 需要 `confirm=true`（仅作用于最近一条 stash），不提供 `git stash clear`。
 
 ### 6.4 凭证与 URL 脱敏
 
@@ -647,6 +675,10 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 
 **提交建议**：`feat(mcp-git): GM3 安全写工具与仓库锁`
 
+**验收结果（2026-10-13）**：已落地。`read_only=false` 时 21 个工具（13 只读 + 8 写）注册；
+dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护分支默认拒绝 commit/删除；
+并发写经每 repo 锁串行、index 完整；写工具返回 before/after 摘要。详见 §14.1 GM3 实现记录。
+
 ### 10.5 GM4：远端只读、Prompts 与 Resources（1.5d）
 
 **交付物**
@@ -706,7 +738,7 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 
 - [x] GM1：MCP 握手/工具列表/`git_status` 通过（2026-10-13，见 §14.1）；
 - [x] GM2：只读工具齐全、结构化、有输出预算（2026-10-13，见 §14.1）；
-- [ ] GM3：写工具默认关闭、dirty/保护分支/锁生效；
+- [x] GM3：写工具默认关闭、dirty/保护分支/锁生效（2026-10-13，见 §14.1）；
 - [ ] GM4：fetch 默认关闭、prompts/resources 可用；
 - [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认；
 - [ ] GM6：全量 pytest + ruff + 人工冒烟记录；
@@ -751,7 +783,7 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 |---|---|---|---|
 | GM1 | 已完成 | `d010f63` | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
 | GM2 | 已完成 | `43391ea` | 13 个只读工具 + 6 个解析器 + 输出预算/有界截断；新增 141 用例 |
-| GM3 | 待实现 | — | 安全写 + dirty/分支保护 + 锁 |
+| GM3 | 已完成 | 待回填 | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
 | GM4 | 待实现 | — | fetch + prompts/resources |
 | GM5 | 待实现 | — | Cline 接入 + 文档 |
 | GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |
@@ -872,6 +904,58 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 - 本阶段不做：写工具与锁（GM3）、fetch/prompts/resources（GM4）、Cline GUI 冒烟（GM5/GM6）、
   `git_list_worktrees`/`git_list_submodules`（§6.5 可选，未排期）。
 
+#### GM3 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw_mcp_git/policy.py`（新增） | `PolicyEngine`：只读开关二次校验、保护分支（默认 main/master）、dirty 保护（force 显式放行）、删除保护（当前/保护分支） |
+| `meowmeowclaw_mcp_git/locks.py`（新增） | `RepoLockManager`：每 repo 进程内 `asyncio.Lock`（按 realpath 隔离）+ `--lock-dir` 跨进程 flock/msvcrt；锁文件按 repo 哈希命名、0600；获取超时 → `lock_timeout` |
+| `meowmeowclaw_mcp_git/tools/write.py`（新增） | 8 个写工具：stage/unstage/restore/commit/branch_create/branch_switch/branch_delete/stash；全部在仓库锁内执行并返回 before/after |
+| `meowmeowclaw_mcp_git/tools/base.py` / `common.py` | `ToolContext` 注入 policy/locks；`read_status` 统一读取写前状态；`require_paths` 等参数校验 |
+| `meowmeowclaw_mcp_git/app.py` | 写工具按 `read_only` 注册（默认 13 → `--read-only=false` 后 21）；失败信封补充 repo alias meta；装配 policy/locks；`--lock-dir` 启动日志 |
+| `meowmeowclaw_mcp_git/errors.py` | 新增 `lock_timeout` 错误码与 `LockTimeoutError` |
+| `meowmeowclaw_mcp_git/parsers/{status,refs}.py` | status 增加 `dirty_paths`/`dirty_count`/`to_state_dict`；stash list 解析（`%gd/%H/%gs`） |
+| `tests/mcp_git/*`（新增 4 个文件） | 85 用例：策略矩阵/锁（进程内+跨进程）/8 个写工具端到端（dirty/保护分支/force/amend/confirm）/并发写与 index 完整性 |
+| `README.md` / 本文 | 工具表、锁与保护说明、目录树、实施状态同步 |
+
+**关键实现决策**
+
+- **两段式权限**：工具注册按 `read_only` 过滤（默认只读 13 个，`--read-only=false` 才出现 8 个写工具），
+  handler 内再 `ensure_writes_enabled` 二次校验（防御直接调用）；
+- **检查与写入原子**：dirty/保护分支检查与 git 写命令在同一把仓库锁内执行，避免 TOCTOU；
+- **危险开关必须显式**：`git_restore --force` 覆盖工作区、`git_branch_switch --force` 丢弃本地修改、
+  `git_branch_delete --force` 强删未合并分支、`git_commit --amend`/`allow_empty`、`git_stash drop confirm`
+  全部默认拒绝；仍不实现 reset --hard/clean/push 等 destructive 工具（§6.2）；
+- **commit 保护**：保护分支拒绝直接 commit/amend；staged 为空时要求 `allow_empty`（`amend` 与 `paths`
+  模式不受限）；message 去空白后必须非空；`paths` 模式按 git 语义提交这些路径的工作区内容；
+- **分支保护**：新分支名经 `git check-ref-format --branch` 校验并拒绝 `-` 开头与 `@{`；删除时当前分支/
+  保护分支拒绝，未合并分支用 `git merge-base --is-ancestor` 预检后 `policy_denied`，`force=true` 才 `-D`；
+- **stash 语义**：`list` 只读不持锁；`push` 支持 message/paths（未指定 paths 默认不含 untracked）；
+  `pop`/`apply` 要求工作区干净；`drop` 需要 `confirm=true` 且只作用于最近一条；不提供 `stash clear`；
+- **锁实现**：只读工具不取锁；写操作在锁内执行，进程内 `asyncio.Lock` 按 repo realpath 隔离，
+  `--lock-dir` 时叠加 flock/msvcrt 文件锁（0600），超时返回 `lock_timeout` 而不是无限等待；
+- **与主项目锁的关系**：本实现按 repo 哈希命名锁文件，MeowMeowClaw 子代理用
+  `<memory_dir>/subagents/workspace.lock`；同一 `--lock-dir` 的多个 MCP Server 进程可互斥，
+  与主项目 workspace 锁完全打通仍属 §12 优化项（§5.5 已备注）。
+
+**验证**
+
+- 8 个写工具端到端：stage（路径/全部）→ commit（普通/amend/signoff/paths/allow_empty）→
+  branch_create（含 switch/start_point）→ branch_switch → branch_delete（merged/unmerged/force）→
+  stash（push/list/apply/pop/drop）全部通过，并返回 before/after 状态摘要；
+- 保护与拒绝路径：保护分支 commit/删除 → `protected_branch`；当前分支/未合并分支删除、stash drop 无
+  confirm → `policy_denied`；dirty 时 switch/restore/apply → `dirty_worktree`；只读模式下写工具不可见；
+  `..`/绝对路径/符号链接 → `invalid_path`；
+- 并发：10 个并发 stage 后 index 内容完整且无 `.git/index.lock` 残留；第二个写操作在锁上等待；
+  锁超时返回 `lock_timeout`；同一 `--lock-dir` 的跨进程锁互斥且释放后可获取；失败路径不泄漏锁；
+- 真实 stdio 会话（`--read-only=false`）：`tools/list` 返回 21 个工具，`git_stage`/`git_commit`/`git_log`
+  经 MCP 协议完成一次真实提交；
+- 全量回归 **2054 passed / 6 skipped / 2 xfailed**（新增 85 用例）；`ruff check meowmeowclaw
+  meowmeowclaw_mcp_git tests` 通过；
+- 本阶段不做：fetch/prompts/resources（GM4）、Cline 配置模板与真实 GUI 冒烟（GM5/GM6）、审计（GM6）。
+
 ---
 
 ## 附录 A：只读模式 Cline 配置模板
@@ -931,4 +1015,4 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 
 > 本文是 Git MCP Server 的实现依据。按 §10 里程碑（GM1–GM6）推进；
 > 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
-> **GM1–GM2 已完成（2026-10-13），实现记录见 §14.1；GM3 待评审确认后启动。**
+> **GM1–GM3 已完成（2026-10-13），实现记录见 §14.1；GM4 待评审确认后启动。**

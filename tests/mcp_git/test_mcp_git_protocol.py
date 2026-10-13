@@ -24,7 +24,7 @@ from meowmeowclaw_mcp_git import __version__  # noqa: E402
 from meowmeowclaw_mcp_git.app import GitMcpApp  # noqa: E402
 from meowmeowclaw_mcp_git.config import ServerConfig  # noqa: E402
 from meowmeowclaw_mcp_git.server import SERVER_NAME, build_server  # noqa: E402
-from meowmeowclaw_mcp_git.tools import build_read_tools  # noqa: E402
+from meowmeowclaw_mcp_git.tools import build_available_tools, build_read_tools  # noqa: E402
 from meowmeowclaw_mcp_git.tools.base import LEVEL_READ, LEVEL_WRITE, ToolOutcome, ToolSpec  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -90,6 +90,19 @@ class TestInProcessProtocol:
         payload = json.loads(result.content[0].text)
         assert payload["ok"] is False
         assert payload["error_code"] == "invalid_argument"
+
+    @pytest.mark.asyncio
+    async def test_write_tools_registered_when_read_only_false(self, repo: Path):
+        app = GitMcpApp(ServerConfig(roots=(str(repo),), read_only=False))
+        server = build_server(app)
+
+        async with create_connected_server_and_client_session(server) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+
+        names = [tool.name for tool in tools.tools]
+        assert names == [spec.name for spec in build_available_tools()]
+        assert {"git_stage", "git_commit", "git_branch_switch", "git_stash"} <= set(names)
 
     @pytest.mark.asyncio
     async def test_write_tools_not_registered_in_read_only_mode(self, repo: Path):

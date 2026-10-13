@@ -17,6 +17,7 @@ from typing import Any, Optional, Sequence
 
 from ..budget import DEFAULT_TEXT_BYTES
 from ..errors import GitMcpError, InvalidArgumentError, OutputTruncatedError
+from ..parsers.status import StatusSummary, parse_porcelain_v2
 from ..registry import RepoEntry
 from ..runner import CommandTimeoutError, GitCommandError, GitResult
 from .base import ToolContext
@@ -124,6 +125,20 @@ def require_ref(value: Any, *, name: str = "ref") -> str:
     if "\x00" in value:
         raise InvalidArgumentError(f"{name} 不能包含 NUL")
     return value
+
+
+def require_paths(value: Any, *, name: str = "paths") -> list[str]:
+    """必填路径数组校验(空数组直接拒绝, 避免“无操作成功”造成误导)."""
+    if not isinstance(value, list) or not value:
+        raise InvalidArgumentError(f"{name} 不能为空数组")
+    return value
+
+
+async def read_status(ctx: ToolContext, entry: RepoEntry) -> StatusSummary:
+    """读取仓库状态(branch/ahead-behind/四组文件), 写工具的 before/after 与保护检查共用."""
+    result = await run_git(ctx, entry, ["status", "--porcelain=v2", "--branch", "-z"])
+    ensure_success(ctx, result, entry=entry, what="git status")
+    return parse_porcelain_v2(result.stdout)
 
 
 def require_text(value: Any, *, name: str) -> str:

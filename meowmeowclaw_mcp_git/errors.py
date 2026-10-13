@@ -21,6 +21,8 @@ ERROR_COMMAND_FAILED = "command_failed"
 ERROR_OUTPUT_TRUNCATED = "output_truncated"
 ERROR_UNSUPPORTED_IN_V1 = "unsupported_in_v1"
 ERROR_PARSE_FAILED = "parse_failed"
+# GM3 补充: 等待仓库写锁超时
+ERROR_LOCK_TIMEOUT = "lock_timeout"
 # GM1 补充: 兜底异常(见 §14.1 实现记录), 避免任何未处理异常泄漏到协议层
 ERROR_INTERNAL = "internal_error"
 
@@ -37,6 +39,7 @@ ALL_ERROR_CODES = (
     ERROR_OUTPUT_TRUNCATED,
     ERROR_UNSUPPORTED_IN_V1,
     ERROR_PARSE_FAILED,
+    ERROR_LOCK_TIMEOUT,
     ERROR_INTERNAL,
 )
 
@@ -117,6 +120,12 @@ class ProtectedBranchError(GitMcpError):
     """目标分支在 protected-branches 列表中(GM3 起使用)."""
 
     code = ERROR_PROTECTED_BRANCH
+
+
+class LockTimeoutError(GitMcpError):
+    """等待仓库写锁(进程内或跨进程)超时(GM3)."""
+
+    code = ERROR_LOCK_TIMEOUT
 
 
 class UnsupportedInV1Error(GitMcpError):

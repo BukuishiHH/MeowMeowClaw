@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from ..config import ServerConfig
+from ..locks import RepoLockManager
+from ..policy import PolicyEngine
 from ..registry import RepoRegistry
 from ..runner import GitRunner
 
@@ -27,12 +29,14 @@ ToolHandler = Callable[["ToolContext", dict[str, Any]], Awaitable["ToolOutcome"]
 
 @dataclass(frozen=True)
 class ToolContext:
-    """一次服务器会话共享的依赖(registry/runner/config 由 app 装配)."""
+    """一次服务器会话共享的依赖(registry/runner/config/policy/locks 由 app 装配)."""
 
     config: ServerConfig
     registry: RepoRegistry
     runner: GitRunner
     logger: logging.Logger
+    policy: PolicyEngine
+    locks: RepoLockManager
 
 
 @dataclass(frozen=True)

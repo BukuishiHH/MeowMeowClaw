@@ -816,7 +816,7 @@ resources 静态项与模板可列出并可读取，读取不修改仓库。详�
 | GM1 | 已完成 | `d010f63` | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
 | GM2 | 已完成 | `43391ea` | 13 个只读工具 + 6 个解析器 + 输出预算/有界截断；新增 141 用例 |
 | GM3 | 已完成 | `8b187d5` | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
-| GM4 | 已完成 | 待回填 | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
+| GM4 | 已完成 | `eba419f` | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
 | GM5 | 待实现 | — | Cline 接入 + 文档 |
 | GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |
 

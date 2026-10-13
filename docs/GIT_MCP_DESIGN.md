@@ -850,7 +850,7 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 | GM4 | 已完成 | `eba419f` | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
 | GM5 | 已完成 | `bf2b356` | 两套 Cline 模板 + 接入指南 + 启动包装 + 模板自动校验；GUI 冒烟待 GM6 |
 | GM6 | 已完成 | `195d71e` | 最小审计(`--audit-log`) + 端到端脚本 24/24 + 验收记录/发布说明；新增 15 用例 |
-| GM6.1 | 已完成 | 待回填 | 补丁: `git_fetch` 忽略远端 HEAD 符号引用(git ≥2.46/CI 兼容)；新增 1 用例 |
+| GM6.1 | 已完成 | `6d209a5` | 补丁: `git_fetch` 忽略远端 HEAD 符号引用(git ≥2.46/CI 兼容)；新增 1 用例 |
 
 ### 14.1 实现记录
 
@@ -1150,7 +1150,7 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 旧实现把它当成一次 ref 变化（CI 上表现为 `refs_changed=1` 与 `refs=[origin, origin/main]`）。
 修复：`_remote_refs` 改为读取 `%(refname)/%(refname:short)/%(objectname)/%(symref)` 并跳过符号引用与
 `*/HEAD` 条目；新增 1 个回归用例（用 `git remote set-head origin --auto` 确定性复现新 git 行为）。
-提交号：待回填。
+提交号：`6d209a5`。
 
 ---
 

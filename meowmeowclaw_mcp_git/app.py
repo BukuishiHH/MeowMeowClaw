@@ -14,8 +14,11 @@
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Sequence
 
+from .audit import AuditSink, digest_arguments
 from .config import ServerConfig
 from .envelope import dumps, failure, ok
 from .errors import ERROR_INTERNAL, ERROR_INVALID_ARGUMENT, ERROR_OUTPUT_TRUNCATED, GitMcpError
@@ -74,6 +77,8 @@ class GitMcpApp:
         self.registry = RepoRegistry.build(config, runner=self.runner)
         self.policy = PolicyEngine(config)
         self.locks = locks or RepoLockManager(lock_dir=config.lock_dir)
+        # --audit-log 配置后启用最小审计(§8); 初始化失败在启动期报 ConfigError
+        self.audit: Optional[AuditSink] = AuditSink(config.audit_log) if config.audit_log else None
         available = tuple(build_available_tools()) if specs is None else tuple(specs)
         self._specs: dict[str, ToolSpec] = {spec.name: spec for spec in select_tools(config, available)}
         self._prompts: dict[str, PromptSpec] = {spec.name: spec for spec in build_prompt_specs()}
@@ -86,11 +91,12 @@ class GitMcpApp:
             locks=self.locks,
         )
         self.logger.info(
-            "装配完成: repos=%s tools=%s read_only=%s lock_dir=%s",
+            "装配完成: repos=%s tools=%s read_only=%s lock_dir=%s audit_log=%s",
             [entry.alias for entry in self.registry.list_repos()],
             sorted(self._specs),
             config.read_only,
             config.lock_dir or "(进程内)",
+            str(self.audit.path) if self.audit else "(未启用)",
         )
 
     @classmethod
@@ -137,23 +143,62 @@ class GitMcpApp:
 
     async def call_tool(self, name: str, arguments: Any = None) -> str:
         """执行工具并返回 JSON 信封文本; 任何失败都不抛异常(§4.2)."""
+        started = time.monotonic()
+        payload = await self._dispatch(name, arguments)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        self._record_audit(name, arguments, payload, elapsed_ms)
+        return dumps(payload)
+
+    async def _dispatch(self, name: str, arguments: Any = None) -> dict[str, Any]:
+        """执行工具并返回信封 payload(dict); 审计/序列化在 call_tool 里统一处理."""
         spec = self._specs.get(name)
         if spec is None:
             allowed = ", ".join(sorted(self._specs)) or "无"
-            return dumps(failure(ERROR_INVALID_ARGUMENT, f"未知工具: {name!r}; 可用工具: {allowed}"))
+            return failure(ERROR_INVALID_ARGUMENT, f"未知工具: {name!r}; 可用工具: {allowed}")
         try:
             params = validate_arguments(spec.parameters, arguments)
         except GitMcpError as exc:
-            return dumps(failure(exc.code, str(exc), exc.meta))
+            return failure(exc.code, str(exc), exc.meta)
         try:
             outcome: ToolOutcome = await spec.handler(self._context, params)
         except GitMcpError as exc:
             self.logger.warning("工具 %s 失败(%s): %s", name, exc.code, exc)
-            return dumps(failure(exc.code, str(exc), self._error_meta(exc, params)))
+            return failure(exc.code, str(exc), self._error_meta(exc, params))
         except Exception as exc:  # noqa: BLE001 - 兜底: 不把未处理异常泄漏给协议层
             self.logger.exception("工具 %s 内部错误", name)
-            return dumps(failure(ERROR_INTERNAL, f"内部错误: {exc!r}"))
-        return self._dump_success(name, outcome)
+            return failure(ERROR_INTERNAL, f"内部错误: {exc!r}")
+        return self._success_payload(name, outcome)
+
+    def _record_audit(self, name: str, arguments: Any, payload: dict[str, Any], elapsed_ms: int) -> None:
+        """追加一条工具调用审计(§8): 只存参数摘要与结果状态, 不落盘参数值/输出全文."""
+        if self.audit is None:
+            return
+        try:
+            meta = payload.get("meta") or {}
+            data = payload.get("data") or {}
+            event = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "tool": name,
+                "repo": self._audit_repo(arguments),
+                "args_digest": digest_arguments(arguments),
+                "status": "ok" if payload.get("ok") else "error",
+                "error_code": None if payload.get("ok") else payload.get("error_code"),
+                "exit_code": meta.get("exit_code"),
+                "elapsed_ms": elapsed_ms,
+                "truncated": bool(meta.get("truncated") or data.get("truncated")),
+            }
+            self.audit.record(event)
+        except Exception:  # noqa: BLE001 - 审计绝不阻塞工具主流程
+            self.logger.exception("审计记录失败(已忽略)")
+
+    def _audit_repo(self, arguments: Any) -> Optional[str]:
+        requested = arguments.get("repo") if isinstance(arguments, dict) else None
+        if isinstance(requested, str) and requested:
+            return requested
+        try:
+            return self.registry.resolve(requested if isinstance(requested, str) else None).alias
+        except GitMcpError:
+            return None
 
     def _error_meta(self, exc: GitMcpError, params: Any) -> dict[str, Any]:
         """失败信封的 meta: 至少带上 repo alias, 便于客户端定位是哪个仓库被拒绝."""
@@ -168,23 +213,21 @@ class GitMcpApp:
                 meta["repo"] = requested
         return meta
 
-    def _dump_success(self, name: str, outcome: ToolOutcome) -> str:
-        """序列化成功信封, 并对最终输出做一次硬上限兜底(§3.1/G3).
+    def _success_payload(self, name: str, outcome: ToolOutcome) -> dict[str, Any]:
+        """组装成功信封, 并对最终输出做一次硬上限兜底(§3.1/G3).
 
         工具自身已按预算裁剪文本/列表; 这里是最后一道保险: 若信封仍超过
         ``--max-output-bytes``, 返回 ``output_truncated`` 错误而不是把巨型 JSON
         塞给模型(错误信封不参与该检查, 消息本身有界)。
         """
-        text = dumps(ok(outcome.data, outcome.meta))
-        size = len(text.encode("utf-8"))
+        payload = ok(outcome.data, outcome.meta)
+        size = len(dumps(payload).encode("utf-8"))
         if size <= self.config.max_output_bytes:
-            return text
+            return payload
         self.logger.warning("工具 %s 输出 %d 字节, 超过上限 %d", name, size, self.config.max_output_bytes)
-        return dumps(
-            failure(
-                ERROR_OUTPUT_TRUNCATED,
-                f"工具输出 {size} 字节, 超过 --max-output-bytes={self.config.max_output_bytes}; "
-                "请缩小查询范围(如 max_count/paths/max_bytes)后重试",
-                {"size_bytes": size, "limit_bytes": self.config.max_output_bytes},
-            )
+        return failure(
+            ERROR_OUTPUT_TRUNCATED,
+            f"工具输出 {size} 字节, 超过 --max-output-bytes={self.config.max_output_bytes}; "
+            "请缩小查询范围(如 max_count/paths/max_bytes)后重试",
+            {"size_bytes": size, "limit_bytes": self.config.max_output_bytes},
         )

@@ -1,6 +1,6 @@
 # MeowMeowClaw Git MCP Server 设计（v1）
 
-> 状态：**评审通过，GM1–GM5 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> 状态：**评审通过，GM1–GM6 已实现，v0.1 收尾（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
 > Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
 > 按 §10 里程碑（GM1–GM6）逐步实现，每阶段独立提交；实施状态与实现记录见 §14。
 > 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
@@ -477,7 +477,7 @@ GM3 实现补充：
 > token/password 查询参数打码）；`http.*.extraheader`、`credential.*` 及键名含 token/password/secret
 > 的配置只返回 `redacted=true`；含 `://` 的 URL 作用域配置键 v1 不支持（返回 `invalid_argument`）。
 > GM4 补充：`git_fetch` 的进度输出与失败消息经 `sanitize_text` 做同样的整段脱敏。
-> `--audit-log` 仍未接入（GM6）。
+> GM6 补充：`--audit-log` 已实现（JSONL，新建文件权限 0600，详见 §8）。
 
 ### 6.5 worktree / submodule / 路径
 
@@ -590,6 +590,15 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 - 不把 Git 输出全文写入审计（只存摘要/哈希），避免敏感内容落盘；
 - 观测指标（v2 可选）：工具调用数、失败码分布、超时数、锁等待时间、输出截断次数；
 - 审计路径建议不与 repo `.git` 混放：默认用户配置，未配置则不写。
+
+GM6 最小实现（`meowmeowclaw_mcp_git/audit.py`）：
+
+- 事件字段：`ts`(ISO8601 UTC) / `tool` / `repo` / `args_digest`(参数规范 JSON 的 sha256 前 16 位) /
+  `status`(`ok`/`error`) / `error_code`(失败时) / `exit_code` / `elapsed_ms` / `truncated`；
+- **不落盘参数值与 git 输出全文**（message/paths 等只以摘要出现，测试覆盖）；
+- 只审计**工具调用**；prompts/resources 为只读查询，不写审计（需要时可查 stderr 日志）；
+- 新建文件权限 `0600`；启动期初始化失败 → `ConfigError`（stderr 提示 + 退出码 2）；
+  运行期写失败 fail-soft（只 warning，不影响工具返回）；无轮转/大小上限（最小实现）。
 
 ---
 
@@ -780,6 +789,12 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 
 **提交建议**：`docs(mcp-git): GM6 验收记录与首版收尾`
 
+**验收结果（2026-10-13）**：全量 **2135 passed / 6 skipped / 2 xfailed**、ruff 通过；
+端到端脚本 `scripts/verify_git_mcp_server.py` **24/24 PASS**（只读 13 工具 / 可写 21 + 审计 /
+远端 22 + fetch 更新 refs 不合并 / stdout 0 字节 / 无残留进程）；`read_only` 两模式均已验证；
+最小审计落地。完整记录（环境、目标 G1–G7、里程碑、模式矩阵、Cline GUI 记录表、发布说明与
+已知限制）见 **`docs/GIT_MCP_ACCEPTANCE.md`**。
+
 ---
 
 ## 11. 验收清单
@@ -789,11 +804,11 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 - [x] GM3：写工具默认关闭、dirty/保护分支/锁生效（2026-10-13，见 §14.1）；
 - [x] GM4：fetch 默认关闭、prompts/resources 可用（2026-10-13，见 §14.1）；
 - [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认（配置模板/指南/自动校验已完成，GUI 冒烟待 GM6）；
-- [ ] GM6：全量 pytest + ruff + 人工冒烟记录；
-- [ ] 所有路径参数在 allowlist 根内；
-- [ ] stdout 仅 MCP 协议消息；
-- [ ] `read_only=true` 下无写工具注册；
-- [ ] 残余风险已写入文档。
+- [ ] GM6：全量 pytest + ruff + 人工冒烟记录（pytest/ruff/端到端脚本已完成，Cline GUI 记录待人工回填）；
+- [x] 所有路径参数在 allowlist 根内（`invalid_path` 用例覆盖，GM2/GM3）；
+- [x] stdout 仅 MCP 协议消息（空 stdin 启动 stdout 0 字节；真 stdio 会话无解析错误）；
+- [x] `read_only=true` 下无写工具注册（只读 13 工具；模板/协议用例断言）；
+- [x] 残余风险已写入文档（§6.6 与 `docs/GIT_MCP_ACCEPTANCE.md` §6）。
 
 ---
 
@@ -834,7 +849,7 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 | GM3 | 已完成 | `8b187d5` | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
 | GM4 | 已完成 | `eba419f` | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
 | GM5 | 已完成 | `bf2b356` | 两套 Cline 模板 + 接入指南 + 启动包装 + 模板自动校验；GUI 冒烟待 GM6 |
-| GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |
+| GM6 | 已完成 | 待回填 | 最小审计(`--audit-log`) + 端到端脚本 24/24 + 验收记录/发布说明；新增 15 用例 |
 
 ### 14.1 实现记录
 
@@ -1092,6 +1107,40 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
   stderr 安装提示 + 退出码 3（指南 §8 排障表）；
 - 未完成：真实 Cline GUI 冒烟（记录版本/配置路径/截图）→ GM6。
 
+#### GM6 实现记录（2026-10-13，v0.1 收尾）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw_mcp_git/audit.py`（新增） | 最小审计：`AuditSink`（JSONL、0600、fail-soft）+ `digest_arguments`；事件 = `ts/tool/repo/args_digest/status/error_code/exit_code/elapsed_ms/truncated` |
+| `meowmeowclaw_mcp_git/app.py` | 派发拆成 `_dispatch`（返回 payload）+ 审计钩子 `_record_audit`；审计失败不影响工具返回；`--audit-log` 初始化失败在启动期报 `ConfigError` |
+| `meowmeowclaw_mcp_git/server.py` | 启动日志提示审计已启用 |
+| `scripts/verify_git_mcp_server.py`（新增） | 端到端验收脚本：临时仓库 + 本地 bare remote；只读/可写/远端三阶段 + 审计 + stdout 纯净性 + 残留进程检查（24 项） |
+| `tests/mcp_git/test_mcp_git_audit.py`（新增） | 15 用例：0600/JSONL/事件字段/错误码/截断标记/参数不落盘/fail-soft/启动校验/prompts-resources 不审计 |
+| `docs/GIT_MCP_ACCEPTANCE.md`（新增） | GM6 验收记录：环境、自动结果、端到端 24 项、目标与里程碑、模式矩阵、Cline GUI 记录表、发布说明与已知限制、残余风险、回滚 |
+| `README.md` / `.env.example` / 本文 | 审计与验收文档、规模数据、目录树、Roadmap、实施状态同步 |
+
+**关键实现决策**
+
+- **审计最小而有用**：只审计工具调用，事件只存参数摘要与结果状态，不写参数值/输出全文（避免提交
+  message 与路径泄漏）；初始化失败 fail-fast（退出码 2），运行期写失败 fail-soft；
+- **不破坏 stdout 纯净性**：审计只写文件；文件权限 0600；无轮转/大小上限（最小实现，已列为已知限制）；
+- **prompts/resources 不审计**：属只读查询，保持审计语义聚焦工具调用；
+- **GM5 GUI 冒烟未闭环**：本环境无 Cline GUI，因此 GM6 以“模板参数真实启动 stdio server 的自动校验
+  + 端到端脚本 + 人工记录模板”替代；Cline GUI 记录表保留待人工回填（验收记录 §5）；
+- **验收可重复**：`scripts/verify_git_mcp_server.py` 纯本地（无网络），24 项检查覆盖两种模式、审计、
+  stdout 与残留进程，可随时重跑。
+
+**验证**
+
+- 全量回归 **2135 passed / 6 skipped / 2 xfailed**（Git MCP 446 用例，GM6 新增 15）；`ruff check
+  meowmeowclaw meowmeowclaw_mcp_git tests` 通过；
+- 端到端脚本 24/24 PASS：只读 13 工具；可写 21 工具 + 真实提交 + 审计（0600、不落盘 message）；
+  远端 22 工具 + fetch 更新 refs 且不合并；空 stdin stdout 0 字节；无残留 server 进程；
+- Cline GUI 冒烟记录表（9 项）见 `docs/GIT_MCP_ACCEPTANCE.md` §5，待人工执行；
+- 明确未完成：真实 Cline GUI 冒烟、Windows 实机验证（验收记录 §6 已知限制 #8/#9）。
+
 ---
 
 ## 附录 A：只读模式 Cline 配置模板
@@ -1154,4 +1203,5 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 
 > 本文是 Git MCP Server 的实现依据。按 §10 里程碑（GM1–GM6）推进；
 > 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
-> **GM1–GM5 已完成（2026-10-13），实现记录见 §14.1；GM6 待评审确认后启动（全量验收 + 真实 Cline 冒烟收尾）。**
+> **GM1–GM6 已完成（2026-10-13，v0.1 收尾），实现记录见 §14.1，完整验收记录见
+> `docs/GIT_MCP_ACCEPTANCE.md`；唯一未闭环项为真实 Cline GUI 冒烟（记录表待人工回填）。**

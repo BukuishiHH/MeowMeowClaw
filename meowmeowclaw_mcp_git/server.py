@@ -143,7 +143,7 @@ def main(argv: Optional[Sequence[str]] = None, *, environ: Optional[Mapping[str,
         return 2
     configure_stderr_logging(config.log_level)
     if config.audit_log:
-        logger.info("--audit-log 已记录, 审计写入将在后续里程碑接入(GM6): %s", config.audit_log)
+        logger.info("工具调用审计已启用(--audit-log): %s", config.audit_log)
     if config.lock_dir:
         logger.info("跨进程仓库写锁已启用: %s", config.lock_dir)
     logger.info("启动 %s %s: %s", SERVER_NAME, __version__, config.describe())

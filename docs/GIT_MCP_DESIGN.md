@@ -717,7 +717,7 @@ stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.
 
 | 里程碑 | 状态 | 提交 | 备注 |
 |---|---|---|---|
-| GM1 | 已完成 | 待回填 | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
+| GM1 | 已完成 | `d010f63` | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
 | GM2 | 待实现 | — | 只读工具集 + 解析 + 输出预算 |
 | GM3 | 待实现 | — | 安全写 + dirty/分支保护 + 锁 |
 | GM4 | 待实现 | — | fetch + prompts/resources |

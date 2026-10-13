@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 56 个源码模块 / 约 13200 行; 测试 60 个文件 / **1697 个用例**(1689 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 68 个源码模块 / 约 15200 行; 测试 67 个文件 / **1833 个用例**(1825 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -594,7 +594,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 1689 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 1825 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -652,6 +652,13 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
 | `test_config.py` | 167 | 取值优先级、路径/记忆目录解析、窗口/运行时缓存/子代理配置、非法值兜底、密钥掩码 |
+| `mcp_git/test_mcp_git_config.py` | 35 | **GM1**: CLI/env 优先级、布尔/正数/枚举校验、roots/repos 解析 |
+| `mcp_git/test_mcp_git_registry.py` | 24 | **GM1**: alias/允许根、工作树顶层、越界路径与符号链接逃逸 |
+| `mcp_git/test_mcp_git_status_parser.py` | 21 | **GM1**: porcelain v2(NUL/行/C 引号/rename/冲突/畸形/截断尾段) |
+| `mcp_git/test_mcp_git_status_tool.py` | 20 | **GM1**: `git_status` 端到端(干净/dirty/ahead-behind/unborn/detached/Unicode/截断) |
+| `mcp_git/test_mcp_git_runner.py` | 17 | **GM1**: 参数列表、环境清洗、超时杀进程组、输出截断与错误码 |
+| `mcp_git/test_mcp_git_app.py` | 11 | **GM1**: 权限矩阵、统一信封、内部错误兜底 |
+| `mcp_git/test_mcp_git_protocol.py` | 8 | **GM1**: MCP 握手/工具列表/调用、真实 stdio 会话、stdout 纯净性 |
 
 ---
 
@@ -665,7 +672,18 @@ MeowMeowClaw/
 │   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 60 个测试文件 / 1697 用例(agent/skills/tools/memory/channels/gateway/subagent 分层)
+├── tests/                       # 67 个测试文件 / 1833 用例(agent/skills/tools/memory/channels/gateway/subagent/mcp_git 分层)
+├── docs/                        # 设计文档(Git MCP Server 见 docs/GIT_MCP_DESIGN.md)
+├── meowmeowclaw_mcp_git/        # GM1: 独立 Git MCP Server(stdio, 默认只读; 可选依赖组 mcp-git)
+│   ├── app.py                   # 协议无关装配/权限矩阵/统一信封
+│   ├── server.py                # MCP stdio 适配(唯一 import mcp 的模块)
+│   ├── config.py                # 启动参数与环境变量(§3.1 全量键)
+│   ├── registry.py              # RepoRegistry(alias/允许根/工作树顶层/路径校验)
+│   ├── runner.py                # GitRunner(参数列表/超时/截断/环境清洗)
+│   ├── envelope.py / errors.py  # {ok,data,meta} 信封与错误码
+│   ├── validation.py            # 工具参数校验(JSON Schema 子集)
+│   ├── parsers/                 # git 输出结构化解析(GM1: status)
+│   └── tools/                   # ToolSpec + git_status
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -735,6 +753,7 @@ MeowMeowClaw/
 
 - A+（会话 IO 尾读 + 运行时生命周期 + 指标）**A1–A5 已全部落地（2026-10-13）**：指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口 / `_SessionRuntime` refcount·LRU·TTL 生命周期 / 配置透传与冒烟验收；设计与记录见 `docs/A_PLUS_OPTIMIZATION.md`，网关接入小结见 `docs/GATEWAY_DESIGN.md` §16.7
 - 子代理 v1（`SpawnSubagentTool`）**SA1–SA5 已落地**（默认 `subagent_enabled=false`）：深度/预算/上下文隔离、顺序调度、workspace 变更锁 + 读后写 OCC + 原子写、exec 环境清洗/策略/取消清理/审计、`ConversationService.stats()["subagents"]`；SA6 验收收尾中，设计与记录见 `docs/SUBAGENT_DESIGN.md`
+- Git MCP Server(`meowmeowclaw_mcp_git`, 独立 stdio 服务, **不改动主 Agent**) **GM1 已落地(2026-10-13)**: MCP 握手 + RepoRegistry(alias/允许根/工作树顶层) + GitRunner(参数列表/超时/截断) + `git_status`(porcelain v2 结构化, 默认只读, `short` 摘要); 安装 `pip install -e ".[mcp-git]"`, Cline 最小配置与实现记录见 `docs/GIT_MCP_DESIGN.md` §14.1; GM2–GM6 按里程碑推进
 - 流式输出已落地 **S1–S5.1**（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式，`stream_enabled` 默认 `false`）；里程碑、实测数据与验收见 `docs/STREAMING_DESIGN.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现

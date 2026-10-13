@@ -1,8 +1,8 @@
 # MeowMeowClaw Git MCP Server 设计（v1）
 
-> 状态：**设计待评审（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> 状态：**评审通过，GM1 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
 > Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
-> 评审通过后按 §10 里程碑（MG1–MG6）逐步实现，每阶段独立提交。
+> 按 §10 里程碑（GM1–GM6）逐步实现，每阶段独立提交；实施状态与实现记录见 §14。
 > 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
 > `meowmeowclaw/memory/filelock.py`、`pyproject.toml`。
 
@@ -98,32 +98,29 @@ Tools / Resources / Prompts 能力。当前 MeowMeowClaw 主项目提供了 `rea
 | `LockManager` | 每 repo 进程内锁 + 可选跨进程锁 | 业务 |
 | `AuditSink` | 可选 JSONL 审计：工具、repo、参数摘要、结果、耗时 | 业务决策 |
 
-### 2.3 建议目录结构
+### 2.3 目录结构（GM1 已落地部分）
 
 ```
-meowmeowclaw_mcp_git/
-├── __init__.py
-├── __main__.py          # python -m ... 入口
-├── server.py            # MCP Server 装配/注册
-├── config.py            # 启动参数与环境变量
-├── registry.py          # RepoRegistry(alias/allow roots)
-├── policy.py            # PolicyEngine(权限/分支/路径)
-├── runner.py            # GitRunner(subprocess/timeout/limits)
+meowmeowclaw_mcp_git/      # 顶层独立包(不并入主 Agent; 主项目运行时不依赖 mcp)
+├── __init__.py            # 版本与分层说明(import 无副作用)
+├── __main__.py            # python -m ... 入口(缺 SDK 时 stderr 提示 + 退出码 3)
+├── app.py                 # 协议无关核心: 装配 + 权限矩阵 + 统一信封 + 派发
+├── server.py              # MCP stdio 适配(唯一 import mcp 的模块)
+├── config.py              # 启动参数与环境变量(CLI > env > 默认)
+├── registry.py            # RepoRegistry(alias/允许根/工作树顶层/路径校验)
+├── runner.py              # GitRunner(subprocess/timeout/截断/环境清洗)
+├── validation.py          # 工具参数校验(JSON Schema 子集)
+├── envelope.py            # {ok,data,meta} / {ok,error_code,message,meta}
+├── errors.py              # 错误码与异常类型
 ├── parsers/
-│   ├── status.py
-│   ├── diff.py
-│   ├── log.py
-│   └── ...
-├── tools/
-│   ├── read.py          # git_status/git_diff/git_log/...
-│   ├── write.py         # git_stage/git_commit/git_branch/...
-│   ├── remote.py        # git_fetch/git_list_remotes
-│   └── stash.py
-├── prompts.py           # MCP prompts
-├── resources.py         # MCP resources
-├── audit.py             # 可选审计
-└── errors.py
+│   └── status.py          # git status porcelain v2(GM2 追加 diff/log/...)
+└── tools/
+    ├── base.py            # ToolSpec / ToolContext / ToolOutcome
+    └── read.py            # git_status(GM2 追加其余只读工具)
 ```
+
+> GM3 起新增 `policy.py`(PolicyEngine)/ `locks.py`(每仓库锁)、GM4 新增 `remote.py`/
+> `prompts.py`/`resources.py`、GM6 新增 `audit.py`; 目录按里程碑增量演进。
 
 ### 2.4 与 MeowMeowClaw 主项目的关系
 
@@ -132,7 +129,7 @@ meowmeowclaw_mcp_git/
   1. Git MCP Server 作为 MeowMeowClaw 的 MCP Client 后端，提供 Git 工具；
   2. 与 `docs/SUBAGENT_DESIGN.md` 的 workspace 变更锁共用同一把 lock 文件，
      让 Cline 的 Git 写操作与 MeowMeowClaw 子代理的 write/exec 不互相踩踏；
-- 上述协同不在 MG1–MG6 首版范围内，作为 §12 优化项。
+- 上述协同不在 GM1–GM6 首版范围内，作为 §12 优化项。
 
 ---
 
@@ -162,6 +159,14 @@ meowmeowclaw_mcp_git/
 - 工具调用只接受 `repo`（alias）与仓库内相对路径，禁止绝对路径、`..`、工作区外路径；
 - worktree/submodule 额外校验（见 §6.5）。
 
+GM1 实现补充：
+
+- repo 路径必须是 git 工作树**顶层**（`git rev-parse --show-toplevel` 的 realpath 与配置路径一致）；
+  指向仓库子目录或裸仓库时启动即拒绝，避免 `git -C <subdir>` 把作用域扩大到父仓库；
+- 只配置 `--repos`（无 `--root` / `--roots`）时，每个 repo 路径自身作为允许根；
+- alias 精确匹配（大小写敏感），大小写策略开关留待后续里程碑；
+- `resolve_path` 拒绝绝对路径、任何 `..` 段（即使最终不越界）以及 realpath 后逃逸出仓库的符号链接。
+
 ### 3.3 安全等级
 
 每个工具注册时标记 `read | write | remote | destructive` 等级：
@@ -181,7 +186,7 @@ meowmeowclaw_mcp_git/
 
 | 工具 | 作用 | 关键参数 | 备注 |
 |---|---|---|---|
-| `git_status` | 工作区/暂存区/分支状态 | `repo`、`short` | porcelain v2 结构化 |
+| `git_status` | 工作区/暂存区/分支状态 | `repo`、`short` | porcelain v2 结构化；**GM1 已实现** |
 | `git_diff` | 工作区/暂存/commit/range 差异 | `repo`、`mode`、`base`、`head`、`paths`、`stat_only`、`context_lines` | 默认限制输出 |
 | `git_log` | 提交历史 | `repo`、`max_count`、`author`、`since`、`until`、`path`、`grep` | 默认 20 条 |
 | `git_show` | 单个 commit/tag/对象 | `repo`、`ref`、`stat_only` | 限制大小 |
@@ -194,6 +199,10 @@ meowmeowclaw_mcp_git/
 | `git_search_history` | 历史 diff 搜索 | `repo`、`pattern`、`pickaxe`、`max_count` | `-S`/`-G` |
 | `git_rev_parse` | ref 解析 | `repo`、`ref`、`short` | — |
 | `git_config_get` | 读取配置 | `repo`、`key` | 只读 |
+
+> GM1 只注册 `git_status`（其余 A 组工具 GM2 补齐）。`short=true` 只返回分支信息与各组计数、
+> 省略逐文件列表，用于大工作区的上下文预算；`short=false`（默认）返回 staged/unstaged/
+> untracked/conflicts/renames 结构化路径列表。
 
 #### B. 安全写类（默认不 autoApprove；需 `read_only=false`）
 
@@ -245,7 +254,7 @@ meowmeowclaw_mcp_git/
   "meta": {
     "repo": "my-app",
     "cwd": "/allowed/roots/my-app",
-    "command": ["git", "status", "--porcelain=v2", "--branch"],
+    "command": ["git", "--no-pager", "-C", "/allowed/roots/my-app", "status", "--porcelain=v2", "--branch", "-z"],
     "exit_code": 0,
     "truncated": false,
     "elapsed_ms": 12
@@ -258,6 +267,10 @@ meowmeowclaw_mcp_git/
 `not_a_repo` / `repo_not_found` / `policy_denied` / `dirty_worktree` / `protected_branch` /
 `invalid_path` / `invalid_argument` / `command_timeout` / `command_failed` / `output_truncated` /
 `unsupported_in_v1`。
+
+> GM1 实现补充：失败信封为**扁平结构** `{ok:false, error_code, message, meta}`，`meta` 恒存在
+> （可能为空对象）；新增 `parse_failed`（git 输出无法解析，§5.3）与 `internal_error`
+> （未处理异常兜底，绝不把堆栈泄漏给协议层）。可选参数显式传 `null` 视为未提供。
 
 ### 4.3 Resources
 
@@ -292,7 +305,7 @@ Prompts 只生成消息内容，不执行写操作。
 `GitRunner` 统一执行 Git，禁止任何 shell：
 
 ```text
-git -C <repo_path> [--no-pager] <subcommand> [args...]
+git --no-pager -C <repo_path> <subcommand> [args...]
 ```
 
 - `subprocess` 使用参数列表，禁止 `shell=True`；
@@ -318,7 +331,7 @@ git -C <repo_path> [--no-pager] <subcommand> [args...]
 
 | 数据 | 解析方式 |
 |---|---|
-| status | `git status --porcelain=v2 --branch` |
+| status | `git status --porcelain=v2 --branch -z`（NUL 分隔，文件名含空格/换行不被误切） |
 | diff | `git diff --stat` / `--numstat` + 可选原始 patch |
 | log | `git log --pretty=format:%H%x00%h%x00%an%x00%aI%x00%s%x00` 等稳定的 NUL 分隔格式 |
 | branch | `git for-each-ref --format=...` |
@@ -458,7 +471,8 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 - `autoApprove` **只放只读工具**；
 - `git_stage`/`git_commit`/`git_branch_*`/`git_stash`/`git_restore`/`git_fetch` 留给 Cline 用户确认；
-- 如果只做只读使用：配置 `--read-only=true`，写工具不注册。
+- 如果只做只读使用：配置 `--read-only=true`，写工具不注册；
+- GM1 阶段只注册 `git_status`，最小可用配置（`autoApprove: ["git_status"]`）见 §14.1 实现记录。
 
 ### 7.3 上下文预算
 
@@ -558,6 +572,10 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 **提交建议**：`feat(mcp-git): GM1 stdio 骨架与 git_status`
 
+**验收结果（2026-10-13）**：已落地。真 SDK 客户端可握手并列出/调用 `git_status`；临时仓库的
+branch/ahead/behind/staged/unstaged/untracked/conflicts 返回正确；stdout 仅协议消息、日志全在
+stderr；默认只读（`read_only=true` 时不注册写工具）。详见 §14.1。
+
 ### 10.3 GM2：只读工具集（2–2.5d）
 
 **交付物**
@@ -654,7 +672,7 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 ## 11. 验收清单
 
-- [ ] GM1：MCP 握手/工具列表/`git_status` 通过；
+- [x] GM1：MCP 握手/工具列表/`git_status` 通过（2026-10-13，见 §14.1）；
 - [ ] GM2：只读工具齐全、结构化、有输出预算；
 - [ ] GM3：写工具默认关闭、dirty/保护分支/锁生效；
 - [ ] GM4：fetch 默认关闭、prompts/resources 可用；
@@ -695,11 +713,11 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 ---
 
-## 14. 实施状态（待更新）
+## 14. 实施状态
 
 | 里程碑 | 状态 | 提交 | 备注 |
 |---|---|---|---|
-| GM1 | 待实现 | — | MCP 骨架 + RepoRegistry + git_status |
+| GM1 | 已完成 | 待回填 | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
 | GM2 | 待实现 | — | 只读工具集 + 解析 + 输出预算 |
 | GM3 | 待实现 | — | 安全写 + dirty/分支保护 + 锁 |
 | GM4 | 待实现 | — | fetch + prompts/resources |
@@ -708,7 +726,68 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 ### 14.1 实现记录
 
-（待各里程碑完成后回填提交号、用例数与验证结论。）
+#### GM1 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw_mcp_git/__init__.py` / `__main__.py`（新增） | 顶层独立包 + `python -m` 入口；缺 `mcp` 时 stderr 提示 `pip install 'meowmeowclaw[mcp-git]'` 并返回退出码 3；包 import 不依赖 SDK |
+| `meowmeowclaw_mcp_git/config.py`（新增） | §3.1 启动键解析（CLI > env > 默认）：`--root`/`--roots`/`--repos`、只读/远端/破坏性开关、保护分支、超时、输出上限、日志级别；布尔/正数/枚举校验；`--audit-log`/`--lock-dir` 先收下（GM6/GM3 消费） |
+| `meowmeowclaw_mcp_git/registry.py`（新增） | `RepoEntry` + `RepoRegistry`：允许根 realpath、alias 唯一、工作树顶层校验、非 git/子目录/裸仓库启动即拒；`resolve_path` 拒绝绝对路径/`..`/符号链接逃逸 |
+| `meowmeowclaw_mcp_git/runner.py`（新增） | `GitRunner`：`git --no-pager -C <repo> …` 参数列表（无 shell）、环境清洗（§5.2）、硬超时杀进程组、输出上限截断标记、`GitCommandError`/`CommandTimeoutError` |
+| `meowmeowclaw_mcp_git/parsers/status.py`（新增） | porcelain v2（`--branch -z`）解析 branch/upstream/ahead/behind 与 staged/unstaged/untracked/conflicts/renames；行模式 C-style 引号解码；未知行报 `parse_failed`，截断尾段丢弃 |
+| `meowmeowclaw_mcp_git/errors.py` / `envelope.py` / `validation.py`（新增） | 错误码与异常、统一信封、JSON Schema 子集参数校验 |
+| `meowmeowclaw_mcp_git/tools/base.py` / `tools/read.py`（新增） | `ToolSpec`/`ToolContext`/`ToolOutcome` 声明式工具表 + `git_status` 处理器（含 `short` 摘要模式） |
+| `meowmeowclaw_mcp_git/app.py`（新增） | 协议无关装配与派发：权限矩阵工具选择、统一信封、未处理异常兜底 `internal_error` |
+| `meowmeowclaw_mcp_git/server.py`（新增） | MCP stdio 适配：`list_tools`/`call_tool`（`validate_input=False` 走自有信封）；日志只写 stderr |
+| `pyproject.toml` / `.github/workflows/ci.yml` | 新增可选依赖组 `mcp-git = ["mcp>=1.0,<2"]`（主项目运行时不引入）；CI 安装 `.[dev,mcp-git]` 并把新包纳入 ruff |
+| `tests/mcp_git/*`（新增 7 个文件） | 136 用例：配置/registry/runner/status parser/app 权限矩阵/`git_status` 端到端/协议握手与 stdout 纯净性 |
+| `README.md` | 规模数据、测试表、目录结构、Roadmap 同步 |
+
+**关键实现决策**
+
+- **默认只读**：`read` 始终注册，`write` 仅 `read_only=false`、`remote` 仅 `allow_remote=true`、
+  `destructive` v1 永不注册——权限矩阵在 `app.select_tools` 一处收口（§3.3/§6.2）；
+- **仓库边界**：配置路径必须是工作树顶层，避免 alias 指向子目录后 git 操作越权到父仓库（§6.1 T1）；
+- **`git_status` 解析**：生产路径用 `--porcelain=v2 --branch -z`，文件名含空格/换行不被误切；
+  行分隔输入按 C-style 引号解码（`\t`/`\NNN`），供 fixture 与调试使用；
+- **输出预算**：`short=true` 只回计数；输出被截断时返回 `output_truncated` 错误而不是残缺文件
+  列表，避免模型把“截断后的干净”当成真的干净（G3/T7）；
+- **错误契约**：失败统一扁平信封且 `meta` 恒存在；`internal_error` 兜底未处理异常；
+- **空值与缺省**：可选参数显式 `null` 视为未提供；单仓库模式下 `repo` 可省略；
+- **alias 大小写**：GM1 精确匹配（大小写敏感），大小写开关留待后续；
+- `--allow-destructive=true` 也不注册破坏性工具；`mcp` 只在 `server.py` 导入，其余层可无 SDK 单测（G7）。
+
+**验证**
+
+- `python -m meowmeowclaw_mcp_git --root <repo>`：真 SDK 客户端握手成功，`tools/list` 仅
+  `git_status`，`tools/call` 返回结构化 branch/ahead/behind/staged/unstaged/untracked/conflicts；
+- stdout 纯净性：空 stdin 启动/退出后 stdout 为 0 字节、日志全在 stderr；真实 stdio 子进程会话可握手/调用；
+- 错误路径：未知 alias → `repo_not_found`；多仓库缺 `repo`、参数类型错误、未知参数/工具 →
+  `invalid_argument`；非仓库根/子目录/裸仓库 → 启动退出码 2 且 stderr 有明确说明；
+- 全量回归 **1825 passed / 6 skipped / 2 xfailed**（新增 136 用例）；`ruff check meowmeowclaw
+  meowmeowclaw_mcp_git tests` 通过；
+- Cline 最小配置（GM1 只注册 `git_status`）：
+
+```json
+{
+  "mcpServers": {
+    "git": {
+      "command": "/path/to/python",
+      "args": ["-m", "meowmeowclaw_mcp_git", "--root", "/path/to/repo", "--read-only=true"],
+      "disabled": false,
+      "autoApprove": ["git_status"]
+    }
+  }
+}
+```
+
+- 本阶段不做：其余只读工具（GM2）、写工具与锁（GM3）、fetch/prompts/resources（GM4）、
+  Cline 配置模板与真实 GUI 冒烟（GM5/GM6）。
+
+**备注**：`python -m` 需要包可导入（源码运行需项目根在 `PYTHONPATH`，或执行
+`pip install -e ".[mcp-git]"`）；`--audit-log`/`--lock-dir` 当前只记录并提示未接入。
 
 ---
 
@@ -767,5 +846,6 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 
 ---
 
-> 本文是 Git MCP Server 的实现依据。评审通过后按 §10 里程碑 MG1–MG6 推进；
+> 本文是 Git MCP Server 的实现依据。按 §10 里程碑（GM1–GM6）推进；
 > 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
+> **GM1 已完成（2026-10-13），实现记录见 §14.1；GM2 待评审确认后启动。**

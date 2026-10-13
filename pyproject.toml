@@ -28,6 +28,10 @@ tokenizers = [
   "tiktoken>=0.7",
   "tokenizers>=0.19"
 ]
+# Git MCP Server(GM1+, docs/GIT_MCP_DESIGN.md): 独立工具面, 主项目运行时不依赖 mcp
+mcp-git = [
+  "mcp>=1.0,<2"
+]
 
 [project.scripts]
 meowmeowclaw = "meowmeowclaw.cli:main"

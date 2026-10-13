@@ -26,6 +26,7 @@ from meowmeowclaw.memory import (
     SessionStore,
     SessionSummary,
 )
+from meowmeowclaw.subagent.models import SubagentStats
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ class ConversationService:
         max_turns / max_chars: 装载历史时的窗口上限
         max_cached_sessions: 运行时缓存容量上限(<=0 视为不限制); 超限时按 LRU 淘汰空闲运行时
         cache_idle_seconds: 空闲 TTL 秒数(<=0 关闭自动 TTL); 显式 ``evict_idle()`` 不受此限制
+        subagent_stats: 子代理观测计数器(SA5); None 时使用 enabled=False 空快照
     """
 
     def __init__(
@@ -102,6 +104,7 @@ class ConversationService:
         max_chars: int = DEFAULT_MAX_CHARS,
         max_cached_sessions: int = DEFAULT_MAX_CACHED_SESSIONS,
         cache_idle_seconds: float = DEFAULT_CACHE_IDLE_SECONDS,
+        subagent_stats: Optional[SubagentStats] = None,
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns 必须为正整数")
@@ -113,6 +116,8 @@ class ConversationService:
         self.max_chars = max_chars
         self.max_cached_sessions = int(max_cached_sessions)
         self.cache_idle_seconds = float(cache_idle_seconds)
+        # SA5: None = 子代理未启用, stats 时返回 enabled=False 空快照(不提前构造对象)
+        self._subagent_stats: Optional[SubagentStats] = subagent_stats
         # storage_id -> _SessionRuntime(agent + lock 一起管理, 按 last_used 排序供 LRU)
         self._runtimes: "OrderedDict[str, _SessionRuntime]" = OrderedDict()
         # A1 观测: 会话运行时被淘汰的次数(A4 的生命周期 API 会递增)
@@ -346,14 +351,16 @@ class ConversationService:
         return self._sweep_expired(ttl)
 
     def stats(self) -> dict[str, Any]:
-        """运行时观测快照(A1/A4, 见 docs/A_PLUS_OPTIMIZATION.md §3.1/§3.4).
+        """运行时观测快照(A1/A4/SA5, 见 docs/A_PLUS_OPTIMIZATION.md §3.1/§3.4, docs/SUBAGENT_DESIGN.md §8.1).
 
         ``{"cached_agents": int, "locks": int, "evictions": int,
-        "store": <SessionStore.stats() 或 {}>, "rss_mb": float | None}``
+        "store": <SessionStore.stats() 或 {}>, "rss_mb": float | None,
+        "subagents": <SubagentStats.snapshot()>}``
 
         - ``cached_agents`` / ``locks``: 当前 ``_SessionRuntime`` 数量(agent 与 lock 一一对应);
         - ``evictions``: 生命周期 API 累计淘汰的运行时数;
-        - 纯观测: 任何取值失败都只降级为 ``{}`` / ``None``, 不影响会话主流程。
+        - ``subagents``: 子代理观测(未启用时为 enabled=False 的全零快照);
+        - 纯观测: 任何取值失败都只降级为 ``{}`` / ``None`` / 空快照, 不影响会话主流程。
         """
         store_stats: dict[str, Any] = {}
         store_stats_fn = getattr(self.store, "stats", None)
@@ -362,11 +369,22 @@ class ConversationService:
                 store_stats = dict(store_stats_fn())
             except Exception:  # noqa: BLE001 观测失败不影响主流程
                 logger.warning("读取 store.stats() 失败(已忽略)", exc_info=True)
+
+        try:
+            if self._subagent_stats is None:
+                subagent_stats = SubagentStats(enabled=False).snapshot()
+            else:
+                subagent_stats = self._subagent_stats.snapshot()
+        except Exception:  # noqa: BLE001 观测失败不影响主流程
+            logger.warning("读取 SubagentStats.snapshot() 失败(已忽略)", exc_info=True)
+            subagent_stats = SubagentStats(enabled=False).snapshot()
+
         return {
             "cached_agents": len(self._runtimes),
             "locks": len(self._runtimes),
             "evictions": self._evictions,
             "store": store_stats,
+            "subagents": subagent_stats,
             "rss_mb": current_rss_mb(),
         }
 

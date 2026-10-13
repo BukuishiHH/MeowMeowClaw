@@ -202,6 +202,9 @@ class TestBuildApplication:
         app = build_application()
 
         assert "spawn_subagent" not in app.registry.list_tools()
+        assert app.conversation.stats()["subagents"]["enabled"] is False
+        # 关闭子代理时不装配变更锁, 主代理 write 行为与旧版一致
+        assert app.registry.get("write_file")._mutation_guard is None  # noqa: SLF001
 
     def test_subagent_enabled_registers_spawn_tool(self, monkeypatch, tmp_path):
         config = make_settings(
@@ -209,6 +212,8 @@ class TestBuildApplication:
             subagent_enabled=True,
             subagent_max_depth=3,
             subagent_model="small-model",
+            subagent_max_children_per_turn=2,
+            subagent_max_total_per_turn=4,
         )
         monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
 
@@ -222,6 +227,13 @@ class TestBuildApplication:
         assert set(spawn["function"]["parameters"]["required"]) == {"task"}
         # SA3: 主代理 write_file 也接入同一把工作区变更锁
         assert app.registry.get("write_file")._mutation_guard is not None  # noqa: SLF001
+        # SA4/SA5: exec 也接入同一把锁; 子代理统计已接入 ConversationService.stats()
+        assert app.registry.get("exec")._mutation_guard is not None  # noqa: SLF001
+        assert app.conversation.stats()["subagents"]["enabled"] is True
+        factory = app.registry.get("spawn_subagent")._factory  # noqa: SLF001
+        assert factory.max_children_per_turn == 2
+        assert factory.max_total_per_turn == 4
+        assert factory.model == "small-model"
 
     def test_load_config_is_called_once(self, monkeypatch):
         loader = MagicMock(return_value=make_settings())

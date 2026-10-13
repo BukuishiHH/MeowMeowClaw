@@ -163,8 +163,9 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         memory_path=config.memory_dir / "MEMORY.md",
     )
 
-    # 子代理(SA2/SA3): 默认关闭; 开启时构造 factory 并把 depth0 spawn 工具注册给主代理。
-    # SA3 开放 write_file(带独立 tracker/OCC); exec 仍由 factory 过滤, 留待 SA4。
+    # 子代理(SA2–SA5): 默认关闭; 开启时构造 factory 并把 depth0 spawn 工具注册给主代理。
+    # write OCC + exec 策略/审计均已装配; 子代理统计通过 ConversationService.stats() 暴露。
+    subagent_stats = None
     if config.subagent_enabled:
         from meowmeowclaw.subagent.audit import SubagentAuditWriter
         from meowmeowclaw.subagent.factory import SubagentFactory
@@ -178,6 +179,7 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
             if config.subagent_audit_enabled
             else None
         )
+        subagent_stats = SubagentStats(enabled=True)
         subagent_factory = SubagentFactory(
             provider=provider,
             base_registry=registry,
@@ -198,7 +200,7 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
             exec_env_allowlist=config.subagent_exec_env_allowlist,
             sensitive_paths=config.subagent_sensitive_paths,
             audit_writer=audit_writer,
-            stats=SubagentStats(enabled=True),
+            stats=subagent_stats,
         )
         registry.register(subagent_factory.make_root_tool())
         logger.info("子代理已装配: %r (SA4: write OCC + exec 策略/审计)", subagent_factory)
@@ -258,6 +260,7 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         max_chars=config.memory_max_chars,
         max_cached_sessions=config.memory_max_cached_sessions,
         cache_idle_seconds=config.memory_cache_idle_seconds,
+        subagent_stats=subagent_stats,
     )
 
     application = Application(

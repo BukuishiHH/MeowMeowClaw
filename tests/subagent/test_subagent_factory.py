@@ -599,3 +599,97 @@ class TestRootAgentLoopIntegration:
         # depth2 子代理收到的工具定义里没有 spawn_subagent
         assert provider.depth2_tools
         assert all("spawn_subagent" not in names for names in provider.depth2_tools)
+
+
+class TestBudgetResetAndSequentialExecution:
+    @pytest.mark.asyncio
+    async def test_root_turn_budget_resets_each_run_turn(self):
+        class TurnProvider(CapturingProvider):
+            async def chat(self, messages, tools=None, model=None, max_tokens=None):
+                self.calls.append(
+                    {
+                        "messages": [dict(message) for message in messages],
+                        "tools": list(tools or []),
+                        "model": model,
+                    }
+                )
+                system = str(messages[0].get("content") or "")
+                if "只负责完成父代理分配的任务" in system:
+                    return LLMResponse(content="子结果", finish_reason=FINISH_REASON_STOP)
+                if messages and messages[-1].get("role") == "tool":
+                    return LLMResponse(content="父完成", finish_reason=FINISH_REASON_STOP)
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id="call_spawn",
+                            name="spawn_subagent",
+                            arguments={"task": "子任务"},
+                        )
+                    ],
+                    finish_reason=FINISH_REASON_TOOL_CALLS,
+                )
+
+        provider = TurnProvider()
+        factory = make_factory(
+            provider,
+            base_registry_with("read_file"),
+            max_children_per_turn=1,
+            max_total_per_turn=1,
+        )
+        root_registry = ToolRegistry()
+        root_registry.register(factory.make_root_tool())
+        loop = AgentLoop(
+            provider=provider,
+            tools=root_registry,
+            context=SimpleContextBuilder(),
+            max_iterations=3,
+        )
+
+        first = await asyncio.wait_for(loop.run_turn("第一轮"), timeout=5)
+        second = await asyncio.wait_for(loop.run_turn("第二轮"), timeout=5)
+
+        assert first.completed and second.completed
+        # 每轮 budget 都必须重置: 两个 turn 各允许 1 次 spawn
+        assert factory.stats.snapshot()["spawned_total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_factory_serializes_concurrent_roots(self):
+        class ConcurrencyProvider(CapturingProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.active = 0
+                self.max_active = 0
+
+            async def chat(self, messages, tools=None, model=None, max_tokens=None):
+                self.calls.append(
+                    {
+                        "messages": [dict(message) for message in messages],
+                        "tools": list(tools or []),
+                        "model": model,
+                    }
+                )
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    await asyncio.sleep(0.02)
+                    return LLMResponse(content="子结果", finish_reason=FINISH_REASON_STOP)
+                finally:
+                    self.active -= 1
+
+        provider = ConcurrencyProvider()
+        factory = make_factory(provider, base_registry_with("read_file"))
+        first_ctx = SpawnContext(
+            root_id="root-1", parent_id="root", depth=0, budget=SubagentBudget()
+        )
+        second_ctx = SpawnContext(
+            root_id="root-2", parent_id="root", depth=0, budget=SubagentBudget()
+        )
+
+        results = await asyncio.gather(
+            factory.spawn(SubagentRequest(task="任务一"), first_ctx),
+            factory.spawn(SubagentRequest(task="任务二"), second_ctx),
+        )
+
+        assert [item.status for item in results] == [STATUS_OK, STATUS_OK]
+        assert provider.max_active == 1  # SA5: 多个 root 并发时仍顺序执行

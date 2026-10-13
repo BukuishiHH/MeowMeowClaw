@@ -96,6 +96,12 @@ class AgentTurnContext:
     turn_id: str
     budget: Any = None
 
+    def ensure_budget(self, factory: Callable[[], Any]) -> Any:
+        """延迟创建并返回本 turn 的子代理预算; 同 turn 内多次 spawn 复用同一对象."""
+        if self.budget is None:
+            self.budget = factory()
+        return self.budget
+
 
 CURRENT_AGENT_TURN: ContextVar[Optional[AgentTurnContext]] = ContextVar(
     "meowmeowclaw_current_agent_turn", default=None

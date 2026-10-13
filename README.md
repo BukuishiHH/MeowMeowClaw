@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 49 个源码模块 / 约 11000 行; 测试 52 个文件 / **1564 个用例**(1556 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 56 个源码模块 / 约 13200 行; 测试 60 个文件 / **1697 个用例**(1689 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -52,6 +52,24 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 | `memory_max_chars` | `120000` | 装载历史窗口的字符上限(≈60k 中文 token); 非法或 <=0 回退默认 |
 | `memory_max_cached_sessions` | `256` | 会话运行时(AgentLoop + 串行锁)缓存上限; `<=0` 不限制, 超限按 LRU 淘汰空闲会话 |
 | `memory_cache_idle_seconds` | `0` | 空闲会话运行时自动淘汰秒数; `0` 关闭自动 TTL(仅容量 LRU + 显式清理) |
+| `subagent_enabled` | `false` | 子代理总开关; `false` 时不注册 `spawn_subagent`, 行为与现状一致 |
+| `subagent_max_depth` | `3` | 总层数(含主代理): depth 0/1 可 spawn, depth 2 不提供 spawn 工具 |
+| `subagent_model` | 空 | 子代理模型; 空 = 继承主 `model` |
+| `subagent_max_iterations` | `8` | 子代理单轮最大"模型↔工具"往返 |
+| `subagent_timeout_seconds` | `120` | 单个子代理整体超时(秒, 含工具执行) |
+| `subagent_max_children_per_turn` | `3` | 单个父代理每 root turn 最多 spawn 的直接子代理数 |
+| `subagent_max_total_per_turn` | `6` | 一棵 root turn 内子代理总数上限 |
+| `subagent_result_max_chars` | `8000` | 返回给父代理的 JSON 摘要最大字符数(超出优先截断 summary) |
+| `subagent_tools` | 读/写/执行 7 项 | 子代理工具白名单; `spawn_subagent` 由深度自动决定; 只读子代理可删除 `write_file`/`exec` |
+| `subagent_exec_policy` | `guarded` | `guarded`(默认)/`allowlist`; `sandbox` 预留未实现时回退 guarded |
+| `subagent_exec_allowlist` | 空 | `allowlist` 模式允许的命令前缀(逗号分隔) |
+| `subagent_exec_env_allowlist` | 空 | exec 额外放行的环境变量名(密钥/代理变量始终剔除) |
+| `subagent_write_requires_read` | `true` | 子代理覆盖已存在文件前必须 read 并做 sha256 OCC 校验 |
+| `subagent_sensitive_paths` | `.env,*.pem,*.key,id_rsa*,.git/config` | 子代理 read/write/list 敏感路径拒绝名单 |
+| `subagent_audit_enabled` | `true` | 子代理审计写 `<memory_dir>/subagents/audit.jsonl` |
+| `subagent_audit_max_bytes` | `4194304` | 审计文件轮转阈值(字节) |
+| `workspace_mutation_lock_enabled` | `true` | 工作区变更锁(仅子代理开启时装配); 主/子 write/exec 串行 |
+| `workspace_mutation_lock_timeout` | `90` | 等待变更锁超时秒数 |
 | `compression_enabled` | `true` | 上下文 Token 压缩总开关; `false` 时只按轮数/字符窗口装载历史 |
 | `token_budget` | `48000` | 输入 Token 预算(估算 × 1.1 后比较); 超预算触发摘要/硬裁/工具占位 |
 | `tokenizer` | `auto` | `auto` / `heuristic` / `tiktoken[:encoding]` / `hf` |
@@ -93,6 +111,14 @@ python -m meowmeowclaw                   # 安装后也可以直接运行 meowme
 `memory_max_cached_sessions` 控制容量, 超限时按 LRU 淘汰最久未使用的**空闲**会话; `memory_cache_idle_seconds` 控制空闲
 自动淘汰(`0` 关闭)。在途 turn 通过引用计数保护, 永不换锁/淘汰; `/clear`、purge、QQ 轮换、CLI `/new`·`/clear`
 与进程关停会立即释放。淘汰只丢进程内辅助状态, JSONL 仍是唯一事实源。观测入口: `ConversationService.stats()`。
+
+**子代理(SA1–SA5)**: `subagent_enabled=true` 时主模型获得 `spawn_subagent` 工具; 子代理拥有独立 `AgentLoop`、
+system prompt、消息历史、模型与工具白名单, 只接收 `task/role/context`, 结果以 JSON 摘要回填, 不写主 JSONL。
+深度上限 3(主 + 2 层); 每 root turn 有 children/total 预算; 首版顺序执行且不外发中间进度。
+竞态护栏: 主/子代理的 `write_file`/`exec` 共用 workspace 变更锁 + 子代理读后写 sha256 OCC + 原子替换;
+`exec` 默认 `guarded`(环境清洗 + 后台化拒绝 + 超时/取消杀进程组), 可选 `allowlist`; 敏感路径对子代理默认拒绝。
+观测与审计见 `ConversationService.stats()["subagents"]` 与 `<memory_dir>/subagents/audit.jsonl`。设计细节见
+`docs/SUBAGENT_DESIGN.md`; **`exec` 是护栏而非沙箱**, 生产环境仍建议容器/受限用户。
 
 > 人设文件固定为项目根 `identity.md`，随仓库提供，不再通过 `.env` 配置。
 
@@ -257,14 +283,17 @@ qq_stream_mode=typing        # off | typing | block
 
 | 模块 | 行数 | 职责 | 关键 API |
 | --- | ---: | --- | --- |
-| `meowmeowclaw/config.py` | 684 | 读 `.env`、校验兜底, 纯解析不产生副作用; 含记忆窗口与会话运行时缓存(A4/A5)配置 | `load_config()` / `Settings` |
+| `meowmeowclaw/config.py` | 918 | 读 `.env`、校验兜底, 纯解析不产生副作用; 含记忆/运行时缓存/子代理配置 | `load_config()` / `Settings` |
 | `meowmeowclaw/paths.py` | 40 | 项目根 / `.env` / workspace / 人设路径的唯一来源 | `PROJECT_ROOT` / `resolve_workspace()` / `IDENTITY_FILE` |
 | `meowmeowclaw/llm/base.py` | 104 | LLM 接入抽象 + **统一数据契约** + 流式事件 | `LLMProvider.chat()` / `chat_stream()`、`StreamTextDelta` / `StreamFinal` |
 | `meowmeowclaw/llm/openai_compat.py` | 207 | OpenAI 兼容实现(异常包装为 `finish_reason="error"`) | `OpenAICompatProvider` |
 | `meowmeowclaw/tools/base.py` | 91 | 工具抽象, 产出 OpenAI function 定义 | `BaseTool` |
-| `meowmeowclaw/tools/registry.py` | 57 | 注册、查重、定义查询、按名路由执行 | `ToolRegistry` |
-| `meowmeowclaw/tools/filesystem.py` | 309 | 文件三件套; realpath 路径防护 + 记忆目录策略 + MEMORY.md 备份 | `ReadFileTool` / `WriteFileTool` / `ListDirTool` / `resolve_in_workspace` |
-| `meowmeowclaw/tools/shell.py` | 196 | 工作区内执行命令(黑名单 + 进程组清理) | `ExecTool` |
+| `meowmeowclaw/tools/registry.py` | 85 | 注册、查重、定义查询、按名路由执行; A+ SA2 `subset()`/`get()` | `ToolRegistry` |
+| `meowmeowclaw/tools/filesystem.py` | 520 | 文件三件套; realpath 路径防护 + 记忆目录/敏感路径策略 + MEMORY.md 备份; SA3 变更锁/OCC/原子写 | `ReadFileTool` / `WriteFileTool` / `ListDirTool` / `resolve_in_workspace` |
+| `meowmeowclaw/tools/shell.py` | 296 | 工作区内执行命令(黑名单 + 进程组清理); SA4 环境清洗/命令策略/变更锁/取消清理/审计 | `ExecTool` |
+| `meowmeowclaw/tools/subagent.py` | 153 | `spawn_subagent` function calling 外壳(root 预算/turn 上下文) | `SpawnSubagentTool` |
+| `meowmeowclaw/tools/mutation.py` | 165 | SA3 工作区变更锁/读后写版本表/原子写 | `WorkspaceMutationGuard` / `ReadVersionTracker` / `atomic_write_text` |
+| `meowmeowclaw/tools/exec_policy.py` | 166 | SA4 子代理 exec 环境清洗/命令策略/敏感路径策略 | `build_subagent_env` / `SubagentCommandPolicy` / `SensitivePathPolicy` |
 | `meowmeowclaw/tools/web_search.py` | 139 | DuckDuckGo 搜索(同步库丢线程池) | `WebSearchTool` |
 | `meowmeowclaw/tools/web_fetch.py` | 248 | 网页抓取 → html2text → 清理(SSRF 防护) | `WebFetchTool` |
 | `meowmeowclaw/skills/loader.py` | 237 | 技能扫描/索引/摘要(importlib.resources + 启动扫描一次) | `SkillCatalog` |
@@ -277,9 +306,13 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/memory/tail.py` | 114 | **A+ A2 尾读**: 反向块读完整行、惰性生成器命中即停、首行 header / 末条有效 turn | `read_header` / `read_last_lines` / `read_last_valid_turn` |
 | `meowmeowclaw/memory/noop.py` | 42 | 长期记忆占位实现(v1 由 MEMORY.md 承担) | `NoopLongTermStore` |
 | `meowmeowclaw/memory/filelock.py` | 110 | 跨进程 advisory 文件锁(flock/msvcrt) | `FileLock` / `async_file_lock` |
+| `meowmeowclaw/subagent/models.py` | 391 | **SA1 子代理领域模型**: 请求/结果/预算/统计/状态映射 | `SubagentRequest` / `SubagentResult` / `SubagentBudget` / `SubagentStats` |
+| `meowmeowclaw/subagent/prompt.py` | 89 | **SA2 子代理 prompt**: 固定模板 + context 数据定界, 不注入父历史/人设/MEMORY | `SubagentPromptBuilder` |
+| `meowmeowclaw/subagent/factory.py` | 520 | **SA2–SA5 子代理工厂**: 深度/预算/顺序调度/工具克隆/超时/审计 | `SubagentFactory` |
+| `meowmeowclaw/subagent/audit.py` | 61 | **SA4 子代理审计**: `<memory_dir>/subagents/audit.jsonl` 轮转写入 | `SubagentAuditWriter` |
 | `meowmeowclaw/agent/context.py` | 208 | System Prompt: 按"稳定->易变"排序(prefix caching 友好) | `ContextBuilder.build_system_prompt()` / `build_messages()` |
-| `meowmeowclaw/agent/loop.py` | 459 | **控制流**: 多轮往返、防爆护栏、历史快照、流式增量与工具轮前导抑制 | `AgentLoop.run_turn(on_delta=...)` / `AgentTurn` / `run()` / `clear_history()` |
-| `meowmeowclaw/conversation.py` | 375 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行; A4 `_SessionRuntime` + refcount/LRU/TTL 生命周期 | `ConversationService` / `ConversationResult` |
+| `meowmeowclaw/agent/loop.py` | 511 | **控制流**: 多轮往返、防爆护栏、历史快照、流式增量与工具轮前导抑制; SA2 turn 上下文/预算挂载 | `AgentLoop.run_turn(on_delta=...)` / `AgentTurn` / `run()` / `clear_history()` |
+| `meowmeowclaw/conversation.py` | 393 | **编排层**: 装载历史 -> run_turn -> 仅完整轮次回写; 同会话串行; A4 runtime 生命周期; SA5 `subagents` 统计 | `ConversationService` / `ConversationResult` |
 | `meowmeowclaw/qq.py` | 223 | **QQ 渠道进程入口**: 配置校验/`--check`/装配/信号与优雅关闭/周期状态日志 | `main()` / `run_qq()` / `qq_config_problems()` |
 | `meowmeowclaw/channels/base.py` | 29 | 渠道适配层通用消息类型(传输无关) | `IncomingMessage` / `OutgoingMessage` |
 | `meowmeowclaw/channels/bridge.py` | 29 | 平台 DTO ↔ 网关 Envelope 转换 | `incoming_to_envelope()` / `outgoing_from_envelope()` |
@@ -299,7 +332,7 @@ qq_stream_mode=typing        # off | typing | block
 | `meowmeowclaw/gateway/worker.py` | 43 | Agent 执行器(包装 ConversationService) | `AgentWorker` |
 | `meowmeowclaw/gateway/dispatcher.py` | 193 | 单任务消费 + 策略路由 + 并发派发 | `GatewayDispatcher` |
 | `meowmeowclaw/gateway/gateway.py` | 153 | 组装、优雅启停、`stats()` 观测 | `Gateway` |
-| `meowmeowclaw/bootstrap.py` | 214 | **组合根**: 配置 -> Provider/工具/技能/记忆/Context/Loop + 可选 Gateway; A5 透传运行时缓存配置 | `build_application()` / `build_gateway()` / `Application` |
+| `meowmeowclaw/bootstrap.py` | 278 | **组合根**: 配置 -> Provider/工具/技能/记忆/Context/Loop + 可选 Gateway; A5 运行时缓存透传; SA2–SA5 子代理装配(guard/factory/stats/audit) | `build_application()` / `build_gateway()` / `Application` |
 | `meowmeowclaw/cli.py` | 338 | **交付层**: banner / REPL; 网关开启时经 CliPolicy + CliAdapter; legacy 路径 /new /clear 同步释放运行时 | `main()` / `interactive_loop()` / `_run_gateway_repl()` |
 
 ### 3.1 契约先行, 实现可换
@@ -527,7 +560,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 1037 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 1689 passed, 6 skipped, 2 xfailed
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
 ruff check meowmeowclaw tests                 # 硬错误静态检查(E9 + F)
@@ -539,7 +572,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 
 | 测试文件 | 用例 | 重点 |
 | --- | ---: | --- |
-| `test_bootstrap.py` | 17 | 装配(工具/技能/Context/Loop/网关/运行时缓存透传)、ConfigError/SkillConfigError、导入边界 |
+| `test_bootstrap.py` | 19 | 装配(工具/技能/Context/Loop/网关/运行时缓存/子代理)、ConfigError/SkillConfigError、导入边界 |
 | `test_cli.py` | 26 | REPL、/new、/clear [id] [--purge]、/sessions、启动输出与退出码、网关分流 |
 | `gateway/test_*.py` | 75 | 信封/总线/去重/策略/适配器/调度/网关生命周期/观测 |
 | `channels/test_qq_policy.py` | 14 | QQ 策略: 身份/轮换/指令/跨渠道删除/A4 轮换释放运行时 |
@@ -547,6 +580,14 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `memory/test_tail.py` | 27 | A+ A2 尾读工具: 反向块读/UTF-8 跨块/超大行/上限/与全量等价 |
 | `memory/test_jsonl_tail_path.py` | 10 | A+ A2 存储层: 打桩证明不走全量、回退路径、A+1 累计口径、归档回退 |
 | `memory/test_jsonl_load_recent_tail.py` | 212 | **A+ A3 窗口尾读**: 200 组随机文件全量差分 + 预算翻倍/回退/半行/超大行/UTF-8 边界 |
+| `subagent/test_subagent_models.py` | 34 | **SA1**: 请求/结果/预算/统计/JSON 截断/状态映射 |
+| `subagent/test_subagent_prompt.py` | 6 | **SA2**: 子代理 prompt 隔离/context 数据定界 |
+| `subagent/test_subagent_factory.py` | 18 | **SA2–SA5**: depth/预算/顺序调度/嵌套不死锁/turn 预算重置/统计/审计/exec 端到端 |
+| `tools/test_mutation.py` | 5 | **SA3**: 变更锁互斥/超时、版本表、原子写失败清理 |
+| `tools/test_filesystem_mutation.py` | 11 | **SA3**: 主代理旧语义、OCC 冲突、锁超时、subagents/ 拒绝 |
+| `tools/test_exec_policy.py` | 24 | **SA4**: 环境清洗、guarded/allowlist、敏感路径匹配 |
+| `tools/test_shell_policy.py` | 6 | **SA4**: exec env/策略、取消杀进程组、锁超时 |
+| `tools/test_filesystem_sensitive.py` | 3 | **SA4**: 子代理敏感 read/write/list 拒绝与过滤 |
 | `channels/test_streaming.py` | 29 | 流式基础件: 语义分块窗口/边界优先级/围栏保护/收尾均分/输入状态续期 |
 | `channels/test_block_uniformity.py` | 10 | **S5.1 回归**: 用实测原文验证 722/288 字分块均匀、内容一致、条数封顶 |
 | `tests/test_stream_llm.py` | 17 | 流式 Provider 契约: 默认回退/tool_calls 分片/空流回退/中断保文本/400 重试 |
@@ -566,17 +607,17 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `memory/test_jsonl_store.py` | 29 | SessionStore 契约 + JSONL 布局/损坏行/归档/短 ID/并发与崩溃恢复 |
 | `memory/test_long_term.py` | 13 | MemoryRecord 校验、LongTermStore 协议、Noop 空实现 |
 | `memory/test_filelock.py` | 4 | FileLock 争用/释放/异步上下文 |
-| `test_conversation.py` | 36 | ConversationService 编排、窗口、fail-soft、同会话串行、agent 缓存、A4 运行时生命周期 |
+| `test_conversation.py` | 37 | ConversationService 编排、窗口、fail-soft、同会话串行、agent 缓存、A4 运行时、SA5 subagents 统计 |
 | `channels/test_qq_private.py` | 15 | QQ active 指针/6h 轮换/重启恢复/命令/跨渠道删除 |
 | `tools/test_base.py` | 3 | 工具基类抽象约束 |
-| `tools/test_registry.py` | 21 | 注册/查重/路由/异常包装、tools 包导入边界 |
+| `tools/test_registry.py` | 24 | 注册/查重/路由/异常包装、subset/get、tools 包导入边界 |
 | `tools/test_filesystem.py` | 101 | 三件套读写/截断、路径防护(含符号链接)、记忆目录策略与 MEMORY.md 备份 |
 | `tools/test_shell.py` | 91 | 黑名单 17 条、进程组清理与自杀保护、超时、输出拼装 |
 | `tools/test_web_search.py` | 44 | 结果格式化、条数归一化、超时、线程池执行、联网开关(4) |
 | `tools/test_web_fetch.py` | 71 | SSRF 12 类目标、`async with` 关连接、UTF-8/GBK、截断、联网开关(2) |
 | `test_provider_base.py` | 48 | 数据契约(默认值、可变默认、`has_tool_calls`) |
 | `test_openai_compat.py` | 44 | 请求参数、tool_calls 转换、usage、异常兜底 |
-| `test_config.py` | 147 | 取值优先级、路径/记忆目录解析、窗口/运行时缓存配置、非法值兜底、密钥掩码 |
+| `test_config.py` | 167 | 取值优先级、路径/记忆目录解析、窗口/运行时缓存/子代理配置、非法值兜底、密钥掩码 |
 
 ---
 
@@ -590,7 +631,7 @@ MeowMeowClaw/
 │   └── bench_session_store.py   # A+ A1: 会话存储 50–2000 轮基准(load_recent/get_meta/append_turn)
 ├── identity.md                  # 人设文件(固定放项目根)
 ├── workspace/                   # 运行时工作区(自动创建, gitignore; 可被 .env 绝对路径覆盖)
-├── tests/                       # 52 个测试文件 / 1564 用例(agent/skills/tools/memory/channels/gateway/llm 分层)
+├── tests/                       # 60 个测试文件 / 1697 用例(agent/skills/tools/memory/channels/gateway/subagent 分层)
 └── meowmeowclaw/
     ├── config.py                # 配置加载(纯解析, 无副作用)
     ├── paths.py                 # 项目根 / workspace / 人设路径唯一来源
@@ -603,9 +644,12 @@ MeowMeowClaw/
     │   └── loop.py              # AgentLoop 控制流
     ├── tools/                   # 工具框架 + 内置工具
     │   ├── base.py              # BaseTool 契约
-    │   ├── registry.py          # ToolRegistry 注册/路由
-    │   ├── filesystem.py        # 三件套 + 路径防护 + 记忆目录策略/备份
-    │   ├── shell.py             # ExecTool
+    │   ├── registry.py          # ToolRegistry 注册/路由/subset
+    │   ├── filesystem.py        # 三件套 + 路径防护 + 记忆目录策略/备份 + SA3 OCC/原子写
+    │   ├── shell.py             # ExecTool(SA4 环境清洗/命令策略/取消清理/审计)
+    │   ├── subagent.py          # SpawnSubagentTool
+    │   ├── mutation.py          # SA3 工作区变更锁/版本表/原子写
+    │   ├── exec_policy.py       # SA4 exec 环境/命令/敏感路径策略
     │   ├── web_search.py        # WebSearchTool
     │   └── web_fetch.py         # WebFetchTool
     ├── skills/
@@ -622,7 +666,12 @@ MeowMeowClaw/
     │   ├── noop.py              # NoopLongTermStore(v1 占位)
     │   ├── filelock.py          # 跨进程 advisory 文件锁
     │   └── errors.py            # 记忆层错误类型
-    ├── conversation.py          # ConversationService: 记忆 <-> AgentLoop 编排(A4: 运行时 refcount/LRU/TTL)
+    ├── subagent/                # SA1–SA5 子代理: 模型/提示词/工厂/审计
+    │   ├── models.py            # SubagentRequest/Result/Budget/Stats
+    │   ├── prompt.py            # 子代理 system prompt(隔离父上下文)
+    │   ├── factory.py           # depth/预算/顺序调度/工具克隆/审计
+    │   └── audit.py             # subagents/audit.jsonl
+    ├── conversation.py          # ConversationService: 编排(A4 runtime; SA5 subagents 统计)
     ├── channels/                # 渠道层: DTO / 策略 / 适配器
     │   ├── base.py              # IncomingMessage / OutgoingMessage
     │   ├── bridge.py            # DTO <-> Envelope
@@ -651,6 +700,7 @@ MeowMeowClaw/
 ## 11. 已知限制与 Roadmap
 
 - A+（会话 IO 尾读 + 运行时生命周期 + 指标）**A1–A5 已全部落地（2026-10-13）**：指标与基准 / `get_meta`·`append_turn`·`list_sessions` 尾读 / `load_recent` 反向块读窗口 / `_SessionRuntime` refcount·LRU·TTL 生命周期 / 配置透传与冒烟验收；设计与记录见 `docs/A_PLUS_OPTIMIZATION.md`，网关接入小结见 `docs/GATEWAY_DESIGN.md` §16.7
+- 子代理 v1（`SpawnSubagentTool`）**SA1–SA5 已落地**（默认 `subagent_enabled=false`）：深度/预算/上下文隔离、顺序调度、workspace 变更锁 + 读后写 OCC + 原子写、exec 环境清洗/策略/取消清理/审计、`ConversationService.stats()["subagents"]`；SA6 验收收尾中，设计与记录见 `docs/SUBAGENT_DESIGN.md`
 - 流式输出已落地 **S1–S5.1**（Provider 流式 / CLI 逐字 / QQ `typing`+`block` 伪流式，`stream_enabled` 默认 `false`）；里程碑、实测数据与验收见 `docs/STREAMING_DESIGN.md`
 - 记忆系统 v1 已完成 **M1-M7**(存储/编排/CLI/QQ 服务层/MEMORY.md 约定与备份/LongTermStore 抽象/并发与崩溃收口); 上下文压缩 P1–P5、多渠道网关 W1–W4、QQ 真实传输 **W5(OneBot 11 / NapCat 反向 WS)** 已落地(`gateway_enabled` 默认 `false`, QQ 渠道需显式打开); 结构化长期记忆后端、飞书/Web 适配器、群聊策略与多 Agent 编排尚未接入
 - 长期记忆 v1 由 `workspace/memory/MEMORY.md` 承担(Agent 写入 + Prompt 注入); 结构化 `LongTermStore` 抽象与 `NoopLongTermStore` 已落地, 持久化后端待后续实现

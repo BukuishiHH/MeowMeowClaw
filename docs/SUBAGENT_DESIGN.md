@@ -1,6 +1,6 @@
 # MeowMeowClaw 子代理协同设计（SpawnSubagentTool / v1）
 
-> 状态：**设计已评审；SA1–SA4 已实现（2026-10-13）**，SA5–SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
+> 状态：**设计已评审；SA1–SA5 已实现（2026-10-13）**，SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
 > 竞态/安全方案、配置、测试与里程碑，**不改 JSONL 文件格式、不改主代理既有语义**；
 > 实现按 §11 里程碑推进，每阶段独立提交，默认 `subagent_enabled=false`。
 > 关联：`docs/A_PLUS_OPTIMIZATION.md`（运行时生命周期）、`docs/GATEWAY_DESIGN.md`、
@@ -1154,7 +1154,7 @@ meowmeowclaw/
 | SA2 | 已完成 | `86e0a07` | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
 | SA3 | 已完成 | `2316a41` | 变更锁/OCC/原子写；主+子 write 接锁；新增 19 用例；exec 仍待 SA4 |
 | SA4 | 已完成 | `4eb4429` | exec 策略/环境清洗/取消杀组/敏感路径/审计；新增 36 用例 |
-| SA5 | 待实现 | — | 依赖 SA2+SA3+SA4；预算/统计/装配 |
+| SA5 | 已完成 | 待回填 | 预算/turn 重置、stats 接入、bootstrap 装配、README 配置表；新增 3 用例 |
 | SA6 | 待实现 | — | 依赖 SA5；全量验收、冒烟与收尾 |
 
 ### 15.1 实现记录
@@ -1246,6 +1246,27 @@ meowmeowclaw/
 - 全量回归 **1686 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
 - 本阶段后 `exec` 在 guarded/allowlist 策略下对子代理开放；残余风险（`exec` 非沙箱）仍按 §7.7 记录。
 
+#### SA5 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/agent/loop.py` | `AgentTurnContext.ensure_budget()`：同 turn 内延迟创建并复用 `SubagentBudget`；`run_turn` 每个 root turn 新建上下文，天然实现预算重置 |
+| `meowmeowclaw/conversation.py` | `ConversationService(subagent_stats=...)`；`stats()` 新增 `"subagents"` 快照（未启用时 `enabled=False` 全零），统计级 fail-soft |
+| `meowmeowclaw/bootstrap.py` | 创建 `SubagentStats` 同时注入 factory 与 `ConversationService`；开启/关闭分支明确；guard/factory/audit/工具包装全部收口 |
+| `README.md` | 配置表新增 19 项子代理配置与说明；模块/测试/目录/Roadmap 同步 |
+| `tests/test_conversation.py` / `tests/subagent/test_subagent_factory.py` / `tests/test_bootstrap.py` | 新增 3 个用例并更新统计契约：subagents 快照、root turn 预算重置、多 root 顺序执行；bootstrap 开关/装配断言 |
+
+**验证**
+
+- root 主代理连续两个 `run_turn` 各允许 1 次 spawn（`max_children=1/max_total=1`），证明每 turn 预算重置；
+- 多个 root 并发调用 factory 时 provider `max_active==1`，顺序执行不退化；
+- `ConversationService.stats()` 新增 `subagents` 字段；关闭子代理时返回 `enabled=False` 快照，A1/A4 原有字段不变；
+- bootstrap 开启时 factory 的 model/children/total 来自配置；主/子 write 与 exec 共用变更锁；关闭时不构造 guard/factory/audit；
+- 全量回归 **1689 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 本阶段不做：真实 CLI/QQ 冒烟、最终文档/README 验收收尾（SA6）。
+
 
 ---
 
@@ -1324,5 +1345,5 @@ workspace_mutation_lock_timeout=90
 
 ---
 
-> 本文是 v1 实现依据；SA1–SA4 已实现，SA5–SA6 按 §11 里程碑逐阶段推进，每阶段完成后更新“实现记录”并提交。
+> 本文是 v1 实现依据；SA1–SA5 已实现，SA6 验收收尾按 §11 推进，完成后更新“实现记录”并提交。
 

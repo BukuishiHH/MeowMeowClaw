@@ -26,6 +26,7 @@ from meowmeowclaw.llm.base import (
     StreamTextDelta,
 )
 from meowmeowclaw.memory import JsonlSessionStore, SessionKey, SessionStoreError
+from meowmeowclaw.subagent import STATUS_OK, SubagentStats
 from meowmeowclaw.tools.registry import ToolRegistry
 
 
@@ -452,6 +453,7 @@ class TestConversationStats:
         assert stats["store"]["metrics"]["load_recent"]["count"] == 1
         assert stats["store"]["metrics"]["append_turn"]["count"] == 1
         assert stats["store"]["active_file_count"] == 1
+        assert stats["subagents"]["enabled"] is False
         # RSS 只在支持的平台给值(Windows 为 None)
         assert stats["rss_mb"] is None or stats["rss_mb"] > 0
 
@@ -467,6 +469,24 @@ class TestConversationStats:
         assert service.stats()["cached_agents"] == 0
         assert service.stats()["locks"] == 0
 
+    def test_stats_exposes_subagent_snapshot(self):
+        subagent_stats = SubagentStats(enabled=True)
+        subagent_stats.record_spawn(depth=1)
+        subagent_stats.record_finish(STATUS_OK, lock_wait_ms=3.5)
+        service = ConversationService(
+            RecordingStore(),
+            AgentFactory(ScriptedProvider()),
+            subagent_stats=subagent_stats,
+        )
+
+        snapshot = service.stats()["subagents"]
+
+        assert snapshot["enabled"] is True
+        assert snapshot["spawned_total"] == 1
+        assert snapshot["ok"] == 1
+        assert snapshot["active"] == 0
+        assert snapshot["lock_wait_total_ms"] == 3.5
+
     def test_stats_degrades_when_store_has_no_stats(self):
         service = ConversationService(RecordingStore(), AgentFactory(ScriptedProvider()))
 
@@ -474,6 +494,7 @@ class TestConversationStats:
 
         assert stats["store"] == {}
         assert stats["cached_agents"] == 0
+        assert stats["subagents"]["enabled"] is False
 
     def test_stats_degrades_when_store_stats_raises(self):
         service = ConversationService(BrokenStatsStore(), AgentFactory(ScriptedProvider()))
@@ -481,7 +502,14 @@ class TestConversationStats:
         stats = service.stats()
 
         assert stats["store"] == {}
-        assert set(stats) == {"cached_agents", "locks", "evictions", "store", "rss_mb"}
+        assert set(stats) == {
+            "cached_agents",
+            "locks",
+            "evictions",
+            "store",
+            "subagents",
+            "rss_mb",
+        }
 
 
 # --------------------------------------------------------- A+ A4 运行时生命周期

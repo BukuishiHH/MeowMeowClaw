@@ -91,14 +91,13 @@ class SpawnSubagentTool(BaseTool):
 
         turn = current_agent_turn()
         if turn is not None:
-            # 预算属于当前 task 的 AgentTurnContext, 并发会话/多 turn 均不会串号
-            if turn.budget is None:
-                turn.budget = self._factory.new_root_budget()
+            # 预算属于当前 task 的 AgentTurnContext; ensure_budget 保证同 turn 内复用
+            budget = turn.ensure_budget(self._factory.new_root_budget)
             return SpawnContext(
                 root_id=turn.turn_id,
                 parent_id=self._parent_id,
                 depth=self._depth,
-                budget=turn.budget,
+                budget=budget,
                 tool_names=tuple(getattr(self._factory, "tool_names", ())),
             )
 

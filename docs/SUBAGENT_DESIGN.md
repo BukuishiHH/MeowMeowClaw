@@ -1151,7 +1151,7 @@ meowmeowclaw/
 | 里程碑 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | SA1 | 已完成 | `3ed6b98` | 领域模型 + 全部配置键；新增 54 用例；默认关闭零行为变化 |
-| SA2 | 已完成 | 待回填 | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
+| SA2 | 已完成 | `86e0a07` | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
 | SA3 | 待实现 | — | 依赖 SA1；变更锁/OCC/原子写 |
 | SA4 | 待实现 | — | 依赖 SA2+SA3；exec 安全与审计 |
 | SA5 | 待实现 | — | 依赖 SA2+SA3+SA4；预算/统计/装配 |

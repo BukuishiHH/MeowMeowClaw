@@ -54,6 +54,24 @@ from meowmeowclaw.config import (
     DEFAULT_STREAM_PREAMBLE_GRACE_MS,
     DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE,
     DEFAULT_CLI_STREAM,
+    DEFAULT_SUBAGENT_AUDIT_ENABLED,
+    DEFAULT_SUBAGENT_AUDIT_MAX_BYTES,
+    DEFAULT_SUBAGENT_ENABLED,
+    DEFAULT_SUBAGENT_EXEC_ALLOWLIST,
+    DEFAULT_SUBAGENT_EXEC_ENV_ALLOWLIST,
+    DEFAULT_SUBAGENT_EXEC_POLICY,
+    DEFAULT_SUBAGENT_MAX_CHILDREN_PER_TURN,
+    DEFAULT_SUBAGENT_MAX_DEPTH,
+    DEFAULT_SUBAGENT_MAX_ITERATIONS,
+    DEFAULT_SUBAGENT_MAX_TOTAL_PER_TURN,
+    DEFAULT_SUBAGENT_MODEL,
+    DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
+    DEFAULT_SUBAGENT_SENSITIVE_PATHS,
+    DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+    DEFAULT_SUBAGENT_TOOLS,
+    DEFAULT_SUBAGENT_WRITE_REQUIRES_READ,
+    DEFAULT_WORKSPACE_MUTATION_LOCK_ENABLED,
+    DEFAULT_WORKSPACE_MUTATION_LOCK_TIMEOUT,
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_TIMEOUT,
     DEFAULT_TOKEN_BUDGET,
@@ -150,6 +168,30 @@ ENV_KEYS = (
     "STREAM_PREAMBLE_GRACE_MS",
     "STREAM_PREAMBLE_GRACE_CHARS",
     "STREAM_SUPPRESS_TOOL_PREAMBLE",
+    "SUBAGENT_ENABLED",
+    "SUBAGENT_MAX_DEPTH",
+    "MAX_SUBAGENT_DEPTH",
+    "SUBAGENT_MODEL",
+    "SUBAGENT_MODEL_NAME",
+    "SUBAGENT_MAX_ITERATIONS",
+    "SUBAGENT_TIMEOUT_SECONDS",
+    "SUBAGENT_TIMEOUT",
+    "SUBAGENT_MAX_CHILDREN_PER_TURN",
+    "SUBAGENT_MAX_TOTAL_PER_TURN",
+    "SUBAGENT_RESULT_MAX_CHARS",
+    "SUBAGENT_TOOLS",
+    "SUBAGENT_TOOL_NAMES",
+    "SUBAGENT_EXEC_POLICY",
+    "SUBAGENT_EXEC_MODE",
+    "SUBAGENT_EXEC_ALLOWLIST",
+    "SUBAGENT_EXEC_ALLOW",
+    "SUBAGENT_EXEC_ENV_ALLOWLIST",
+    "SUBAGENT_WRITE_REQUIRES_READ",
+    "SUBAGENT_SENSITIVE_PATHS",
+    "SUBAGENT_AUDIT_ENABLED",
+    "SUBAGENT_AUDIT_MAX_BYTES",
+    "WORKSPACE_MUTATION_LOCK_ENABLED",
+    "WORKSPACE_MUTATION_LOCK_TIMEOUT",
 )
 
 
@@ -1042,6 +1084,160 @@ class TestStreamSettings:
 
         assert "stream_enabled=True" in text
         assert "cli_stream=False" in text
+
+
+# ------------------------------------------------------------ 子代理配置(SA1)
+
+
+class TestSubagentSettings:
+    def test_defaults(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "model=m\n"))
+
+        assert s.subagent_enabled is DEFAULT_SUBAGENT_ENABLED
+        assert s.subagent_max_depth == DEFAULT_SUBAGENT_MAX_DEPTH
+        assert s.subagent_model == DEFAULT_SUBAGENT_MODEL
+        assert s.subagent_max_iterations == DEFAULT_SUBAGENT_MAX_ITERATIONS
+        assert s.subagent_timeout_seconds == DEFAULT_SUBAGENT_TIMEOUT_SECONDS
+        assert s.subagent_max_children_per_turn == DEFAULT_SUBAGENT_MAX_CHILDREN_PER_TURN
+        assert s.subagent_max_total_per_turn == DEFAULT_SUBAGENT_MAX_TOTAL_PER_TURN
+        assert s.subagent_result_max_chars == DEFAULT_SUBAGENT_RESULT_MAX_CHARS
+        assert s.subagent_tools == DEFAULT_SUBAGENT_TOOLS
+        assert s.subagent_exec_policy == DEFAULT_SUBAGENT_EXEC_POLICY
+        assert s.subagent_exec_allowlist == DEFAULT_SUBAGENT_EXEC_ALLOWLIST
+        assert s.subagent_exec_env_allowlist == DEFAULT_SUBAGENT_EXEC_ENV_ALLOWLIST
+        assert s.subagent_write_requires_read is DEFAULT_SUBAGENT_WRITE_REQUIRES_READ
+        assert s.subagent_sensitive_paths == DEFAULT_SUBAGENT_SENSITIVE_PATHS
+        assert s.subagent_audit_enabled is DEFAULT_SUBAGENT_AUDIT_ENABLED
+        assert s.subagent_audit_max_bytes == DEFAULT_SUBAGENT_AUDIT_MAX_BYTES
+        assert s.workspace_mutation_lock_enabled is DEFAULT_WORKSPACE_MUTATION_LOCK_ENABLED
+        assert s.workspace_mutation_lock_timeout == DEFAULT_WORKSPACE_MUTATION_LOCK_TIMEOUT
+
+    def test_explicit_values(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "subagent_enabled=true\n"
+            "subagent_max_depth=4\n"
+            "subagent_model=small-model\n"
+            "subagent_max_iterations=5\n"
+            "subagent_timeout_seconds=30.5\n"
+            "subagent_max_children_per_turn=2\n"
+            "subagent_max_total_per_turn=4\n"
+            "subagent_result_max_chars=1234\n"
+            "subagent_tools=read_file, custom_tool ,read_file\n"
+            "subagent_exec_policy=allowlist\n"
+            "subagent_exec_allowlist=pytest -q,ruff check\n"
+            "subagent_exec_env_allowlist=MYPATH\n"
+            "subagent_write_requires_read=false\n"
+            "subagent_sensitive_paths=.env,secrets/*\n"
+            "subagent_audit_enabled=false\n"
+            "subagent_audit_max_bytes=1024\n"
+            "workspace_mutation_lock_enabled=false\n"
+            "workspace_mutation_lock_timeout=5.5\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.subagent_enabled is True
+        assert s.subagent_max_depth == 4
+        assert s.subagent_model == "small-model"
+        assert s.subagent_max_iterations == 5
+        assert s.subagent_timeout_seconds == 30.5
+        assert s.subagent_max_children_per_turn == 2
+        assert s.subagent_max_total_per_turn == 4
+        assert s.subagent_result_max_chars == 1234
+        assert s.subagent_tools == ("read_file", "custom_tool")
+        assert s.subagent_exec_policy == "allowlist"
+        assert s.subagent_exec_allowlist == ("pytest -q", "ruff check")
+        assert s.subagent_exec_env_allowlist == ("MYPATH",)
+        assert s.subagent_write_requires_read is False
+        assert s.subagent_sensitive_paths == (".env", "secrets/*")
+        assert s.subagent_audit_enabled is False
+        assert s.subagent_audit_max_bytes == 1024
+        assert s.workspace_mutation_lock_enabled is False
+        assert s.workspace_mutation_lock_timeout == 5.5
+
+    @pytest.mark.parametrize("raw", ["abc", "0", "1", "-1", "3.5"])
+    def test_invalid_max_depth_falls_back(self, tmp_path, caplog, raw):
+        env = write_env(tmp_path, f"subagent_max_depth={raw}\n")
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.subagent_max_depth == DEFAULT_SUBAGENT_MAX_DEPTH
+        assert any("subagent_max_depth" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        ("line", "name", "default"),
+        [
+            ("subagent_max_iterations=0", "subagent_max_iterations", DEFAULT_SUBAGENT_MAX_ITERATIONS),
+            ("subagent_timeout_seconds=-1", "subagent_timeout_seconds", DEFAULT_SUBAGENT_TIMEOUT_SECONDS),
+            ("subagent_max_children_per_turn=abc", "subagent_max_children_per_turn", DEFAULT_SUBAGENT_MAX_CHILDREN_PER_TURN),
+            ("subagent_max_total_per_turn=0", "subagent_max_total_per_turn", DEFAULT_SUBAGENT_MAX_TOTAL_PER_TURN),
+            ("subagent_result_max_chars=0", "subagent_result_max_chars", DEFAULT_SUBAGENT_RESULT_MAX_CHARS),
+            ("subagent_audit_max_bytes=-1", "subagent_audit_max_bytes", DEFAULT_SUBAGENT_AUDIT_MAX_BYTES),
+            ("workspace_mutation_lock_timeout=0", "workspace_mutation_lock_timeout", DEFAULT_WORKSPACE_MUTATION_LOCK_TIMEOUT),
+        ],
+    )
+    def test_invalid_positive_values_fall_back(self, tmp_path, caplog, line, name, default):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, f"{line}\n"))
+
+        assert getattr(s, name) == default
+        assert any(name in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize("raw", ["bad-mode", "sandbox"])
+    def test_invalid_exec_policy_falls_back(self, tmp_path, caplog, raw):
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(write_env(tmp_path, f"subagent_exec_policy={raw}\n"))
+
+        assert s.subagent_exec_policy == DEFAULT_SUBAGENT_EXEC_POLICY
+        assert any("subagent_exec_policy" in record.message for record in caplog.records)
+
+    def test_empty_tool_list_uses_default(self, tmp_path):
+        s = load_settings(write_env(tmp_path, "subagent_tools= , ,\n"))
+
+        assert s.subagent_tools == DEFAULT_SUBAGENT_TOOLS
+
+    def test_aliases(self, tmp_path):
+        env = write_env(
+            tmp_path,
+            "max_subagent_depth=5\n"
+            "subagent_model_name=alias-model\n"
+            "subagent_timeout=33\n"
+            "subagent_tool_names=read_file\n"
+            "subagent_exec_mode=allowlist\n"
+            "subagent_exec_allow=ls -la\n",
+        )
+
+        s = load_settings(env)
+
+        assert s.subagent_max_depth == 5
+        assert s.subagent_model == "alias-model"
+        assert s.subagent_timeout_seconds == 33
+        assert s.subagent_tools == ("read_file",)
+        assert s.subagent_exec_policy == "allowlist"
+        assert s.subagent_exec_allowlist == ("ls -la",)
+
+    def test_total_below_children_warns(self, tmp_path, caplog):
+        env = write_env(
+            tmp_path,
+            "subagent_max_children_per_turn=5\nsubagent_max_total_per_turn=2\n",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="meowmeowclaw.config"):
+            s = load_settings(env)
+
+        assert s.subagent_max_children_per_turn == 5
+        assert s.subagent_max_total_per_turn == 2
+        assert any("subagent_max_total_per_turn" in record.message for record in caplog.records)
+
+    def test_repr_contains_subagent_fields(self):
+        text = repr(Settings(subagent_enabled=True, subagent_max_depth=4, subagent_model="m"))
+
+        assert "subagent_enabled=True" in text
+        assert "subagent_max_depth=4" in text
+        assert "subagent_model='m'" in text
+
 
 
 # ------------------------------------------------- 模块级副作用护栏

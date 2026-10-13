@@ -90,6 +90,34 @@ DEFAULT_STREAM_PREAMBLE_GRACE_MS = 1500
 DEFAULT_STREAM_PREAMBLE_GRACE_CHARS = 40
 DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE = True
 
+# 子代理默认值(设计见 docs/SUBAGENT_DESIGN.md §3.5; SA1 只做配置解析, 默认关闭)
+DEFAULT_SUBAGENT_ENABLED = False
+DEFAULT_SUBAGENT_MAX_DEPTH = 3
+DEFAULT_SUBAGENT_MODEL = ""
+DEFAULT_SUBAGENT_MAX_ITERATIONS = 8
+DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 120.0
+DEFAULT_SUBAGENT_MAX_CHILDREN_PER_TURN = 3
+DEFAULT_SUBAGENT_MAX_TOTAL_PER_TURN = 6
+DEFAULT_SUBAGENT_RESULT_MAX_CHARS = 8000
+DEFAULT_SUBAGENT_TOOLS = (
+    "read_file",
+    "list_dir",
+    "web_search",
+    "web_fetch",
+    "load_skill",
+    "write_file",
+    "exec",
+)
+DEFAULT_SUBAGENT_EXEC_POLICY = "guarded"
+DEFAULT_SUBAGENT_EXEC_ALLOWLIST: tuple[str, ...] = ()
+DEFAULT_SUBAGENT_EXEC_ENV_ALLOWLIST: tuple[str, ...] = ()
+DEFAULT_SUBAGENT_WRITE_REQUIRES_READ = True
+DEFAULT_SUBAGENT_SENSITIVE_PATHS = (".env", "*.pem", "*.key", "id_rsa*", ".git/config")
+DEFAULT_SUBAGENT_AUDIT_ENABLED = True
+DEFAULT_SUBAGENT_AUDIT_MAX_BYTES = 4_194_304
+DEFAULT_WORKSPACE_MUTATION_LOCK_ENABLED = True
+DEFAULT_WORKSPACE_MUTATION_LOCK_TIMEOUT = 90.0
+
 # 键别名映射
 _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "model": ("model", "model_name"),
@@ -147,6 +175,25 @@ _KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "stream_preamble_grace_ms": ("stream_preamble_grace_ms",),
     "stream_preamble_grace_chars": ("stream_preamble_grace_chars",),
     "stream_suppress_tool_preamble": ("stream_suppress_tool_preamble",),
+    # 子代理(SA1: 只解析配置, 默认关闭)
+    "subagent_enabled": ("subagent_enabled",),
+    "subagent_max_depth": ("subagent_max_depth", "max_subagent_depth"),
+    "subagent_model": ("subagent_model", "subagent_model_name"),
+    "subagent_max_iterations": ("subagent_max_iterations",),
+    "subagent_timeout_seconds": ("subagent_timeout_seconds", "subagent_timeout"),
+    "subagent_max_children_per_turn": ("subagent_max_children_per_turn",),
+    "subagent_max_total_per_turn": ("subagent_max_total_per_turn",),
+    "subagent_result_max_chars": ("subagent_result_max_chars",),
+    "subagent_tools": ("subagent_tools", "subagent_tool_names"),
+    "subagent_exec_policy": ("subagent_exec_policy", "subagent_exec_mode"),
+    "subagent_exec_allowlist": ("subagent_exec_allowlist", "subagent_exec_allow"),
+    "subagent_exec_env_allowlist": ("subagent_exec_env_allowlist",),
+    "subagent_write_requires_read": ("subagent_write_requires_read",),
+    "subagent_sensitive_paths": ("subagent_sensitive_paths",),
+    "subagent_audit_enabled": ("subagent_audit_enabled",),
+    "subagent_audit_max_bytes": ("subagent_audit_max_bytes",),
+    "workspace_mutation_lock_enabled": ("workspace_mutation_lock_enabled",),
+    "workspace_mutation_lock_timeout": ("workspace_mutation_lock_timeout",),
 }
 
 # 已废弃配置键: 人设已固定为 <项目根>/identity.md, 出现时警告并忽略
@@ -219,6 +266,64 @@ def _resolve_session_cache_size(value: Optional[str], default: int, name: str) -
     except (TypeError, ValueError):
         logger.warning("%s 不是整数(%r), 回退默认值 %d", name, value, default)
         return default
+
+
+def _resolve_subagent_max_depth(value: Optional[str], default: int) -> int:
+    """解析子代理总层数: 必须 >= 2; 非法/过小回退默认并告警."""
+    if value is None:
+        return default
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning("subagent_max_depth 不是整数(%r), 回退默认值 %d", value, default)
+        return default
+    if num < 2:
+        logger.warning(
+            "subagent_max_depth 必须 >= 2(%r), 回退默认值 %d", value, default
+        )
+        return default
+    return num
+
+
+def _resolve_csv_tuple(
+    value: Optional[str],
+    default: tuple[str, ...],
+    name: str,
+) -> tuple[str, ...]:
+    """解析逗号分隔字符串为去重 tuple; None/空值返回默认; 保持输入顺序."""
+    if value is None:
+        return default
+    items = [item.strip() for item in str(value).split(",")]
+    items = [item for item in items if item]
+    if not items:
+        return default
+    result: list[str] = []
+    for item in items:
+        if item not in result:
+            result.append(item)
+    if result == list(default):
+        return default
+    return tuple(result)
+
+
+def _resolve_subagent_exec_policy(value: Optional[str]) -> str:
+    """解析子代理 exec 档位: guarded/allowlist; sandbox 预留未实现时回退 guarded."""
+    if value is None:
+        return DEFAULT_SUBAGENT_EXEC_POLICY
+    text = str(value).strip().lower()
+    if text in ("guarded", "allowlist"):
+        return text
+    if text == "sandbox":
+        logger.warning(
+            "subagent_exec_policy=sandbox 为预留档位(未实现), 本次回退 guarded"
+        )
+        return DEFAULT_SUBAGENT_EXEC_POLICY
+    logger.warning(
+        "subagent_exec_policy 取值不合法(%r), 回退默认值 %s",
+        value,
+        DEFAULT_SUBAGENT_EXEC_POLICY,
+    )
+    return DEFAULT_SUBAGENT_EXEC_POLICY
 
 
 def _resolve_bool(value: Optional[str], default: bool, name: str) -> bool:
@@ -429,6 +534,25 @@ class Settings:
     stream_preamble_grace_ms: int = DEFAULT_STREAM_PREAMBLE_GRACE_MS
     stream_preamble_grace_chars: int = DEFAULT_STREAM_PREAMBLE_GRACE_CHARS
     stream_suppress_tool_preamble: bool = DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE
+    # 子代理(SA1: 纯配置, 默认关闭; 设计见 docs/SUBAGENT_DESIGN.md §3.5)
+    subagent_enabled: bool = DEFAULT_SUBAGENT_ENABLED
+    subagent_max_depth: int = DEFAULT_SUBAGENT_MAX_DEPTH
+    subagent_model: str = DEFAULT_SUBAGENT_MODEL
+    subagent_max_iterations: int = DEFAULT_SUBAGENT_MAX_ITERATIONS
+    subagent_timeout_seconds: float = DEFAULT_SUBAGENT_TIMEOUT_SECONDS
+    subagent_max_children_per_turn: int = DEFAULT_SUBAGENT_MAX_CHILDREN_PER_TURN
+    subagent_max_total_per_turn: int = DEFAULT_SUBAGENT_MAX_TOTAL_PER_TURN
+    subagent_result_max_chars: int = DEFAULT_SUBAGENT_RESULT_MAX_CHARS
+    subagent_tools: tuple[str, ...] = DEFAULT_SUBAGENT_TOOLS
+    subagent_exec_policy: str = DEFAULT_SUBAGENT_EXEC_POLICY
+    subagent_exec_allowlist: tuple[str, ...] = DEFAULT_SUBAGENT_EXEC_ALLOWLIST
+    subagent_exec_env_allowlist: tuple[str, ...] = DEFAULT_SUBAGENT_EXEC_ENV_ALLOWLIST
+    subagent_write_requires_read: bool = DEFAULT_SUBAGENT_WRITE_REQUIRES_READ
+    subagent_sensitive_paths: tuple[str, ...] = DEFAULT_SUBAGENT_SENSITIVE_PATHS
+    subagent_audit_enabled: bool = DEFAULT_SUBAGENT_AUDIT_ENABLED
+    subagent_audit_max_bytes: int = DEFAULT_SUBAGENT_AUDIT_MAX_BYTES
+    workspace_mutation_lock_enabled: bool = DEFAULT_WORKSPACE_MUTATION_LOCK_ENABLED
+    workspace_mutation_lock_timeout: float = DEFAULT_WORKSPACE_MUTATION_LOCK_TIMEOUT
     source: str = str(ENV_FILE)
 
     def __repr__(self) -> str:
@@ -470,6 +594,24 @@ class Settings:
             f"stream_preamble_grace_ms={self.stream_preamble_grace_ms}, "
             f"stream_preamble_grace_chars={self.stream_preamble_grace_chars}, "
             f"stream_suppress_tool_preamble={self.stream_suppress_tool_preamble}, "
+            f"subagent_enabled={self.subagent_enabled}, "
+            f"subagent_max_depth={self.subagent_max_depth}, "
+            f"subagent_model={self.subagent_model!r}, "
+            f"subagent_max_iterations={self.subagent_max_iterations}, "
+            f"subagent_timeout_seconds={self.subagent_timeout_seconds}, "
+            f"subagent_max_children_per_turn={self.subagent_max_children_per_turn}, "
+            f"subagent_max_total_per_turn={self.subagent_max_total_per_turn}, "
+            f"subagent_result_max_chars={self.subagent_result_max_chars}, "
+            f"subagent_tools={self.subagent_tools!r}, "
+            f"subagent_exec_policy={self.subagent_exec_policy!r}, "
+            f"subagent_exec_allowlist={self.subagent_exec_allowlist!r}, "
+            f"subagent_exec_env_allowlist={self.subagent_exec_env_allowlist!r}, "
+            f"subagent_write_requires_read={self.subagent_write_requires_read}, "
+            f"subagent_sensitive_paths={self.subagent_sensitive_paths!r}, "
+            f"subagent_audit_enabled={self.subagent_audit_enabled}, "
+            f"subagent_audit_max_bytes={self.subagent_audit_max_bytes}, "
+            f"workspace_mutation_lock_enabled={self.workspace_mutation_lock_enabled}, "
+            f"workspace_mutation_lock_timeout={self.workspace_mutation_lock_timeout}, "
             f"api_key={masked_key}, source={self.source!r})"
         )
 
@@ -668,8 +810,100 @@ def load_config(env_file: Optional[Union[str, Path]] = None) -> Settings:
             DEFAULT_STREAM_SUPPRESS_TOOL_PREAMBLE,
             "stream_suppress_tool_preamble",
         ),
+        # 子代理配置(SA1)
+        subagent_enabled=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["subagent_enabled"]),
+            DEFAULT_SUBAGENT_ENABLED,
+            "subagent_enabled",
+        ),
+        subagent_max_depth=_resolve_subagent_max_depth(
+            _get(raw, *_KEY_ALIASES["subagent_max_depth"]),
+            DEFAULT_SUBAGENT_MAX_DEPTH,
+        ),
+        subagent_model=_get(raw, *_KEY_ALIASES["subagent_model"]) or "",
+        subagent_max_iterations=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["subagent_max_iterations"]),
+            DEFAULT_SUBAGENT_MAX_ITERATIONS,
+            "subagent_max_iterations",
+        ),
+        subagent_timeout_seconds=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["subagent_timeout_seconds"]),
+            DEFAULT_SUBAGENT_TIMEOUT_SECONDS,
+            "subagent_timeout_seconds",
+        ),
+        subagent_max_children_per_turn=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["subagent_max_children_per_turn"]),
+            DEFAULT_SUBAGENT_MAX_CHILDREN_PER_TURN,
+            "subagent_max_children_per_turn",
+        ),
+        subagent_max_total_per_turn=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["subagent_max_total_per_turn"]),
+            DEFAULT_SUBAGENT_MAX_TOTAL_PER_TURN,
+            "subagent_max_total_per_turn",
+        ),
+        subagent_result_max_chars=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["subagent_result_max_chars"]),
+            DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
+            "subagent_result_max_chars",
+        ),
+        subagent_tools=_resolve_csv_tuple(
+            _get(raw, *_KEY_ALIASES["subagent_tools"]),
+            DEFAULT_SUBAGENT_TOOLS,
+            "subagent_tools",
+        ),
+        subagent_exec_policy=_resolve_subagent_exec_policy(
+            _get(raw, *_KEY_ALIASES["subagent_exec_policy"])
+        ),
+        subagent_exec_allowlist=_resolve_csv_tuple(
+            _get(raw, *_KEY_ALIASES["subagent_exec_allowlist"]),
+            DEFAULT_SUBAGENT_EXEC_ALLOWLIST,
+            "subagent_exec_allowlist",
+        ),
+        subagent_exec_env_allowlist=_resolve_csv_tuple(
+            _get(raw, *_KEY_ALIASES["subagent_exec_env_allowlist"]),
+            DEFAULT_SUBAGENT_EXEC_ENV_ALLOWLIST,
+            "subagent_exec_env_allowlist",
+        ),
+        subagent_write_requires_read=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["subagent_write_requires_read"]),
+            DEFAULT_SUBAGENT_WRITE_REQUIRES_READ,
+            "subagent_write_requires_read",
+        ),
+        subagent_sensitive_paths=_resolve_csv_tuple(
+            _get(raw, *_KEY_ALIASES["subagent_sensitive_paths"]),
+            DEFAULT_SUBAGENT_SENSITIVE_PATHS,
+            "subagent_sensitive_paths",
+        ),
+        subagent_audit_enabled=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["subagent_audit_enabled"]),
+            DEFAULT_SUBAGENT_AUDIT_ENABLED,
+            "subagent_audit_enabled",
+        ),
+        subagent_audit_max_bytes=_resolve_positive_int(
+            _get(raw, *_KEY_ALIASES["subagent_audit_max_bytes"]),
+            DEFAULT_SUBAGENT_AUDIT_MAX_BYTES,
+            "subagent_audit_max_bytes",
+        ),
+        workspace_mutation_lock_enabled=_resolve_bool(
+            _get(raw, *_KEY_ALIASES["workspace_mutation_lock_enabled"]),
+            DEFAULT_WORKSPACE_MUTATION_LOCK_ENABLED,
+            "workspace_mutation_lock_enabled",
+        ),
+        workspace_mutation_lock_timeout=_resolve_positive_float(
+            _get(raw, *_KEY_ALIASES["workspace_mutation_lock_timeout"]),
+            DEFAULT_WORKSPACE_MUTATION_LOCK_TIMEOUT,
+            "workspace_mutation_lock_timeout",
+        ),
         source=str(path),
     )
+
+    if settings.subagent_max_total_per_turn < settings.subagent_max_children_per_turn:
+        logger.warning(
+            "subagent_max_total_per_turn(%d) < subagent_max_children_per_turn(%d), "
+            "实际并发/扇出以更小的总预算为准",
+            settings.subagent_max_total_per_turn,
+            settings.subagent_max_children_per_turn,
+        )
 
     # 废弃字段 qq_stream_hard_chars 与 max_block_chars 保持一致(兼容旧读者)
     if settings.qq_stream_hard_chars != settings.qq_stream_max_block_chars:

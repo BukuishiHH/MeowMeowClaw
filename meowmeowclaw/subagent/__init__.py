@@ -1,0 +1,56 @@
+"""子代理基础设施(设计见 ``docs/SUBAGENT_DESIGN.md``).
+
+SA1 只提供领域模型与配置骨架; SA2+ 在此基础上增加 factory / prompt / tool。
+"""
+
+from .models import (
+    ERROR_BUDGET_EXCEEDED,
+    ERROR_CANCELLED,
+    ERROR_CHILDREN_EXCEEDED,
+    ERROR_CIRCUIT_BREAK,
+    ERROR_CONTEXT_OVERFLOW,
+    ERROR_DEPTH_EXCEEDED,
+    ERROR_ENABLED,
+    ERROR_INTERNAL,
+    ERROR_MAX_ITERATIONS,
+    ERROR_PROVIDER,
+    ERROR_TIMEOUT,
+    ERROR_TOOL_NOT_ALLOWED,
+    STATUS_CANCELLED,
+    STATUS_ERROR,
+    STATUS_LIMIT,
+    STATUS_OK,
+    STATUS_TIMEOUT,
+    VALID_STATUSES,
+    SpawnContext,
+    SubagentBudget,
+    SubagentRequest,
+    SubagentResult,
+    SubagentStats,
+)
+
+__all__ = [
+    "ERROR_BUDGET_EXCEEDED",
+    "ERROR_CANCELLED",
+    "ERROR_CHILDREN_EXCEEDED",
+    "ERROR_CIRCUIT_BREAK",
+    "ERROR_CONTEXT_OVERFLOW",
+    "ERROR_DEPTH_EXCEEDED",
+    "ERROR_ENABLED",
+    "ERROR_INTERNAL",
+    "ERROR_MAX_ITERATIONS",
+    "ERROR_PROVIDER",
+    "ERROR_TIMEOUT",
+    "ERROR_TOOL_NOT_ALLOWED",
+    "STATUS_CANCELLED",
+    "STATUS_ERROR",
+    "STATUS_LIMIT",
+    "STATUS_OK",
+    "STATUS_TIMEOUT",
+    "VALID_STATUSES",
+    "SpawnContext",
+    "SubagentBudget",
+    "SubagentRequest",
+    "SubagentResult",
+    "SubagentStats",
+]

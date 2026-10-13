@@ -1150,7 +1150,7 @@ meowmeowclaw/
 
 | 里程碑 | 状态 | 提交 | 备注 |
 |---|---|---|---|
-| SA1 | 待实现 | — | 依赖无；默认关闭下的领域模型与配置骨架 |
+| SA1 | 已完成 | 待回填 | 领域模型 + 全部配置键；新增 54 用例；默认关闭零行为变化 |
 | SA2 | 待实现 | — | 依赖 SA1；只读子代理与深度/上下文隔离 |
 | SA3 | 待实现 | — | 依赖 SA1；变更锁/OCC/原子写 |
 | SA4 | 待实现 | — | 依赖 SA2+SA3；exec 安全与审计 |
@@ -1159,7 +1159,24 @@ meowmeowclaw/
 
 ### 15.1 实现记录
 
-（待各里程碑完成后回填提交号、用例数与验证结论。）
+#### SA1 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/subagent/models.py`（新增） | `SubagentRequest` / `SubagentResult` / `SpawnContext` / `SubagentBudget` / `SubagentStats`；状态/错误码常量、`from_turn` 状态映射、JSON 摘要截断、预算并发计数、统计快照 |
+| `meowmeowclaw/subagent/__init__.py`（新增） | 导出上述公共类型，import 无副作用 |
+| `meowmeowclaw/config.py` | §3.5 全部子代理配置键：默认值、别名、解析兜底、`Settings` 字段与 `repr`；children/total 不一致时 warning |
+| `.env.example` | 新增「子代理(SA1: 默认关闭)」配置小节，含全部键与默认值 |
+| `tests/test_config.py` / `tests/subagent/test_subagent_models.py`（新增） | 新增 54 个用例：配置默认值/显式值/非法回退/别名/`repr`、请求校验、状态映射、JSON 截断、预算、统计 |
+
+**验证**
+
+- `subagent_enabled=false` 时未注册任何工具、未构造任何运行时对象，启动路径与现状一致；
+- 全量回归 **1610 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 本阶段不做：spawn 工具、factory、prompt builder、变更锁、exec 安全策略（分别属于 SA2–SA4）。
+
 
 ---
 

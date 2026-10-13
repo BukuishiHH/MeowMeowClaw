@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "git": {
+      "command": "/path/to/python",
+      "args": [
+        "-m",
+        "meowmeowclaw_mcp_git",
+        "--root",
+        "/path/to/repo",
+        "--read-only=false",
+        "--allow-remote=false",
+        "--protected-branches",
+        "main,master",
+        "--timeout",
+        "30"
+      ],
+      "disabled": false,
+      "autoApprove": [
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_blame",
+        "git_file_at_revision",
+        "git_list_branches",
+        "git_list_tags",
+        "git_list_remotes",
+        "git_rev_parse",
+        "git_config_get",
+        "git_grep",
+        "git_search_history"
+      ]
+    }
+  }
+}

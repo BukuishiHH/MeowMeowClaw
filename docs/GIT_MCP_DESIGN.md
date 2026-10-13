@@ -1,6 +1,6 @@
 # MeowMeowClaw Git MCP Server 设计（v1）
 
-> 状态：**评审通过，GM1–GM4 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> 状态：**评审通过，GM1–GM5 已实现（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
 > Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
 > 按 §10 里程碑（GM1–GM6）逐步实现，每阶段独立提交；实施状态与实现记录见 §14。
 > 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
@@ -507,6 +507,11 @@ GM3 实现补充：
 
 ### 7.2 Cline 配置示例
 
+> GM5 已落地：可直接复制的模板在 `docs/cline_mcp_settings.readonly.json` 与
+> `docs/cline_mcp_settings.writable.json`；完整步骤、参数表、autoApprove 原则、上下文预算建议与排障
+> 见 `docs/CLINE_MCP_GIT.md`；POSIX 启动包装为 `scripts/run_git_mcp_server.sh`（`MCP_GIT_PYTHON` 指定解释器）。
+> 下面保留设计期示例，字段含义与模板一致。
+
 Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/系统路径不同，实现阶段确认）。
 配置形态：
 
@@ -572,7 +577,9 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 | 工具报“repo 未找到” | 检查 alias/root 配置 |
 | 命令超时 | 大仓/网络；调 `--timeout` 或缩小查询范围 |
 | 输出截断 | 使用 `paths`/`max_count`/`stat_only` 缩小请求 |
-| 写操作被拒绝 | 检查 `--read-only=false`、保护分支、dirty 状态 |
+| 写操作被拒绝 | 检查 `--read-only=false`、保护分支、dirty 状态、错误码 `policy_denied`/`protected_branch`/`dirty_worktree`/`lock_timeout` |
+
+> GM5 起完整排障表（含真实 stderr 文案与错误码）见 `docs/CLINE_MCP_GIT.md` §8。
 
 ---
 
@@ -616,6 +623,10 @@ Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/�
 - 验证写操作会弹出确认，确认后 commit/switch 正常；
 - 验证只读模式下写工具不可见；
 - 记录 Cline 版本、配置路径与截图/日志（实现阶段）。
+
+> GM5 已提供 `docs/CLINE_MCP_GIT.md` §10 的可勾选冒烟清单与两套模板；本机环境无法启动 Cline GUI，
+> 真实 GUI 冒烟的记录在 GM6 回填。模板与服务器实现的一致性由 `tests/mcp_git/test_mcp_git_cline_config.py`
+> 自动校验（用模板参数真实启动 stdio server 比对工具列表）。
 
 ---
 
@@ -746,6 +757,11 @@ resources 静态项与模板可列出并可读取，读取不修改仓库。详�
 
 **提交建议**：`docs(mcp-git): GM5 Cline 接入指南与配置模板`
 
+**验收结果（2026-10-13）**：配置模板/接入指南/启动包装已落地并自动校验：两套模板均为合法 JSON、
+autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server 后工具列表与 `--read-only` 一致
+（只读 13 / 可写 21）；`docs/CLINE_MCP_GIT.md` 覆盖安装、路径、参数、预算、排障与勾选清单。
+**真实 Cline GUI 冒烟（工具列表出现、autoApprove 不弹确认、写操作弹确认）留待 GM6 人工执行并回填。**
+
 ### 10.7 GM6：全量验收与收尾（1d）
 
 **交付物**
@@ -772,7 +788,7 @@ resources 静态项与模板可列出并可读取，读取不修改仓库。详�
 - [x] GM2：只读工具齐全、结构化、有输出预算（2026-10-13，见 §14.1）；
 - [x] GM3：写工具默认关闭、dirty/保护分支/锁生效（2026-10-13，见 §14.1）；
 - [x] GM4：fetch 默认关闭、prompts/resources 可用（2026-10-13，见 §14.1）；
-- [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认；
+- [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认（配置模板/指南/自动校验已完成，GUI 冒烟待 GM6）；
 - [ ] GM6：全量 pytest + ruff + 人工冒烟记录；
 - [ ] 所有路径参数在 allowlist 根内；
 - [ ] stdout 仅 MCP 协议消息；
@@ -817,7 +833,7 @@ resources 静态项与模板可列出并可读取，读取不修改仓库。详�
 | GM2 | 已完成 | `43391ea` | 13 个只读工具 + 6 个解析器 + 输出预算/有界截断；新增 141 用例 |
 | GM3 | 已完成 | `8b187d5` | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
 | GM4 | 已完成 | `eba419f` | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
-| GM5 | 待实现 | — | Cline 接入 + 文档 |
+| GM5 | 已完成 | 待回填 | 两套 Cline 模板 + 接入指南 + 启动包装 + 模板自动校验；GUI 冒烟待 GM6 |
 | GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |
 
 ### 14.1 实现记录
@@ -1038,9 +1054,50 @@ resources 静态项与模板可列出并可读取，读取不修改仓库。详�
   meowmeowclaw_mcp_git tests` 通过；
 - 本阶段不做：Cline 配置模板与真实 GUI 冒烟（GM5）、审计与全量验收收尾（GM6）。
 
+#### GM5 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `docs/cline_mcp_settings.readonly.json`（新增） | 只读模板：`--read-only=true`；`autoApprove` = 13 个只读工具；可直接复制（替换 `/path/to/python`、`/path/to/repo`） |
+| `docs/cline_mcp_settings.writable.json`（新增） | 可写模板：`--read-only=false` + `--allow-remote=false` + `--protected-branches main,master` + `--timeout 30`；`autoApprove` 仍只放只读工具 |
+| `docs/CLINE_MCP_GIT.md`（新增） | 接入指南：安装/自检、Cline 配置文件路径、五分钟只读接入、可写模式与确认策略、多仓库、参数/环境变量表、autoApprove 原则、上下文预算建议、排障表、安全边界、人工冒烟勾选清单 |
+| `scripts/run_git_mcp_server.sh`（新增） | POSIX 启动包装：`MCP_GIT_PYTHON` 指定解释器，其余参数透传；Windows 直接用 python.exe（指南注明） |
+| `README.md` | §1 新增「Git MCP Server(Cline 接入)」小节（安装/入口/模板/指南指引）；目录树与 Roadmap 同步 |
+| `.env.example` | 说明该服务**不读取本 .env**，列出 `MCP_GIT_*` 环境变量与指南位置 |
+| `tests/mcp_git/test_mcp_git_cline_config.py`（新增） | 14 用例：模板 JSON/占位符/autoApprove 白名单、指南覆盖、包装脚本可执行，以及**用模板参数真实启动 stdio server** 比对工具列表 |
+| `docs/GIT_MCP_DESIGN.md` | §7.2/§7.4/§9.4/§10.6/§11/§14/附录 A 与状态同步 |
+
+**关键实现决策**
+
+- **模板即验收用例**：测试直接读取 `docs/cline_mcp_settings.*.json`，替换占位符后用官方 SDK
+  `stdio_client` 启动服务器，断言只读模板=13 只读工具、可写模板=13 只读+8 写（不含 fetch），
+  保证文档与实际注册矩阵不会漂移；
+- **autoApprove 白名单代码化校验**：断言模板里的 `autoApprove` 恰好等于 `build_read_tools()` 的 13 个
+  名字，且不含任何写/远端工具（防误配导致写操作自动执行）；
+- **可写模板默认保守**：`--allow-remote=false`、`--protected-branches main,master`、`--timeout 30`；
+  危险开关（force/amend/allow_empty/confirm）仍由每次调用显式传参 + Cline 确认；
+- **真实 GUI 冒烟与自动校验分离**：本机环境无法启动 Cline GUI，因此 GM5 交付“模板 + 指南 + 可自动执行的
+  一致性校验”，真实 Cline 的 autoApprove/写确认留到 GM6 人工执行并回填；
+- **启动包装最小化**：只做解释器选择与 `exec`，不引入额外依赖；Windows 明确不用该脚本。
+
+**验证**
+
+- `tests/mcp_git/test_mcp_git_cline_config.py` 14 用例通过：模板结构/占位符、autoApprove 白名单、
+  指南覆盖关键参数与工具、包装脚本可执行并能 `--version`、模板真实启动 stdio 后工具列表一致；
+- 全量回归 **2120 passed / 6 skipped / 2 xfailed**（新增 14 用例）；`ruff check meowmeowclaw
+  meowmeowclaw_mcp_git tests` 通过；
+- 配置错误提示：`--root` 指向非仓库/不存在 → stderr `启动失败: ...` + 退出码 2；缺 `mcp` →
+  stderr 安装提示 + 退出码 3（指南 §8 排障表）；
+- 未完成：真实 Cline GUI 冒烟（记录版本/配置路径/截图）→ GM6。
+
 ---
 
 ## 附录 A：只读模式 Cline 配置模板
+
+> 可复制文件：`docs/cline_mcp_settings.readonly.json`（可写模板：`docs/cline_mcp_settings.writable.json`）；
+> 接入步骤见 `docs/CLINE_MCP_GIT.md`。下面为等价示例（占位符需替换为绝对路径）。
 
 ```json
 {
@@ -1097,4 +1154,4 @@ resources 静态项与模板可列出并可读取，读取不修改仓库。详�
 
 > 本文是 Git MCP Server 的实现依据。按 §10 里程碑（GM1–GM6）推进；
 > 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
-> **GM1–GM4 已完成（2026-10-13），实现记录见 §14.1；GM5 待评审确认后启动。**
+> **GM1–GM5 已完成（2026-10-13），实现记录见 §14.1；GM6 待评审确认后启动（全量验收 + 真实 Cline 冒烟收尾）。**

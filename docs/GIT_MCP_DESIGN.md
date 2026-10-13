@@ -783,7 +783,7 @@ dirty 下 switch/restore/apply 默认拒绝并可用 force 显式放行；保护
 |---|---|---|---|
 | GM1 | 已完成 | `d010f63` | MCP stdio 骨架 + RepoRegistry + `git_status`；新增 136 用例；默认只读、stdout 无污染 |
 | GM2 | 已完成 | `43391ea` | 13 个只读工具 + 6 个解析器 + 输出预算/有界截断；新增 141 用例 |
-| GM3 | 已完成 | 待回填 | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
+| GM3 | 已完成 | `8b187d5` | 8 个写工具 + PolicyEngine + 每仓库锁(进程内/跨进程)；新增 85 用例 |
 | GM4 | 待实现 | — | fetch + prompts/resources |
 | GM5 | 待实现 | — | Cline 接入 + 文档 |
 | GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |

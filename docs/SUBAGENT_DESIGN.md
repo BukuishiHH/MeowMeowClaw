@@ -1154,7 +1154,7 @@ meowmeowclaw/
 | SA2 | 已完成 | `86e0a07` | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
 | SA3 | 已完成 | `2316a41` | 变更锁/OCC/原子写；主+子 write 接锁；新增 19 用例；exec 仍待 SA4 |
 | SA4 | 已完成 | `4eb4429` | exec 策略/环境清洗/取消杀组/敏感路径/审计；新增 36 用例 |
-| SA5 | 已完成 | 待回填 | 预算/turn 重置、stats 接入、bootstrap 装配、README 配置表；新增 3 用例 |
+| SA5 | 已完成 | `29b95a7` | 预算/turn 重置、stats 接入、bootstrap 装配、README 配置表；新增 3 用例 |
 | SA6 | 待实现 | — | 依赖 SA5；全量验收、冒烟与收尾 |
 
 ### 15.1 实现记录

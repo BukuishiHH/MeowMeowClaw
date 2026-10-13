@@ -91,6 +91,28 @@ class TestFetch:
         assert any(item["name"] == "origin/main" for item in payload["data"]["refs"])
 
     @pytest.mark.asyncio
+    async def test_remote_head_symref_is_not_reported(self, remote_pair, git):
+        """回归(CI git ≥2.46): fetch 自动创建的 refs/remotes/origin/HEAD 是符号引用,
+        其短名会被缩写成 "origin"; 它不应出现在 ref 变化里, 真实分支更新仍要报告."""
+        work, _remote, other = remote_pair
+        # 显式造出远端 HEAD 符号引用: 老 git 默认不创建, 用它确定性地模拟新 git 的行为
+        git(work, "remote", "set-head", "origin", "--auto")
+        assert git(work, "symbolic-ref", "refs/remotes/origin/HEAD").returncode == 0
+        (other / "remote.txt").write_text("remote\n", encoding="utf-8")
+        git(other, "add", "remote.txt")
+        git(other, "commit", "-qm", "feat: remote work")
+        git(other, "push", "-q", "origin", "main")
+        app = make_app(work)
+
+        first = await call(app, "git_fetch", remote="origin")
+        second = await call(app, "git_fetch", remote="origin")
+
+        assert [item["name"] for item in first["data"]["refs"]] == ["origin/main"]
+        assert first["data"]["refs_changed"] == 1
+        assert second["data"]["refs_changed"] == 0
+        assert second["data"]["refs"] == []
+
+    @pytest.mark.asyncio
     async def test_prune_deletes_removed_tracking_branch(self, remote_pair, git):
         work, _remote, other = remote_pair
         git(other, "checkout", "-qb", "feature")

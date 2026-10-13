@@ -230,7 +230,7 @@ GM1 实现补充：
 | `git_branch_switch` | 切换分支 | `repo`、`name`、`force` | 默认 dirty 拒绝；**GM3 已实现** |
 | `git_branch_delete` | 删除分支 | `repo`、`name`、`force` | 默认拒绝未合并/当前分支；**GM3 已实现** |
 | `git_stash` | stash 管理 | `repo`、`action(list/push/pop/apply/drop)`、`message`、`paths` | drop 需显式确认；**GM3 已实现** |
-| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase；**GM4 已实现** |
+| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase；**GM4 已实现**；忽略 `<remote>/HEAD` 符号引用 |
 
 > 写工具默认不注册（`--read-only=true` 时 `tools/list` 只有 13 个只读工具）；
 > `--read-only=false` 后出现上述 8 个写工具，Cline 应保持逐次确认（`autoApprove` 只放只读工具）。
@@ -850,6 +850,7 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
 | GM4 | 已完成 | `eba419f` | `git_fetch`(默认关闭) + URL 脱敏收口 + 4 prompts + 4 resources/模板；新增 52 用例 |
 | GM5 | 已完成 | `bf2b356` | 两套 Cline 模板 + 接入指南 + 启动包装 + 模板自动校验；GUI 冒烟待 GM6 |
 | GM6 | 已完成 | `195d71e` | 最小审计(`--audit-log`) + 端到端脚本 24/24 + 验收记录/发布说明；新增 15 用例 |
+| GM6.1 | 已完成 | 待回填 | 补丁: `git_fetch` 忽略远端 HEAD 符号引用(git ≥2.46/CI 兼容)；新增 1 用例 |
 
 ### 14.1 实现记录
 
@@ -1042,6 +1043,7 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
   无关，只读模式下也可显式开启远端）；handler 内 `ensure_remote_enabled` 二次校验；
 - **只拉不合并**：只执行 `git fetch [--prune] [remote]`，不动工作区/本地分支；用 fetch 前后的
   remote-tracking refs 对比生成结构化 `refs`（created/updated/deleted），比解析进度文本更稳定；
+  对比时跳过远端 HEAD 符号引用（`refs/remotes/<remote>/HEAD`，见 GM6 补丁记录）；
 - **fetch 不被早停杀死**：GM2 的有界流式读取默认超限杀进程组；fetch 有副作用，改用
   `kill_on_limit=False`（读完、只截断输出），避免半更新状态；
 - **脱敏**：fetch 的进度输出与失败消息统一 `sanitize_text`（userinfo → `***`，token/password
@@ -1140,6 +1142,15 @@ autoApprove 只含 13 个只读工具、用模板参数真实启动 stdio server
   远端 22 工具 + fetch 更新 refs 且不合并；空 stdin stdout 0 字节；无残留 server 进程；
 - Cline GUI 冒烟记录表（9 项）见 `docs/GIT_MCP_ACCEPTANCE.md` §5，待人工执行；
 - 明确未完成：真实 Cline GUI 冒烟、Windows 实机验证（验收记录 §6 已知限制 #8/#9）。
+
+
+**v0.1 补丁（2026-10-13）**：修复 git ≥2.46 下 `git_fetch` 误报远端 HEAD 符号引用导致 CI 失败的问题。
+新版 git 的 `git fetch` 会按 `remote.<name>.followRemoteHEAD`（默认 `create`）自动创建/更新
+`refs/remotes/<remote>/HEAD`；它本身是符号引用，且 `%(refname:short)` 会把它缩写成远端名（如 `origin`），
+旧实现把它当成一次 ref 变化（CI 上表现为 `refs_changed=1` 与 `refs=[origin, origin/main]`）。
+修复：`_remote_refs` 改为读取 `%(refname)/%(refname:short)/%(objectname)/%(symref)` 并跳过符号引用与
+`*/HEAD` 条目；新增 1 个回归用例（用 `git remote set-head origin --auto` 确定性复现新 git 行为）。
+提交号：待回填。
 
 ---
 

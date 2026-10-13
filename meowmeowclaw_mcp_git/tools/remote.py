@@ -21,6 +21,10 @@ from .base import LEVEL_REMOTE, ToolContext, ToolOutcome, ToolSpec
 
 FETCH_OUTPUT_BYTES = 4096
 _FIELD_SEP = "\x1f"
+# full name / short name / oid / symref: 用于识别并跳过远端 HEAD 符号引用
+_REMOTE_REF_FORMAT = (
+    f"%(refname){_FIELD_SEP}%(refname:short){_FIELD_SEP}%(objectname){_FIELD_SEP}%(symref)"
+)
 
 
 async def git_fetch(ctx: ToolContext, args: dict[str, Any]) -> ToolOutcome:
@@ -80,18 +84,29 @@ async def _ensure_success(ctx: ToolContext, entry: Any, result: Any) -> None:
 
 
 async def _remote_refs(ctx: ToolContext, entry: Any, remote: Optional[str]) -> dict[str, str]:
-    """读取 remote-tracking refs(name → oid), 用于对比 fetch 前后的变化."""
+    """读取 remote-tracking refs(short name → oid), 用于对比 fetch 前后的变化.
+
+    跳过**远端 HEAD 符号引用**(``refs/remotes/<remote>/HEAD``):
+
+    - git ≥2.46 的 ``git fetch`` 会按 ``remote.<name>.followRemoteHEAD``(默认 create)
+      自动创建/更新它, 导致不同 git 版本行为不一致(CI 曾因此失败);
+    - 它的 ``%(refname:short)`` 会被缩写成远端名(如 ``origin``), 当成分支变化会严重误导;
+    - 它本身是符号引用, 不属于远端分支对象的更新。
+    """
     prefix = f"refs/remotes/{remote}/" if remote else "refs/remotes/"
-    result = await common.run_git(ctx, entry, ["for-each-ref", f"--format=%(refname:short){_FIELD_SEP}%(objectname)", prefix])
+    result = await common.run_git(ctx, entry, ["for-each-ref", f"--format={_REMOTE_REF_FORMAT}", prefix])
     common.ensure_success(ctx, result, entry=entry, what="git for-each-ref refs/remotes")
     refs: dict[str, str] = {}
     for line in result.stdout_text().splitlines():
         if not line:
             continue
-        name, sep, oid = line.partition(_FIELD_SEP)
-        if not sep:
+        fields = line.split(_FIELD_SEP)
+        if len(fields) != 4:
             raise GitMcpError(f"无法解析远端 ref 行: {line[:120]!r}")
-        refs[name] = oid
+        full_name, short_name, oid, symref = fields
+        if symref or full_name.endswith("/HEAD"):
+            continue  # 远端 HEAD 等符号引用不计入 ref 变化
+        refs[short_name] = oid
     return refs
 
 

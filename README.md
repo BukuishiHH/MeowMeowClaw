@@ -5,7 +5,7 @@
 依据 OpenClaw 思路实现的自定义 Agent -- **不依赖 LangChain / LangGraph 等编排框架**, 用一个显式的"模型 ↔ 工具"循环驱动.
 
 - **技术栈**: Python 3.10+; 运行时依赖 `openai`(AsyncOpenAI) / `python-dotenv` / `httpx` / `pyyaml` / `websockets`, 联网工具另需 `ddgs`、`html2text`
-- **代码规模**: 84 个源码模块 / 约 18600 行; 测试 82 个文件 / **2143 个用例**(2135 passed + 6 skipped + 2 xfailed)
+- **代码规模**: 84 个源码模块 / 约 18600 行; 测试 82 个文件 / **2144 个用例**(2136 passed + 6 skipped + 2 xfailed)
 - **渠道**: CLI(直连或网关) + QQ(**NapCat / OneBot 11 反向 WebSocket**, 仅主人私聊); 支持**流式输出**(CLI 逐字 / QQ "正在输入" / QQ 渐进式气泡)
 - **协议**: OpenAI Chat Completions + function calling, 任何兼容服务(DeepSeek / 通义 / vLLM / Ollama / One-API)改 `base_url` 即可接入
 
@@ -612,7 +612,7 @@ registry.register(HttpGetTool())
 ## 9. 测试
 
 ```bash
-pytest                                        # 全量: 2135 passed, 6 skipped, 2 xfailed
+pytest                                        # 全量: 2136 passed, 6 skipped, 2 xfailed
 python scripts/verify_git_mcp_server.py       # Git MCP 端到端验收(24 项, 纯本地)
 pytest tests/agent/test_loop.py -v
 RUN_NETWORK_TESTS=1 pytest -m network -v      # 仅真实联网用例
@@ -688,7 +688,7 @@ CI: GitHub Actions(`.github/workflows/ci.yml`)在 push / PR 时于 Python 3.10 /
 | `mcp_git/test_mcp_git_locks.py` | 10 | **GM3**: 进程内串行/超时、跨进程 flock、锁文件权限与排障 |
 | `mcp_git/test_mcp_git_write_tools.py` | 50 | **GM3**: 8 个写工具端到端(路径/全部/dirty/force/amend/confirm/before-after) |
 | `mcp_git/test_mcp_git_write_concurrency.py` | 7 | **GM3**: 并发写 index 完整性、锁等待/超时、跨进程互斥 |
-| `mcp_git/test_mcp_git_fetch_tool.py` | 12 | **GM4**: fetch 注册/更新/prune/默认远端/凭证脱敏/错误码 |
+| `mcp_git/test_mcp_git_fetch_tool.py` | 13 | **GM4/GM6.1**: fetch 注册/更新/prune/默认远端/凭证脱敏/远端 HEAD 符号引用 |
 | `mcp_git/test_mcp_git_prompts.py` | 14 | **GM4**: 4 个 prompt 的内容/参数校验/预算/只读性(含真实冲突) |
 | `mcp_git/test_mcp_git_resources.py` | 20 | **GM4**: status/head/log/file、含 `/` 的 ref、二进制/截断、越界与只读性 |
 | `mcp_git/test_mcp_git_cline_config.py` | 14 | **GM5**: Cline 模板/autoApprove 白名单/指南覆盖/包装脚本 + 模板启动 stdio 冒烟 |

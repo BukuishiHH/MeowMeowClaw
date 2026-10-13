@@ -1,6 +1,9 @@
 # Git MCP Server v0.1 验收记录（GM6）
 
-> 日期：2026-10-13　范围：GM1–GM6　关联：`docs/GIT_MCP_DESIGN.md` §10.7/§14、`docs/CLINE_MCP_GIT.md`
+> 日期：2026-10-13　范围：GM1–GM6（含 GM6.1 补丁）　关联：`docs/GIT_MCP_DESIGN.md` §10.7/§14、`docs/CLINE_MCP_GIT.md`
+>
+> **2026-10-13 补丁**：修复 git ≥2.46 下 `git_fetch` 误报远端 HEAD 符号引用（CI 两条 Python 腿失败根因），
+> 详见设计文档 §14.1 GM6 补丁记录；本记录中的测试数字为补丁后重跑结果。
 > 结论：**GM1–GM6 交付完成，自动验收全绿**；唯一未闭环项是“真实 Cline GUI 冒烟”（本环境无 Cline，
 > 记录表见 §5，人工执行后回填）。
 
@@ -20,10 +23,10 @@
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 全量测试 | `pytest -q` | **2135 passed / 6 skipped / 2 xfailed** |
+| 全量测试 | `pytest -q` | **2136 passed / 6 skipped / 2 xfailed**（含 2026-10-13 补丁后重跑） |
 | 静态检查 | `ruff check meowmeowclaw meowmeowclaw_mcp_git tests` | 通过（E9+F 硬错误） |
 | 端到端验收 | `python scripts/verify_git_mcp_server.py` | **24/24 PASS**（见 §3） |
-| Git MCP 专项 | `pytest tests/mcp_git -q` | **446 passed**（GM1–GM6） |
+| Git MCP 专项 | `pytest tests/mcp_git -q` | **447 passed**（GM1–GM6.1） |
 | 协议能力 | `pytest tests/mcp_git/test_mcp_git_protocol.py -q` | 通过：真 SDK stdio 握手、tools/prompts/resources、stdout 纯净性 |
 | Cline 模板 | `pytest tests/mcp_git/test_mcp_git_cline_config.py -q` | 通过：模板参数真实启动服务器，工具列表与 `--read-only` 一致 |
 | 审计 | `pytest tests/mcp_git/test_mcp_git_audit.py -q` | 通过：JSONL/0600/参数摘要/失败 fail-soft |
@@ -51,7 +54,7 @@
 | G3 | 输出可被模型消费 | 统一 `{ok,data,meta}`；`truncated`/`has_more` 与预算裁剪；app 层 `--max-output-bytes` 兜底 |
 | G4 | Cline 集成顺畅 | 两套模板 + 接入指南 + 模板启动一致性自动校验（GM5） |
 | G5 | 并发可控 | 每仓库 `asyncio.Lock` + `--lock-dir` 跨进程 flock；并发 stage 后 index 完整 |
-| G6 | 可测试可回归 | Git MCP 446 用例、全量 2135 passed、ruff 通过、脚本不依赖网络 |
+| G6 | 可测试可回归 | Git MCP 447 用例、全量 2136 passed、ruff 通过、脚本不依赖网络 |
 | G7 | 不污染主项目 | 独立顶层包 + 可选依赖组 `mcp-git`；`mcp` 只在 `server.py` 导入；主项目用例回归通过 |
 
 ### 4.2 里程碑

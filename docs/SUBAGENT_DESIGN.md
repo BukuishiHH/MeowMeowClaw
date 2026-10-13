@@ -1,6 +1,6 @@
 # MeowMeowClaw 子代理协同设计（SpawnSubagentTool / v1）
 
-> 状态：**设计已评审；SA1–SA5 已实现（2026-10-13）**，SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
+> 状态：**SA1–SA6 已实现（v1 完成，2026-10-13）**。本文只定义 v1 子代理的行为、接口、隔离边界、
 > 竞态/安全方案、配置、测试与里程碑，**不改 JSONL 文件格式、不改主代理既有语义**；
 > 实现按 §11 里程碑推进，每阶段独立提交，默认 `subagent_enabled=false`。
 > 关联：`docs/A_PLUS_OPTIMIZATION.md`（运行时生命周期）、`docs/GATEWAY_DESIGN.md`、
@@ -1155,7 +1155,7 @@ meowmeowclaw/
 | SA3 | 已完成 | `2316a41` | 变更锁/OCC/原子写；主+子 write 接锁；新增 19 用例；exec 仍待 SA4 |
 | SA4 | 已完成 | `4eb4429` | exec 策略/环境清洗/取消杀组/敏感路径/审计；新增 36 用例 |
 | SA5 | 已完成 | `29b95a7` | 预算/turn 重置、stats 接入、bootstrap 装配、README 配置表；新增 3 用例 |
-| SA6 | 待实现 | — | 依赖 SA5；全量验收、冒烟与收尾 |
+| SA6 | 已完成 | 待回填 | 全量验收 + CLI/QQ 真实进程冒烟 + README/ADR 收尾；设计文档更新 |
 
 ### 15.1 实现记录
 
@@ -1267,6 +1267,52 @@ meowmeowclaw/
 - 全量回归 **1689 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
 - 本阶段不做：真实 CLI/QQ 冒烟、最终文档/README 验收收尾（SA6）。
 
+#### SA6 实现记录（2026-10-13，v1 完成）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `README.md` | 新增「子代理(SpawnSubagentTool v1 / SA1–SA6)」章节：启用示例、隔离/深度/竞态/exec/敏感路径/观测/回滚；配置表与模块/测试/目录/Roadmap 已在 SA5 同步 |
+| `.env.example` | 子代理小节更新为 v1（SA1–SA6），补充“exec 是护栏而非沙箱”警告 |
+| `docs/GATEWAY_DESIGN.md` | 新增 §16.8「子代理接入」：装配、网关透明性、竞态/安全边界、观测与验证结论 |
+| `docs/SUBAGENT_DESIGN.md` | 状态更新为 SA1–SA6 已实现；本记录回填冒烟与验收结论 |
+
+**真实进程冒烟（2026-10-13）**
+
+1. **CLI（真实 `python -m meowmeowclaw` + 假 OpenAI 兼容端点）**
+   - 隔离 workspace/memory，`SUBAGENT_ENABLED=true`、`GATEWAY_ENABLED=false`、`COMPRESSION_ENABLED=false`；
+   - 假端点按 system prompt 分流：根模型返回 `spawn_subagent` tool_call，子模型直接返回文本，父模型消费
+     JSON 摘要后返回最终回答；
+   - 管道输入「你好 → /exit」：退出码 0；输出包含 `SA6 父代理最终回答（已收到子代理结果）`；
+   - `sessions/*.jsonl` 只有 1 个文件、1 条 turn / 4 条 message（user + assistant(tool_calls) + tool + final）；
+     子代理不产生 JSONL、不出现在 `/sessions`；
+   - `<memory_dir>/subagents/audit.jsonl` 含 `spawn` / `finish` 两条事件，finish 为 `status=ok`。
+2. **QQ（真实 `python -m meowmeowclaw.qq` + 假 NapCat/OneBot11 WS）**
+   - `GATEWAY_ENABLED=true`、`SUBAGENT_ENABLED=true`、`QQ_STREAM_MODE=typing`，临时端口 + Token；
+   - 假 NapCat 发送私聊「你好」；Root agent 经 `spawn_subagent` 调用子代理后，最终只收到
+     **1 条** `send_private_msg` 气泡：`SA6 父代理最终回答（已收到子代理结果）`；
+   - SIGINT 后退出码 0、日志 `已停止, 再见喵!`、监听端口释放（可重新 bind）；
+   - audit 文件同样为 `spawn` / `finish` 两条事件；
+   - 说明：当前环境无真机 NapCat，本项为真实 QQ 进程 + 假传输链路；QQ 真机传输记录见
+     `docs/GATEWAY_DESIGN.md` §16.4（W5）。
+3. **指令链路回归**：`/help` 等指令由策略直回，不触发 Agent/spawn；全量回归覆盖 CLI/QQ 策略用例。
+
+**启用建议与回滚**
+
+- 可信本地单用户：保持默认 `subagent_enabled=false`，需要时打开，建议保留默认 `guarded` + 审计；
+- 共享/不可信输入：建议 `subagent_tools` 去掉 `write_file`/`exec`（只读子代理），或
+  `subagent_exec_policy=allowlist` + `subagent_exec_allowlist` 白名单，并配合容器/受限用户；
+- 回滚：`subagent_enabled=false` 即回到与旧版逐字节一致的行为（不注册工具、不构造 guard/factory/audit）；
+- 残余风险：`exec` 非 OS 沙箱（workspace 外读取/网络外发/磁盘占用等）仍按 §7.7 明确记录。
+
+**最终验收**
+
+- 全量回归 **1689 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- `subagent_enabled=false` 与 `true` 两种启动路径均通过回归；
+- v1 里程碑 SA1–SA6 全部落地：领域模型/配置 → spawn 工具与严格隔离 → 竞态护栏 → exec 安全/敏感路径/审计 →
+  预算/统计/装配 → 真实进程冒烟与文档收尾。
+
 
 ---
 
@@ -1345,5 +1391,5 @@ workspace_mutation_lock_timeout=90
 
 ---
 
-> 本文是 v1 实现依据；SA1–SA5 已实现，SA6 验收收尾按 §11 推进，完成后更新“实现记录”并提交。
+> 本文是 v1 实现依据；**SA1–SA6 已全部实现（2026-10-13）**，本文实现记录与 `README.md` / `docs/GATEWAY_DESIGN.md` §16.8 保持一致。
 

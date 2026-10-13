@@ -673,3 +673,18 @@ fail-soft/窗口/持久化逻辑成熟有测试；适合聊天式、低频、长
   管道输入 + `/exit`，回答与 JSONL 落盘正常）；QQ 进程级冒烟（真实 `python -m meowmeowclaw.qq` +
   假 NapCat：`/help` 经 WS 往返、SIGINT 优雅关闭、端口释放；当前环境无真机 NapCat，W5 真机链路见 §16.4）；
 - 详细实现记录见 `docs/A_PLUS_OPTIMIZATION.md` §8。
+
+### 16.8 子代理接入（SpawnSubagentTool v1 / SA1–SA6，2026-10-13）
+
+- **装配**：`subagent_enabled=true` 时 `bootstrap` 构造 `SubagentFactory` 并向主 `ToolRegistry` 注册
+  `spawn_subagent`；关闭时不注册/不构造 guard、factory、audit，行为与旧版一致；
+- **网关透明**：子代理不进入 `ConversationService` runtime/refcount，不写 JSONL、不发布 `kind=stream`；
+  Gateway 的会话串行、去重、死信、流式机制对子代理无感，父代理仍只回一条最终结果；
+- **竞态**：主/子代理的 `write_file`/`exec` 共用 workspace 变更锁（跨进程），子代理叠加读后写 sha256 OCC
+  与原子替换；exec 默认 `guarded`（环境清洗 + 后台化拒绝 + 取消杀进程组），可选 `allowlist`；
+- **安全边界**：子代理敏感路径拒绝（`.env`/`*.pem`/`id_rsa*`/`.git/config`）、深度 ≤3、每 root turn
+  children/total 预算、超时与顺序调度；审计写 `<memory_dir>/subagents/audit.jsonl`；
+- **观测**：`ConversationService.stats()["subagents"]`；残余风险（exec 非沙箱）见 `docs/SUBAGENT_DESIGN.md` §7.7；
+- **验证**：全量 1689 passed；真实 CLI 进程（假 OpenAI 端点：根 spawn 子代理、父最终回答、主会话 JSONL
+  1 轮 4 消息、子代理无 JSONL、audit spawn/finish）；真实 QQ 进程（假 NapCat：agent 路径经子代理后只回
+  1 条最终气泡、SIGINT 优雅关闭、端口释放）。

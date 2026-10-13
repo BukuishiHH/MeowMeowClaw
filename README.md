@@ -218,6 +218,40 @@ qq_stream_mode=typing        # off | typing | block
 - 观测: `Gateway.stats()` 含 `stream_enabled / stream_deltas_published / stream_deltas_dropped`;
 - 回滚: `qq_stream_mode=typing`(仅保留"正在输入") 或 `stream_enabled=false`(完全回到旧行为)。
 
+### 子代理(SpawnSubagentTool v1 / SA1–SA6)
+
+由主模型通过 `spawn_subagent` 工具决定是否派生子代理; 子代理拥有独立 `AgentLoop`、
+system prompt、消息历史、模型与工具白名单, 只接收 `task/role/context`, 结果以 JSON 摘要回填父代理。
+**默认关闭**; 设计、接口、竞态/安全与里程碑见 **`docs/SUBAGENT_DESIGN.md`**。
+
+```ini
+subagent_enabled=true            # 总开关; 默认 false 时零行为变化
+subagent_max_depth=3             # 主代理 + 2 层子代理; 到上限不提供 spawn_subagent
+subagent_model=                  # 留空继承主 model
+subagent_max_iterations=8
+subagent_timeout_seconds=120
+subagent_max_children_per_turn=3
+subagent_max_total_per_turn=6
+subagent_tools=read_file,list_dir,web_search,web_fetch,load_skill,write_file,exec
+subagent_exec_policy=guarded     # guarded | allowlist; sandbox 预留
+subagent_sensitive_paths=.env,*.pem,*.key,id_rsa*,.git/config
+subagent_audit_enabled=true
+workspace_mutation_lock_enabled=true
+```
+
+| 维度 | 行为 |
+|---|---|
+| 隔离 | 独立 AgentLoop/prompt/history/模型/工具集; 不继承父对话历史/人设/MEMORY; 不写主 JSONL、不出现在 `/sessions` |
+| 深度/预算 | 默认 depth 0/1 可 spawn, depth 2 无 spawn 工具且执行层拒绝; 每 root turn children ≤3、总数 ≤6; 首版顺序执行 |
+| 竞态 | 主/子代理 `write_file`/`exec` 共用 workspace 变更锁; 子代理覆盖已存在文件必须“先读后写”+ sha256 OCC; 写入原子替换 |
+| exec | 最小环境(剔除密钥/代理变量、隔离 HOME/TMPDIR); `guarded` 拒绝后台/守护化; `allowlist` 拒绝 shell 组合符; 取消/超时杀进程组 |
+| 敏感路径 | 子代理 read/write/list 拒绝 `.env`/`*.pem`/`id_rsa*`/`.git/config` 等, 列表级过滤敏感文件名 |
+| 观测 | `ConversationService.stats()["subagents"]`(spawn/active/ok/error/timeout/conflict/exec_denied/lock_wait); 审计 `<memory_dir>/subagents/audit.jsonl` |
+| 回滚 | `subagent_enabled=false` 即回到旧版行为, 不构造 guard/factory/audit |
+
+> ⚠️ `exec` 是护栏而非沙箱: 仍有 workspace 外读取、网络外发、磁盘占用等残余风险; 不可信环境请使用 `allowlist`
+> 并配合容器/受限用户; 详见设计文档 §7.7。
+
 ### 内置工具(默认注册 6 个 + `load_skill`; 内置技能始终存在)
 
 | 工具 | 能力 | 关键限制 |

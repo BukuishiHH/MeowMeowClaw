@@ -37,10 +37,12 @@ from meowmeowclaw.subagent import (
     SubagentFactory,
     SubagentRequest,
 )
+from meowmeowclaw.subagent.audit import SubagentAuditWriter
 from meowmeowclaw.tools.base import BaseTool
 from meowmeowclaw.tools.filesystem import ReadFileTool, WriteFileTool
 from meowmeowclaw.tools.mutation import ReadVersionTracker, WorkspaceMutationGuard
 from meowmeowclaw.tools.registry import ToolRegistry
+from meowmeowclaw.tools.shell import ExecTool
 
 
 class NamedTool(BaseTool):
@@ -208,7 +210,9 @@ class TestSpawnOkAndIsolation:
         )
         tracker = ReadVersionTracker()
 
-        child = factory._build_child_registry(tracker)  # noqa: SLF001 - 验证克隆语义
+        child = factory._build_child_registry(  # noqa: SLF001 - 验证克隆语义
+            tracker, env=None, audit_callback=None
+        )
 
         child_write = child.get("write_file")
         parent_write = base.get("write_file")
@@ -313,6 +317,113 @@ class TestDepthBudgetFailSoft:
         assert result.status == STATUS_ERROR
         assert result.error_code == ERROR_ENABLED
         assert provider.calls == []
+
+
+class TestSA4ExecAndAudit:
+    @pytest.mark.asyncio
+    async def test_exec_enabled_when_allow_exec_true(self):
+        provider = CapturingProvider()
+        factory = make_factory(
+            provider,
+            base_registry_with("exec"),
+            tool_names=("exec",),
+            read_only=False,
+            allow_exec=True,
+        )
+        ctx = SpawnContext(root_id="root", parent_id="root", depth=0, budget=SubagentBudget())
+
+        result = await factory.spawn(SubagentRequest(task="运行命令"), ctx)
+
+        assert result.status == STATUS_OK
+        assert "exec" in tool_names(provider.calls[0])
+
+    @pytest.mark.asyncio
+    async def test_audit_writer_records_spawn_and_finish(self, tmp_path):
+        audit_path = tmp_path / "subagents" / "audit.jsonl"
+        writer = SubagentAuditWriter(audit_path)
+        factory = make_factory(
+            CapturingProvider(), base_registry_with("read_file"), audit_writer=writer
+        )
+        ctx = SpawnContext(root_id="root", parent_id="root", depth=0, budget=SubagentBudget())
+
+        result = await factory.spawn(
+            SubagentRequest(task="审计任务", role="researcher"), ctx
+        )
+
+        assert result.status == STATUS_OK
+        events = [
+            json.loads(line)
+            for line in audit_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert [event["event"] for event in events] == ["spawn", "finish"]
+        assert events[0]["subagent_id"] == result.subagent_id
+        assert events[0]["depth"] == 1
+        assert events[0]["task_digest"]
+        assert events[1]["status"] == STATUS_OK
+
+    @pytest.mark.asyncio
+    async def test_child_exec_env_scrubs_secrets_end_to_end(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "super-secret-key")
+
+        class ExecProvider(CapturingProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.exec_output: str | None = None
+
+            async def chat(self, messages, tools=None, model=None, max_tokens=None):
+                self.calls.append(
+                    {
+                        "messages": [dict(message) for message in messages],
+                        "tools": list(tools or []),
+                        "model": model,
+                    }
+                )
+                if len(self.calls) == 1:
+                    return LLMResponse(
+                        content="",
+                        tool_calls=[
+                            ToolCallRequest(
+                                id="call_exec",
+                                name="exec",
+                                arguments={
+                                    "command": (
+                                        "python3 -c \"import os; "
+                                        "print(os.environ.get('DEEPSEEK_API_KEY', 'MISSING'))\""
+                                    )
+                                },
+                            )
+                        ],
+                        finish_reason=FINISH_REASON_TOOL_CALLS,
+                    )
+                self.exec_output = next(
+                    str(message.get("content") or "")
+                    for message in messages
+                    if message.get("role") == "tool"
+                )
+                return LLMResponse(content="执行完成", finish_reason=FINISH_REASON_STOP)
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir(parents=True)
+        base = ToolRegistry()
+        base.register(ExecTool(str(workspace)))
+        provider = ExecProvider()
+        factory = SubagentFactory(
+            provider=provider,
+            base_registry=base,
+            workspace=workspace,
+            read_only=False,
+            allow_exec=True,
+            tool_names=("exec",),
+        )
+        ctx = SpawnContext(root_id="root", parent_id="root", depth=0, budget=SubagentBudget())
+
+        result = await factory.spawn(SubagentRequest(task="检查环境变量"), ctx)
+
+        assert result.status == STATUS_OK
+        assert provider.exec_output is not None
+        assert "super-secret-key" not in provider.exec_output
+        assert "MISSING" in provider.exec_output
 
 
 class TestChildWriteExecution:

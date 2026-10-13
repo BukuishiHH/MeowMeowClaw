@@ -10,9 +10,11 @@ import logging
 import os
 import re
 import signal
-from typing import Any, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .base import BaseTool
+from .exec_policy import SubagentCommandPolicy
+from .mutation import MutationLockError, WorkspaceMutationGuard
 
 logger = logging.getLogger(__name__)
 
@@ -50,20 +52,53 @@ class ExecTool(BaseTool):
 
     Args:
         workspace: 命令执行的工作目录(会归一化为绝对路径); 默认当前目录
+        mutation_guard: 可选工作区变更锁(SA4); exec 全程持锁, 与 write_file 串行
+        env: 可选子进程环境覆盖(子代理最小环境); None 表示继承当前进程环境
+        command_policy: 可选子代理命令策略(guarded/allowlist)
+        audit_callback: 可选审计回调, 接受事件 dict(SA4)
 
     行为约定:
         - 危险命令直接被拦截, **不会**创建任何进程;
         - 超时 60 秒, 超时后杀掉整个进程组(避免 shell 的子进程变成孤儿);
+        - 取消(CancelledError)同样杀进程组, 不留孤儿进程;
         - 标准输出与标准错误合并返回, 标准错误带 "标准错误:" 前缀;
         - 输出超过 10000 字符截断, 末尾附截断提示, 再附退出码;
-        - 任何异常都会被包装成文本返回, 不会抛给上层.
+        - 任何异常都会被包装成文本返回, 不会抛给上层。
     """
 
     # 子类可覆盖以扩展/收紧黑名单
     deny_patterns: tuple[str, ...] = DENY_PATTERNS
 
-    def __init__(self, workspace: str = ".") -> None:
+    def __init__(
+        self,
+        workspace: str = ".",
+        *,
+        mutation_guard: Optional[WorkspaceMutationGuard] = None,
+        env: Optional[Mapping[str, str]] = None,
+        command_policy: Optional[SubagentCommandPolicy] = None,
+        audit_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
         self.workspace = os.path.abspath(workspace)
+        self._mutation_guard = mutation_guard
+        self._env = dict(env) if env is not None else None
+        self._command_policy = command_policy
+        self._audit_callback = audit_callback
+
+    def for_subagent(
+        self,
+        *,
+        env: Mapping[str, str],
+        command_policy: SubagentCommandPolicy,
+        audit_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> "ExecTool":
+        """构造子代理专用副本: 保留共享变更锁, 附加最小环境/命令策略/审计."""
+        return ExecTool(
+            self.workspace,
+            mutation_guard=self._mutation_guard,
+            env=env,
+            command_policy=command_policy,
+            audit_callback=audit_callback,
+        )
 
     def __repr__(self) -> str:
         return f"<Tool name={self.name}, label={self.label}, workspace={self.workspace!r}>"
@@ -126,17 +161,49 @@ class ExecTool(BaseTool):
         blocked = self._is_dangerous(command)
         if blocked:
             logger.warning("拦截危险命令: %r", command)
+            self._emit_audit(
+                {"event": "exec", "command": command[:500], "status": "denied", "reason": blocked}
+            )
             return blocked
+
+        if self._command_policy is not None:
+            denied = self._command_policy.check(command)
+            if denied:
+                logger.warning("子代理命令策略拦截: %r (%s)", command, denied)
+                self._emit_audit(
+                    {
+                        "event": "exec",
+                        "command": command[:500],
+                        "status": "denied",
+                        "reason": denied,
+                    }
+                )
+                return f"[安全拦截] {denied}"
 
         if not os.path.isdir(self.workspace):
             return f"[错误] 工作目录不存在: {self.workspace}"
 
+        if self._mutation_guard is not None:
+            try:
+                async with self._mutation_guard.mutate(reason="exec", tool=self.name):
+                    return await self._run_command(command)
+            except MutationLockError as exc:
+                self._emit_audit(
+                    {"event": "exec", "command": command[:500], "status": "lock_timeout"}
+                )
+                return f"[变更锁超时] {exc}"
+        return await self._run_command(command)
+
+    async def _run_command(self, command: str) -> str:
+        """在（可选）变更锁内启动并回收子进程; 取消时同样杀进程组."""
+        process: Any = None
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.workspace,
+                env=self._env,
                 start_new_session=True,  # 独立进程组, 便于超时后整组清理
             )
             try:
@@ -146,12 +213,45 @@ class ExecTool(BaseTool):
             except asyncio.TimeoutError:
                 await self._terminate(process)
                 logger.warning("命令执行超时(%s 秒), 已终止: %r", EXEC_TIMEOUT_SECONDS, command)
+                self._emit_audit(
+                    {"event": "exec", "command": command[:500], "status": "timeout"}
+                )
                 return f"命令执行超时({EXEC_TIMEOUT_SECONDS}秒), 已终止"
+            except asyncio.CancelledError:
+                # SA4: 取消也必须清理整个进程组, 否则子进程会成为孤儿继续改盘
+                await asyncio.shield(self._terminate(process))
+                self._emit_audit(
+                    {"event": "exec", "command": command[:500], "status": "cancelled"}
+                )
+                raise
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 任何异常都转成文本, 不炸主循环
             logger.warning("命令执行异常: %r (%r)", command, exc)
+            self._emit_audit(
+                {"event": "exec", "command": command[:500], "status": "error"}
+            )
             return f"[命令执行异常] {exc!r}"
 
-        return self._format_result(stdout, stderr, process.returncode)
+        result = self._format_result(stdout, stderr, process.returncode)
+        self._emit_audit(
+            {
+                "event": "exec",
+                "command": command[:500],
+                "status": "ok",
+                "exit_code": process.returncode,
+                "output_chars": len(result),
+            }
+        )
+        return result
+
+    def _emit_audit(self, event: dict[str, Any]) -> None:
+        if self._audit_callback is None:
+            return
+        try:
+            self._audit_callback(event)
+        except Exception:  # noqa: BLE001 审计失败不影响主流程
+            logger.warning("子代理 exec 审计失败(已忽略): %r", event)
 
     async def _terminate(self, process: Any) -> None:
         """超时清理: 优先杀掉整个进程组(避免 shell 的子进程成为孤儿), 再兜底杀单进程."""

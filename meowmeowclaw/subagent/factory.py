@@ -12,16 +12,25 @@ SA2 临时约束: 子代理工具强制只读; write_file/exec 在 SA3/SA4 完�
 
 import asyncio
 import logging
+import shutil
+import tempfile
 import time
 import uuid
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from meowmeowclaw.agent.loop import AgentLoop
 from meowmeowclaw.llm.base import LLMProvider
+from meowmeowclaw.tools.exec_policy import (
+    SensitivePathPolicy,
+    SubagentCommandPolicy,
+    build_subagent_env,
+)
 from meowmeowclaw.tools.mutation import ReadVersionTracker
 from meowmeowclaw.tools.registry import ToolRegistry
+
+from .audit import SubagentAuditWriter
 
 from .models import (
     ERROR_CHILDREN_EXCEEDED,
@@ -78,6 +87,11 @@ class SubagentFactory:
         tool_names: tuple[str, ...] = DEFAULT_CHILD_TOOL_NAMES,
         read_only: bool = True,
         allow_exec: bool = False,
+        exec_policy: str = "guarded",
+        exec_allowlist: tuple[str, ...] = (),
+        exec_env_allowlist: tuple[str, ...] = (),
+        sensitive_paths: tuple[str, ...] = (),
+        audit_writer: Optional[SubagentAuditWriter] = None,
         stats: Optional[SubagentStats] = None,
     ) -> None:
         if max_depth < 2:
@@ -106,6 +120,14 @@ class SubagentFactory:
         self.max_total_per_turn = int(max_total_per_turn)
         self.read_only = bool(read_only)
         self.allow_exec = bool(allow_exec)
+        self.command_policy = SubagentCommandPolicy(
+            mode=exec_policy, allowlist=exec_allowlist
+        )
+        self.exec_env_allowlist = tuple(exec_env_allowlist)
+        self.sensitive_policy = (
+            SensitivePathPolicy(sensitive_paths) if sensitive_paths else None
+        )
+        self.audit = audit_writer
         self.stats = stats if stats is not None else SubagentStats(enabled=self.enabled)
         self._scheduler = asyncio.Lock()
 
@@ -220,10 +242,33 @@ class SubagentFactory:
             return self._limit(subagent_id, child_depth, code, summary, started)
 
         self.stats.record_spawn(child_depth)
+        self._record_audit(
+            {
+                "event": "spawn",
+                "subagent_id": subagent_id,
+                "parent_id": ctx.parent_id,
+                "root_id": ctx.root_id,
+                "depth": child_depth,
+                "model": self._model_name,
+                "task_digest": request.task_digest,
+            }
+        )
         try:
             result = await self._run_scheduled(request, ctx, child_depth, subagent_id, started)
         except asyncio.CancelledError:
             self.stats.record_finish("cancelled")
+            self._record_audit(
+                {
+                    "event": "finish",
+                    "subagent_id": subagent_id,
+                    "parent_id": ctx.parent_id,
+                    "root_id": ctx.root_id,
+                    "depth": child_depth,
+                    "status": "cancelled",
+                    "finish_reason": "cancelled",
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                }
+            )
             raise
         except Exception as exc:  # noqa: BLE001 子代理失败不能炸父代理
             logger.exception("子代理执行异常: id=%s", subagent_id)
@@ -235,6 +280,21 @@ class SubagentFactory:
                 started,
             )
         self.stats.record_finish(result.status)
+        self._record_audit(
+            {
+                "event": "finish",
+                "subagent_id": subagent_id,
+                "parent_id": ctx.parent_id,
+                "root_id": ctx.root_id,
+                "depth": child_depth,
+                "status": result.status,
+                "finish_reason": result.finish_reason,
+                "error_code": result.error_code,
+                "iterations": result.iterations,
+                "elapsed_ms": result.elapsed_ms,
+                "summary_chars": len(result.summary),
+            }
+        )
         return result
 
     async def _run_scheduled(
@@ -258,8 +318,14 @@ class SubagentFactory:
         finally:
             _SCHEDULER_HELD.reset(token)
 
-    def _build_child_registry(self, tracker: ReadVersionTracker) -> ToolRegistry:
-        """构造子代理工具集: read/write 克隆为带私有 tracker 的副本, 其他工具复用."""
+    def _build_child_registry(
+        self,
+        tracker: ReadVersionTracker,
+        *,
+        env: Optional[dict[str, str]],
+        audit_callback: Optional[Any],
+    ) -> ToolRegistry:
+        """构造子代理工具集: read/write 克隆为带私有 tracker 的副本, 其他按需包装(SA4)."""
         registry = ToolRegistry()
         for name in self.tool_names:
             tool = self.base_registry.get(name)
@@ -267,9 +333,47 @@ class SubagentFactory:
                 continue
             clone_for_subagent = getattr(tool, "for_subagent", None)
             if callable(clone_for_subagent):
-                tool = clone_for_subagent(version_tracker=tracker)
+                try:
+                    if name == "read_file":
+                        tool = clone_for_subagent(
+                            version_tracker=tracker,
+                            sensitive_policy=self.sensitive_policy,
+                        )
+                    elif name == "write_file":
+                        tool = clone_for_subagent(
+                            version_tracker=tracker,
+                            sensitive_policy=self.sensitive_policy,
+                            audit_callback=audit_callback,
+                        )
+                    elif name == "list_dir":
+                        tool = clone_for_subagent(sensitive_policy=self.sensitive_policy)
+                    elif name == "exec":
+                        tool = clone_for_subagent(
+                            env=env or {},
+                            command_policy=self.command_policy,
+                            audit_callback=audit_callback,
+                        )
+                    else:
+                        tool = clone_for_subagent()
+                except TypeError:
+                    # 测试替身等自定义工具不实现精确签名: 保留原实例
+                    tool = self.base_registry.get(name)
             registry.register(tool)
         return registry
+
+    def _record_audit(self, event: dict[str, Any]) -> None:
+        if self.audit is None:
+            return
+        try:
+            self.audit.record({"ts_ms": int(time.time() * 1000), **event})
+        except Exception:  # noqa: BLE001 审计失败不影响主流程
+            logger.warning("子代理审计失败(已忽略): %r", event)
+
+    def _tool_audit_callback(self, subagent_id: str):
+        def callback(event: dict[str, Any]) -> None:
+            self._record_audit({"subagent_id": subagent_id, **event})
+
+        return callback
 
     async def _run_child(
         self,
@@ -279,67 +383,84 @@ class SubagentFactory:
         subagent_id: str,
         started: float,
     ) -> SubagentResult:
-        tracker = ReadVersionTracker()
-        child_registry = self._build_child_registry(tracker)
-        if child_depth + 1 < self.max_depth:
-            # 子代理自己还可以再创建一层: 给它配置与 root 共享的 budget/parent
-            child_registry.register(
-                self.make_tool(
-                    depth=child_depth,
-                    parent_id=subagent_id,
-                    root_id=ctx.root_id,
-                    budget=ctx.budget,
-                )
-            )
-
-        builder = SubagentPromptBuilder(
-            self.workspace,
-            request=request,
-            depth=child_depth,
-            max_depth=self.max_depth,
-            tool_names=tuple(child_registry.list_tools()),
+        exec_enabled = "exec" in self.tool_names
+        home_dir = (
+            tempfile.mkdtemp(prefix="meow-subagent-home-") if exec_enabled else None
         )
-        child = AgentLoop(
-            provider=self.provider,
-            tools=child_registry,
-            context=builder,
-            model=self.model,
-            max_iterations=self.max_iterations,
+        env = (
+            build_subagent_env(home_dir=home_dir, allowlist=self.exec_env_allowlist)
+            if exec_enabled and home_dir is not None
+            else None
         )
-
         try:
-            turn = await asyncio.wait_for(
-                child.run_turn(request.task, history=[]),
-                timeout=self.timeout_seconds,
+            tracker = ReadVersionTracker()
+            child_registry = self._build_child_registry(
+                tracker,
+                env=env,
+                audit_callback=self._tool_audit_callback(subagent_id),
             )
-        except asyncio.TimeoutError:
+            if child_depth + 1 < self.max_depth:
+                # 子代理自己还可以再创建一层: 给它配置与 root 共享的 budget/parent
+                child_registry.register(
+                    self.make_tool(
+                        depth=child_depth,
+                        parent_id=subagent_id,
+                        root_id=ctx.root_id,
+                        budget=ctx.budget,
+                    )
+                )
+
+            builder = SubagentPromptBuilder(
+                self.workspace,
+                request=request,
+                depth=child_depth,
+                max_depth=self.max_depth,
+                tool_names=tuple(child_registry.list_tools()),
+            )
+            child = AgentLoop(
+                provider=self.provider,
+                tools=child_registry,
+                context=builder,
+                model=self.model,
+                max_iterations=self.max_iterations,
+            )
+
+            try:
+                turn = await asyncio.wait_for(
+                    child.run_turn(request.task, history=[]),
+                    timeout=self.timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                logger.warning(
+                    "子代理超时: id=%s depth=%d timeout=%.1fs",
+                    subagent_id,
+                    child_depth,
+                    self.timeout_seconds,
+                )
+                return SubagentResult(
+                    status=STATUS_TIMEOUT,
+                    summary=f"子代理在 {self.timeout_seconds:g} 秒内未完成，已取消。",
+                    finish_reason="timeout",
+                    iterations=0,
+                    elapsed_ms=elapsed_ms,
+                    subagent_id=subagent_id,
+                    depth=child_depth,
+                    model=self._model_name,
+                    error_code=ERROR_TIMEOUT,
+                )
+
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            logger.warning(
-                "子代理超时: id=%s depth=%d timeout=%.1fs",
-                subagent_id,
-                child_depth,
-                self.timeout_seconds,
-            )
-            return SubagentResult(
-                status=STATUS_TIMEOUT,
-                summary=f"子代理在 {self.timeout_seconds:g} 秒内未完成，已取消。",
-                finish_reason="timeout",
-                iterations=0,
-                elapsed_ms=elapsed_ms,
+            return SubagentResult.from_turn(
+                turn,
                 subagent_id=subagent_id,
                 depth=child_depth,
                 model=self._model_name,
-                error_code=ERROR_TIMEOUT,
+                elapsed_ms=elapsed_ms,
             )
-
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        return SubagentResult.from_turn(
-            turn,
-            subagent_id=subagent_id,
-            depth=child_depth,
-            model=self._model_name,
-            elapsed_ms=elapsed_ms,
-        )
+        finally:
+            if home_dir is not None:
+                shutil.rmtree(home_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------ 结果辅助
 

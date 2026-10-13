@@ -9,17 +9,21 @@
   可选 ``ReadVersionTracker``(子代理读后写 sha256 OCC) + 原子替换。
 """
 
+import logging
 import os
 import shutil
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from .base import BaseTool
+from .exec_policy import SensitivePathPolicy
 from .mutation import (
     MutationLockError,
     ReadVersionTracker,
     WorkspaceMutationGuard,
     atomic_write_text,
 )
+
+logger = logging.getLogger(__name__)
 
 MEMORY_FILE_NAME = "MEMORY.md"
 MEMORY_BACKUP_NAME = "MEMORY.md.bak"
@@ -120,15 +124,24 @@ class _MemoryAwareTool(BaseTool):
         self,
         workspace: Union[str, os.PathLike],
         memory_dir: Optional[Union[str, os.PathLike]] = None,
+        *,
+        sensitive_policy: Optional[SensitivePathPolicy] = None,
     ) -> None:
         self.workspace = os.path.abspath(os.fspath(workspace))
         if memory_dir is None:
             self.memory_dir = os.path.join(self.workspace, "memory")
         else:
             self.memory_dir = os.path.abspath(os.fspath(memory_dir))
+        # 子代理专用; 主代理默认 None(行为不变)
+        self._sensitive_policy = sensitive_policy
 
     def _denied(self, absolute_path: str, *, listing: bool = False) -> bool:
         return is_memory_denied(absolute_path, self.memory_dir, listing=listing)
+
+    def _sensitive_denied(self, absolute_path: str) -> bool:
+        if self._sensitive_policy is None:
+            return False
+        return self._sensitive_policy.is_denied(absolute_path, workspace=self.workspace)
 
     def _is_memory_file(self, absolute_path: str) -> bool:
         return os.path.normcase(os.path.realpath(absolute_path)) == os.path.normcase(
@@ -151,17 +164,24 @@ class ReadFileTool(_MemoryAwareTool):
         memory_dir: Optional[Union[str, os.PathLike]] = None,
         *,
         version_tracker: Optional[ReadVersionTracker] = None,
+        sensitive_policy: Optional[SensitivePathPolicy] = None,
     ) -> None:
-        super().__init__(workspace, memory_dir)
+        super().__init__(workspace, memory_dir, sensitive_policy=sensitive_policy)
         # 子代理实例携带私有 tracker; 主代理默认 None(行为与旧版一致)
         self._version_tracker = version_tracker
 
-    def for_subagent(self, *, version_tracker: ReadVersionTracker) -> "ReadFileTool":
-        """构造子代理专用副本(共享 workspace/memory_dir, 携带独立读版本表)."""
+    def for_subagent(
+        self,
+        *,
+        version_tracker: ReadVersionTracker,
+        sensitive_policy: Optional[SensitivePathPolicy] = None,
+    ) -> "ReadFileTool":
+        """构造子代理专用副本(独立读版本表 + 可选敏感路径策略)."""
         return ReadFileTool(
             self.workspace,
             self.memory_dir,
             version_tracker=version_tracker,
+            sensitive_policy=sensitive_policy,
         )
 
     @property
@@ -194,6 +214,9 @@ class ReadFileTool(_MemoryAwareTool):
             return f"[安全拦截] 禁止访问工作区外路径, 请求路径: {file_rel_path}"
         except Exception as exc:  # 非字符串路径等: 包装成可读文本而不是向上抛
             return f"[读取文件异常] {repr(exc)}"
+
+        if self._sensitive_denied(absolute_path):
+            return f"[安全拦截] 禁止读取敏感文件, 请求路径: {file_rel_path}"
 
         if self._denied(absolute_path):
             return f"[安全拦截] 禁止读取记忆运行时目录, 请求路径: {file_rel_path}"
@@ -229,6 +252,8 @@ class WriteFileTool(_MemoryAwareTool):
         memory_dir: 记忆目录(默认 ``<workspace>/memory``)
         mutation_guard: 可选工作区变更锁(SA3); None 时保持旧写入语义
         version_tracker: 可选子代理私有读后写版本表; None 时不做 OCC(主代理)
+        sensitive_policy: 可选子代理敏感路径策略(SA4)
+        audit_callback: 可选审计回调, 接受事件 dict(SA4)
     """
 
     def __init__(
@@ -238,18 +263,29 @@ class WriteFileTool(_MemoryAwareTool):
         *,
         mutation_guard: Optional[WorkspaceMutationGuard] = None,
         version_tracker: Optional[ReadVersionTracker] = None,
+        sensitive_policy: Optional[SensitivePathPolicy] = None,
+        audit_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
-        super().__init__(workspace, memory_dir)
+        super().__init__(workspace, memory_dir, sensitive_policy=sensitive_policy)
         self._mutation_guard = mutation_guard
         self._version_tracker = version_tracker
+        self._audit_callback = audit_callback
 
-    def for_subagent(self, *, version_tracker: ReadVersionTracker) -> "WriteFileTool":
-        """构造子代理专用副本: 共享变更锁, 携带独立读版本表(SA3)."""
+    def for_subagent(
+        self,
+        *,
+        version_tracker: ReadVersionTracker,
+        sensitive_policy: Optional[SensitivePathPolicy] = None,
+        audit_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> "WriteFileTool":
+        """构造子代理专用副本: 共享变更锁, 独立读版本表/敏感策略/审计(SA3/SA4)."""
         return WriteFileTool(
             self.workspace,
             self.memory_dir,
             mutation_guard=self._mutation_guard,
             version_tracker=version_tracker,
+            sensitive_policy=sensitive_policy,
+            audit_callback=audit_callback,
         )
 
     @property
@@ -288,6 +324,9 @@ class WriteFileTool(_MemoryAwareTool):
         except Exception as exc:
             return f"[写入文件异常] {repr(exc)}"
 
+        if self._sensitive_denied(absolute_path):
+            return f"[安全拦截] 禁止写入敏感文件, 请求路径: {file_rel_path}"
+
         if self._denied(absolute_path):
             return f"[安全拦截] 禁止写入记忆运行时目录, 请求路径: {file_rel_path}"
 
@@ -298,6 +337,9 @@ class WriteFileTool(_MemoryAwareTool):
                 ):
                     return self._write_file(absolute_path, content, file_rel_path)
             except MutationLockError as exc:
+                self._emit_audit(
+                    {"event": "write", "path": file_rel_path, "status": "lock_timeout"}
+                )
                 return f"[变更锁超时] {exc}"
         return self._write_file(absolute_path, content, file_rel_path)
 
@@ -309,6 +351,14 @@ class WriteFileTool(_MemoryAwareTool):
         try:
             conflict = self._occ_conflict(absolute_path)
             if conflict is not None:
+                self._emit_audit(
+                    {
+                        "event": "write",
+                        "path": str(file_rel_path),
+                        "status": "conflict",
+                        "reason": conflict,
+                    }
+                )
                 return conflict
 
             if self._is_memory_file(absolute_path):
@@ -326,6 +376,14 @@ class WriteFileTool(_MemoryAwareTool):
 
             if self._version_tracker is not None:
                 self._version_tracker.record_read(absolute_path, str(content))
+            self._emit_audit(
+                {
+                    "event": "write",
+                    "path": str(file_rel_path),
+                    "status": "ok",
+                    "sha256": ReadVersionTracker.digest_text(str(content)),
+                }
+            )
 
             if self._is_memory_file(absolute_path):
                 return f"[成功] 长期记忆已写入(上一版备份为 {MEMORY_BACKUP_NAME}): {file_rel_path}"
@@ -333,7 +391,18 @@ class WriteFileTool(_MemoryAwareTool):
         except IsADirectoryError:
             return f"[错误] 目标路径是目录, 不能作为文件: {absolute_path}"
         except Exception as e:
+            self._emit_audit(
+                {"event": "write", "path": str(file_rel_path), "status": "error"}
+            )
             return f"[写入文件异常] {repr(e)}"
+
+    def _emit_audit(self, event: dict[str, Any]) -> None:
+        if self._audit_callback is None:
+            return
+        try:
+            self._audit_callback(event)
+        except Exception:  # noqa: BLE001 审计失败不影响主流程
+            logger.warning("子代理写审计失败(已忽略): %r", event)
 
     def _occ_conflict(self, absolute_path: str) -> Optional[str]:
         """子代理读后写校验; 主代理(tracker=None)直接返回 None."""
@@ -381,6 +450,16 @@ class ListDirTool(_MemoryAwareTool):
         memory_dir: 记忆目录(默认 ``<workspace>/memory``); 根目录与运行时子目录禁止列举
     """
 
+    def for_subagent(
+        self, *, sensitive_policy: Optional[SensitivePathPolicy] = None
+    ) -> "ListDirTool":
+        """构造子代理专用副本(仅附加敏感路径策略)."""
+        return ListDirTool(
+            self.workspace,
+            self.memory_dir,
+            sensitive_policy=sensitive_policy,
+        )
+
     @property
     def name(self) -> str:
         return "list_dir"
@@ -412,6 +491,9 @@ class ListDirTool(_MemoryAwareTool):
         except Exception as exc:
             return f"[列举目录异常] {repr(exc)}"
 
+        if self._sensitive_denied(absolute_path):
+            return f"[安全拦截] 禁止列举敏感目录, 请求路径: {dir_rel_path}"
+
         if self._denied(absolute_path, listing=True):
             return f"[安全拦截] 禁止列举记忆运行时目录, 请求路径: {dir_rel_path}"
 
@@ -422,6 +504,9 @@ class ListDirTool(_MemoryAwareTool):
             lines = []
             for entry in sorted(entries):
                 full_entry_path = os.path.join(absolute_path, entry)
+                if self._sensitive_denied(full_entry_path):
+                    # 列表级防护: 不把敏感文件名暴露给子代理
+                    continue
                 if os.path.isdir(full_entry_path):
                     lines.append(f"{entry}/")
                 else:

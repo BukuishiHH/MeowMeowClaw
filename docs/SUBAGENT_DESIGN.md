@@ -1,6 +1,6 @@
 # MeowMeowClaw 子代理协同设计（SpawnSubagentTool / v1）
 
-> 状态：**设计已评审；SA1–SA3 已实现（2026-10-13）**，SA4–SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
+> 状态：**设计已评审；SA1–SA4 已实现（2026-10-13）**，SA5–SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
 > 竞态/安全方案、配置、测试与里程碑，**不改 JSONL 文件格式、不改主代理既有语义**；
 > 实现按 §11 里程碑推进，每阶段独立提交，默认 `subagent_enabled=false`。
 > 关联：`docs/A_PLUS_OPTIMIZATION.md`（运行时生命周期）、`docs/GATEWAY_DESIGN.md`、
@@ -1153,7 +1153,7 @@ meowmeowclaw/
 | SA1 | 已完成 | `3ed6b98` | 领域模型 + 全部配置键；新增 54 用例；默认关闭零行为变化 |
 | SA2 | 已完成 | `86e0a07` | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
 | SA3 | 已完成 | `2316a41` | 变更锁/OCC/原子写；主+子 write 接锁；新增 19 用例；exec 仍待 SA4 |
-| SA4 | 待实现 | — | 依赖 SA2+SA3；exec 安全与审计 |
+| SA4 | 已完成 | 待回填 | exec 策略/环境清洗/取消杀组/敏感路径/审计；新增 36 用例 |
 | SA5 | 待实现 | — | 依赖 SA2+SA3+SA4；预算/统计/装配 |
 | SA6 | 待实现 | — | 依赖 SA5；全量验收、冒烟与收尾 |
 
@@ -1221,6 +1221,30 @@ meowmeowclaw/
 - `exec` 仍被 SA3 factory 过滤（warning），留待 SA4 安全策略；
 - 全量回归 **1650 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
 - 本阶段不做：exec 环境清洗/命令策略/取消杀进程组、敏感路径、审计（SA4）。
+
+#### SA4 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/tools/exec_policy.py`（新增） | `build_subagent_env`(最小环境 + 密钥/代理变量剔除 + 隔离 HOME/TMPDIR)；`SubagentCommandPolicy`(`guarded` 拒绝 nohup/setsid/disown/尾随 &，`allowlist` 拒绝 shell 组合符并按前缀匹配)；`SensitivePathPolicy`(相对 workspace 的敏感文件 fnmatch) |
+| `meowmeowclaw/tools/shell.py` | `ExecTool` 支持可选 mutation_guard / env / command_policy / audit_callback；exec 全程持变更锁；**CancelledError 也杀进程组**；拒绝/超时/取消/异常/成功均写审计事件；`for_subagent()` 生成带最小环境与策略的副本 |
+| `meowmeowclaw/tools/filesystem.py` | 子代理 read/write/list 接入敏感路径策略；列表级过滤敏感文件名；写审计回调；`for_subagent()` 支持 sensitive_policy/audit_callback |
+| `meowmeowclaw/subagent/audit.py`（新增） | `SubagentAuditWriter`：`<memory_dir>/subagents/audit.jsonl` 追加 JSONL、单份轮转、失败 fail-soft |
+| `meowmeowclaw/subagent/factory.py` | 每个子代理创建隔离 HOME/TMPDIR 并在 finally 清理；exec 克隆注入命令策略/最小环境/审计；spawn/finish 写审计；保持顺序调度与深/预算约束 |
+| `meowmeowclaw/bootstrap.py` | exec 策略/allowlist/env allowlist/敏感路径/审计 writer 透传；`allow_exec=True`；主/子 exec 与 write 共用同一把变更锁 |
+| `tests/tools/test_exec_policy.py` / `test_shell_policy.py` / `test_filesystem_sensitive.py` / `tests/subagent/test_subagent_factory.py` | 新增 36 个用例：环境清洗、guarded/allowlist、敏感路径 read/write/list、exec 取消杀进程组、锁超时、子代理 exec 端到端密钥不泄漏、审计 spawn/finish |
+
+**验证**
+
+- 子代理 exec 只看得到最小环境：`DEEPSEEK_API_KEY` 等密钥/令牌/代理变量被剔除，`HOME/TMPDIR` 指向隔离目录且 spawn 结束后清理；
+- `guarded` 拒绝后台/守护化；`allowlist` 拒绝 `;`/`&&`/`|`/`$()` 等组合符与未授权命令；已有危险命令黑名单仍生效；
+- `CancelledError` 路径杀整个进程组，父任务取消不留孤儿命令；
+- 子代理 read/write/list 对 `.env`/`*.pem`/`id_rsa*`/`.git/config` 拒绝或过滤，主代理行为不变；
+- 审计文件包含 spawn/finish/tool 事件（模型工具不可见），写入失败不影响主流程；
+- 全量回归 **1686 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 本阶段后 `exec` 在 guarded/allowlist 策略下对子代理开放；残余风险（`exec` 非沙箱）仍按 §7.7 记录。
 
 
 ---
@@ -1300,5 +1324,5 @@ workspace_mutation_lock_timeout=90
 
 ---
 
-> 本文是 v1 实现依据；SA1–SA3 已实现，SA4–SA6 按 §11 里程碑逐阶段推进，每阶段完成后更新“实现记录”并提交。
+> 本文是 v1 实现依据；SA1–SA4 已实现，SA5–SA6 按 §11 里程碑逐阶段推进，每阶段完成后更新“实现记录”并提交。
 

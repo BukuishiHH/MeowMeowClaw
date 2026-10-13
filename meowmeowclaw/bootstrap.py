@@ -78,7 +78,7 @@ def build_registry(
         )
     )
     registry.register(ListDirTool(config.workspace, config.memory_dir))
-    registry.register(ExecTool(config.workspace))
+    registry.register(ExecTool(config.workspace, mutation_guard=mutation_guard))
     registry.register(WebSearchTool())
     registry.register(WebFetchTool())
     return registry
@@ -166,9 +166,18 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
     # 子代理(SA2/SA3): 默认关闭; 开启时构造 factory 并把 depth0 spawn 工具注册给主代理。
     # SA3 开放 write_file(带独立 tracker/OCC); exec 仍由 factory 过滤, 留待 SA4。
     if config.subagent_enabled:
+        from meowmeowclaw.subagent.audit import SubagentAuditWriter
         from meowmeowclaw.subagent.factory import SubagentFactory
         from meowmeowclaw.subagent.models import SubagentStats
 
+        audit_writer = (
+            SubagentAuditWriter(
+                config.memory_dir / "subagents" / "audit.jsonl",
+                max_bytes=config.subagent_audit_max_bytes,
+            )
+            if config.subagent_audit_enabled
+            else None
+        )
         subagent_factory = SubagentFactory(
             provider=provider,
             base_registry=registry,
@@ -183,11 +192,16 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
             max_total_per_turn=config.subagent_max_total_per_turn,
             tool_names=config.subagent_tools,
             read_only=False,
-            allow_exec=False,
+            allow_exec=True,  # SA4: exec 在 guarded/allowlist 策略下开放
+            exec_policy=config.subagent_exec_policy,
+            exec_allowlist=config.subagent_exec_allowlist,
+            exec_env_allowlist=config.subagent_exec_env_allowlist,
+            sensitive_paths=config.subagent_sensitive_paths,
+            audit_writer=audit_writer,
             stats=SubagentStats(enabled=True),
         )
         registry.register(subagent_factory.make_root_tool())
-        logger.info("子代理已装配: %r (SA3: write OCC, exec 待 SA4)", subagent_factory)
+        logger.info("子代理已装配: %r (SA4: write OCC + exec 策略/审计)", subagent_factory)
 
     # token 计数器无状态, 全局构造一次即可(精确档 lazy 加载, 失败自动回退启发式);
     # 关闭压缩时不构造, 避免无谓的可选依赖探测

@@ -158,6 +158,44 @@ class TestRegister:
             registry.register(tool)
 
 
+# ------------------------------------------------------- subset 子代理工具子集
+
+
+class TestSubset:
+    def test_subset_returns_new_registry_and_reuses_tool_instances(self):
+        registry = ToolRegistry()
+        first = make_tool_mock("a")
+        second = make_tool_mock("b")
+        registry.register(first)
+        registry.register(second)
+
+        child = registry.subset(["a"])
+
+        assert child is not registry
+        assert child.list_tools() == ["a"]
+        assert child._tools["a"] is first  # noqa: SLF001
+        # 原注册表不被修改
+        assert registry.list_tools() == ["a", "b"]
+
+    def test_subset_skips_unknown_names_with_warning(self, caplog):
+        registry = ToolRegistry()
+        registry.register(make_tool_mock("known"))
+
+        with caplog.at_level("WARNING", logger="meowmeowclaw.tools.registry"):
+            child = registry.subset(["known", "missing"])
+
+        assert child.list_tools() == ["known"]
+        assert any("missing" in record.message for record in caplog.records)
+
+    def test_subset_empty_names_returns_empty_registry(self):
+        registry = ToolRegistry()
+        registry.register(make_tool_mock("a"))
+
+        child = registry.subset([])
+
+        assert child.list_tools() == []
+
+
 # ------------------------------------------------------- get_definitions 定义查询
 
 

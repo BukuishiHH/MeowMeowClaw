@@ -17,6 +17,8 @@
 import asyncio
 import json
 import logging
+import uuid
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -79,6 +81,30 @@ class AgentTurn:
     finish_reason: str
     iterations: int
     completed: bool
+
+
+@dataclass
+class AgentTurnContext:
+    """当前 ``AgentLoop.run_turn`` 的上下文(SA2).
+
+    - ``turn_id``: 本次 turn 的随机 ID; root 主代理的 SpawnSubagentTool 用它做预算归属与审计;
+    - ``budget``: 该 turn 的子代理预算(延迟创建, 由 SpawnSubagentTool 首次 spawn 时写入);
+      预算对象挂在每个 task 自己的上下文对象上, 并发会话之间天然隔离;
+    - 子代理 ``run_turn`` 会设置自己的上下文, 并在结束时用 token 恢复父上下文。
+    """
+
+    turn_id: str
+    budget: Any = None
+
+
+CURRENT_AGENT_TURN: ContextVar[Optional[AgentTurnContext]] = ContextVar(
+    "meowmeowclaw_current_agent_turn", default=None
+)
+
+
+def current_agent_turn() -> Optional[AgentTurnContext]:
+    """返回当前 task 正在执行的 agent turn 上下文; 不在 run_turn 内时返回 None."""
+    return CURRENT_AGENT_TURN.get()
 
 
 class AgentLoop:
@@ -156,6 +182,26 @@ class AgentLoop:
         return turn.answer
 
     async def run_turn(
+        self,
+        user_message: str,
+        *,
+        history: Optional[list[dict[str, Any]]] = None,
+        on_delta: Optional[DeltaCallback] = None,
+    ) -> AgentTurn:
+        """跑完一轮对话, 并在本次 turn 期间设置 ``CURRENT_AGENT_TURN``.
+
+        子代理 factory 通过该上下文拿到 root turn_id 做预算/审计归属;
+        子代理自身的 ``run_turn`` 会设置自己的 turn 上下文, 结束时用 token 恢复父上下文。
+        """
+        token: Token = CURRENT_AGENT_TURN.set(AgentTurnContext(turn_id=uuid.uuid4().hex))
+        try:
+            return await self._run_turn_impl(
+                user_message, history=history, on_delta=on_delta
+            )
+        finally:
+            CURRENT_AGENT_TURN.reset(token)
+
+    async def _run_turn_impl(
         self,
         user_message: str,
         *,

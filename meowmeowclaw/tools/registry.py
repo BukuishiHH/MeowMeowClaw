@@ -1,6 +1,9 @@
-from typing import Dict, List
+import logging
+from typing import Dict, Iterable, List
 
 from .base import BaseTool
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -55,6 +58,25 @@ class ToolRegistry:
     def list_tools(self) -> List[str]:
         """返回所有已注册工具名称列表"""
         return list(self._tools.keys())
+
+    def subset(self, names: Iterable[str]) -> "ToolRegistry":
+        """构造只包含指定工具的新注册表(SA2 子代理工具集).
+
+        - 返回**新的** ``ToolRegistry``, 工具实例默认复用(当前内置工具无可变会话状态);
+        - 未知工具名 warning 后跳过, 不让配置变更导致启动/运行失败;
+        - 不会修改原注册表。
+        """
+        child = ToolRegistry()
+        missing: List[str] = []
+        for name in names:
+            tool = self._tools.get(name)
+            if tool is None:
+                missing.append(name)
+                continue
+            child._tools[name] = tool
+        if missing:
+            logger.warning("ToolRegistry.subset 跳过未注册工具: %s", ", ".join(missing))
+        return child
 
     def __repr__(self):
         return f"<ToolRegistry registered_tools={self.list_tools()}>"

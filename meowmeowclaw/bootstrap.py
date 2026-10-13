@@ -142,6 +142,31 @@ def build_application(env_file: Optional[Union[str, Path]] = None) -> Applicatio
         memory_path=config.memory_dir / "MEMORY.md",
     )
 
+    # 子代理(SA2): 默认关闭; 开启时构造 factory 并把 depth0 spawn 工具注册给主代理。
+    # SA2 临时只读: write_file/exec 由 SubagentFactory(read_only=True) 过滤, SA3/SA4 完成护栏后放开。
+    if config.subagent_enabled:
+        from meowmeowclaw.subagent.factory import SubagentFactory
+        from meowmeowclaw.subagent.models import SubagentStats
+
+        subagent_factory = SubagentFactory(
+            provider=provider,
+            base_registry=registry,
+            workspace=config.workspace,
+            enabled=True,
+            max_depth=config.subagent_max_depth,
+            model=config.subagent_model or None,
+            max_iterations=config.subagent_max_iterations,
+            timeout_seconds=config.subagent_timeout_seconds,
+            result_max_chars=config.subagent_result_max_chars,
+            max_children_per_turn=config.subagent_max_children_per_turn,
+            max_total_per_turn=config.subagent_max_total_per_turn,
+            tool_names=config.subagent_tools,
+            read_only=True,
+            stats=SubagentStats(enabled=True),
+        )
+        registry.register(subagent_factory.make_root_tool())
+        logger.info("子代理已装配: %r (SA2 只读模式)", subagent_factory)
+
     # token 计数器无状态, 全局构造一次即可(精确档 lazy 加载, 失败自动回退启发式);
     # 关闭压缩时不构造, 避免无谓的可选依赖探测
     counter = None

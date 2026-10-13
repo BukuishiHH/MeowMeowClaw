@@ -1,6 +1,6 @@
 # MeowMeowClaw 子代理协同设计（SpawnSubagentTool / v1）
 
-> 状态：**设计待评审（2026-10-13）**。本文只定义 v1 子代理的行为、接口、隔离边界、
+> 状态：**设计已评审；SA1–SA2 已实现（2026-10-13）**，SA3–SA6 待实现。本文只定义 v1 子代理的行为、接口、隔离边界、
 > 竞态/安全方案、配置、测试与里程碑，**不改 JSONL 文件格式、不改主代理既有语义**；
 > 实现按 §11 里程碑推进，每阶段独立提交，默认 `subagent_enabled=false`。
 > 关联：`docs/A_PLUS_OPTIMIZATION.md`（运行时生命周期）、`docs/GATEWAY_DESIGN.md`、
@@ -1151,7 +1151,7 @@ meowmeowclaw/
 | 里程碑 | 状态 | 提交 | 备注 |
 |---|---|---|---|
 | SA1 | 已完成 | `3ed6b98` | 领域模型 + 全部配置键；新增 54 用例；默认关闭零行为变化 |
-| SA2 | 待实现 | — | 依赖 SA1；只读子代理与深度/上下文隔离 |
+| SA2 | 已完成 | 待回填 | `ToolRegistry.subset` + prompt + factory + spawn 工具；SA2 只读；新增 21 用例 |
 | SA3 | 待实现 | — | 依赖 SA1；变更锁/OCC/原子写 |
 | SA4 | 待实现 | — | 依赖 SA2+SA3；exec 安全与审计 |
 | SA5 | 待实现 | — | 依赖 SA2+SA3+SA4；预算/统计/装配 |
@@ -1176,6 +1176,29 @@ meowmeowclaw/
 - `subagent_enabled=false` 时未注册任何工具、未构造任何运行时对象，启动路径与现状一致；
 - 全量回归 **1610 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
 - 本阶段不做：spawn 工具、factory、prompt builder、变更锁、exec 安全策略（分别属于 SA2–SA4）。
+
+#### SA2 实现记录（2026-10-13）
+
+**交付物**
+
+| 文件 | 变更 |
+|---|---|
+| `meowmeowclaw/tools/registry.py` | 新增 `ToolRegistry.subset(names)`：返回新注册表、复用工具实例、缺名 warning 跳过、不修改原表 |
+| `meowmeowclaw/subagent/prompt.py`（新增） | `SubagentPromptBuilder`：固定子代理模板（task/role/context + 工作区 + 工具边界 + 输出要求）；不注入父历史/人设/MEMORY/长期记忆；context 用 `<parent_context>` 数据定界并转义闭合标签 |
+| `meowmeowclaw/subagent/factory.py`（新增） | `SubagentFactory`：depth 执行层校验、children/total 预算预检、可重入顺序调度、子 AgentLoop 构造、超时取消、结果折叠、统计；SA2 强制只读工具 |
+| `meowmeowclaw/tools/subagent.py`（新增） | `SpawnSubagentTool`：schema/描述/参数校验 → factory → JSON 摘要；root 工具按 turn_id 维护预算，子工具使用固定 `SpawnContext` |
+| `meowmeowclaw/agent/loop.py` | 新增 `AgentTurnContext` / `CURRENT_AGENT_TURN` / `current_agent_turn()`；`run_turn` 设置并在结束时 token reset，子代理嵌套不覆盖父 turn |
+| `meowmeowclaw/bootstrap.py` | 仅 `subagent_enabled=true` 时创建 factory 并注册 depth0 `spawn_subagent`；默认关闭时零改动 |
+| `tests/tools/test_registry.py` / `tests/subagent/*` / `tests/test_bootstrap.py` | 新增 21 个用例：subset 契约、prompt 隔离/定界、factory depth/预算/超时/fail-soft、根 AgentLoop 端到端、嵌套 spawn 不死锁、bootstrap 开关 |
+
+**验证**
+
+- depth 2 子代理工具集中没有 `spawn_subagent`；执行层伪造调用返回 `limit/depth_exceeded`；
+- 子代理 provider 只收到“独立 system prompt + task”，不含父 history/人设/MEMORY；
+- SA2 只读：配置中的 `write_file`/`exec` 被过滤并 warning（SA3/SA4 放开）；
+- 嵌套 spawn 在可重入调度器下通过，未自我死锁；
+- 全量回归 **1631 passed / 6 skipped / 2 xfailed**；`ruff check .` 通过；
+- 本阶段不做：变更锁/OCC/原子写、exec 环境与命令策略、审计（SA3/SA4）。
 
 
 ---
@@ -1255,5 +1278,5 @@ workspace_mutation_lock_timeout=90
 
 ---
 
-> 本文是 v1 实现依据。确认后按 §11 里程碑逐阶段编码；每个阶段完成后更新本文“实现记录”并提交。
+> 本文是 v1 实现依据；SA1–SA2 已实现，SA3–SA6 按 §11 里程碑逐阶段推进，每阶段完成后更新“实现记录”并提交。
 

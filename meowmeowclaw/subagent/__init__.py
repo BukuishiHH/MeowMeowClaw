@@ -3,6 +3,7 @@
 SA1 只提供领域模型与配置骨架; SA2+ 在此基础上增加 factory / prompt / tool。
 """
 
+from .factory import SubagentFactory
 from .models import (
     ERROR_BUDGET_EXCEEDED,
     ERROR_CANCELLED,
@@ -28,6 +29,7 @@ from .models import (
     SubagentResult,
     SubagentStats,
 )
+from .prompt import SubagentPromptBuilder
 
 __all__ = [
     "ERROR_BUDGET_EXCEEDED",
@@ -50,6 +52,8 @@ __all__ = [
     "VALID_STATUSES",
     "SpawnContext",
     "SubagentBudget",
+    "SubagentFactory",
+    "SubagentPromptBuilder",
     "SubagentRequest",
     "SubagentResult",
     "SubagentStats",

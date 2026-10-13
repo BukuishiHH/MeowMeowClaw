@@ -195,6 +195,32 @@ class TestBuildApplication:
         assert app.conversation.max_cached_sessions == 3
         assert app.conversation.cache_idle_seconds == 42.5
 
+    def test_subagent_disabled_does_not_register_spawn_tool(self, monkeypatch, tmp_path):
+        config = make_settings(workspace=tmp_path, subagent_enabled=False)
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+
+        app = build_application()
+
+        assert "spawn_subagent" not in app.registry.list_tools()
+
+    def test_subagent_enabled_registers_spawn_tool(self, monkeypatch, tmp_path):
+        config = make_settings(
+            workspace=tmp_path,
+            subagent_enabled=True,
+            subagent_max_depth=3,
+            subagent_model="small-model",
+        )
+        monkeypatch.setattr(bootstrap_module, "load_config", lambda *a, **k: config)
+
+        app = build_application()
+
+        assert "spawn_subagent" in app.registry.list_tools()
+        definitions = app.registry.get_definitions()
+        spawn = next(
+            item for item in definitions if item["function"]["name"] == "spawn_subagent"
+        )
+        assert set(spawn["function"]["parameters"]["required"]) == {"task"}
+
     def test_load_config_is_called_once(self, monkeypatch):
         loader = MagicMock(return_value=make_settings())
         monkeypatch.setattr(bootstrap_module, "load_config", loader)

@@ -1155,7 +1155,7 @@ meowmeowclaw/
 | SA3 | 已完成 | `2316a41` | 变更锁/OCC/原子写；主+子 write 接锁；新增 19 用例；exec 仍待 SA4 |
 | SA4 | 已完成 | `4eb4429` | exec 策略/环境清洗/取消杀组/敏感路径/审计；新增 36 用例 |
 | SA5 | 已完成 | `29b95a7` | 预算/turn 重置、stats 接入、bootstrap 装配、README 配置表；新增 3 用例 |
-| SA6 | 已完成 | 待回填 | 全量验收 + CLI/QQ 真实进程冒烟 + README/ADR 收尾；设计文档更新 |
+| SA6 | 已完成 | `3bae6ce` | 全量验收 + CLI/QQ 真实进程冒烟 + README/ADR 收尾；设计文档更新 |
 
 ### 15.1 实现记录
 

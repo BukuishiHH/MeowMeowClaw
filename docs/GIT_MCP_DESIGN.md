@@ -1,0 +1,771 @@
+# MeowMeowClaw Git MCP Server 设计（v1）
+
+> 状态：**设计待评审（2026-10-13）**。本文定义 Git MCP Server 的协议形态、工具清单、安全策略、
+> Cline 接入方式与里程碑计划；**不修改 MeowMeowClaw 主项目现有行为**。
+> 评审通过后按 §10 里程碑（MG1–MG6）逐步实现，每阶段独立提交。
+> 关联：`README.md`、`docs/SUBAGENT_DESIGN.md`（workspace 变更锁/子代理工作区）、
+> `meowmeowclaw/memory/filelock.py`、`pyproject.toml`。
+
+---
+
+## 0. 背景与目标
+
+### 0.1 背景
+
+Cline 等 MCP（Model Context Protocol）客户端可以通过 stdio / HTTP 连接外部 MCP Server，获得
+Tools / Resources / Prompts 能力。当前 MeowMeowClaw 主项目提供了 `read_file`/`write_file`/`exec`
+等通用工具，但没有专门的 Git 语义层：Git 操作只能通过 `exec` 拼 shell 命令，既不安全也不结构化。
+
+本设计将 Git 能力从主 Agent 中解耦为**独立的 Git MCP Server**：
+
+- 对 Cline：提供一个可配置、可审计、默认只读的 Git 工具服务；
+- 对 MeowMeowClaw：未来可作为 MCP Client 消费同一服务，或复用其 workspace 锁与安全策略；
+- 对用户：以 `git` CLI 为唯一执行后端，保持与本地 `.gitconfig`、hooks、credential helper 兼容。
+
+### 0.2 目标
+
+| # | 目标 | 验收指标 |
+|---|---|---|
+| G1 | 提供完整、结构化的 Git 工具集 | Cline 可通过 Tools 完成状态/历史/差异/提交/分支/暂存等常用操作 |
+| G2 | 默认安全 | 只读默认开放；写操作显式开关；危险/破坏性操作默认不暴露 |
+| G3 | 输出可被模型消费 | 统一 JSON 返回、结构化字段、错误码、输出截断与上下文预算 |
+| G4 | 与 Cline 集成顺畅 | `cline_mcp_settings.json` 可直接接 stdio；只读工具可 autoApprove |
+| G5 | 并发可控 | 每仓库串行化写操作；可与 MeowMeowClaw workspace 变更锁协同 |
+| G6 | 可测试、可回归 | 本地临时 git 仓库单测；不依赖网络；ruff + pytest 通过 |
+| G7 | 不污染主项目 | MCP 依赖与 Git Server 独立；主项目不引入 MCP client/server 运行时依赖 |
+
+### 0.3 非目标（v1 明确不做）
+
+- 不做 Git Web UI / PR 管理 / Issue 管理；不做 GitHub/GitLab API 客户端；
+- 不做任意 shell 命令执行或任意 `git` 参数透传；
+- 不做自动冲突解决、自动 rebase 策略、自动 push/rebase 的高风险链路；
+- 不做远程 MCP HTTP 服务（v1 以 stdio 为准，HTTP 预留优化项）；
+- 不把 Git MCP Server 内置进 `AgentLoop` 的工具注册表（后续如需，以 MCP Client 方式接入）；
+- 不替代 MeowMeowClaw 现有 `exec`/filesystem 安全模型；两者是独立工具面。
+
+---
+
+## 1. 已确认决策与默认假设
+
+| # | 决策项 | 默认结论 |
+|---|---|---|
+| D1 | 服务边界 | 独立包/模块（建议 `meowmeowclaw-mcp-git`），不并入主 Agent |
+| D2 | 实现语言 | Python + 官方 `mcp` SDK（stdio transport） |
+| D3 | Git 后端 | 调用 `git` CLI 子进程；参数以列表传递，不经 shell |
+| D4 | 默认权限 | `read_only=true`，写/远端/破坏性各自独立开关 |
+| D5 | 仓库模型 | 支持多仓库 **alias allowlist**；工具只接收 alias/repo_id，不接受任意绝对路径 |
+| D6 | Cline 集成 | 只读工具可 autoApprove；写操作由 Cline 用户逐次确认 |
+| D7 | v1 远端 | 仅 `git_fetch` + 只读 remote 列表；push 默认不提供 |
+| D8 | 返回协议 | 统一 `{ok,data,meta}`；结构化 + 原始片段；错误码可编程处理 |
+| D9 | 并发 | 每 repo 一把锁；写操作串行；预留与 workspace 变更锁协同 |
+| D10 | 文档位置 | 本文；实现阶段在 README/`.env.example` 补接入说明 |
+
+> 以上为默认假设，评审时可逐项调整；本文其余部分按该默认编写。
+
+---
+
+## 2. 总体架构
+
+### 2.1 部署形态
+
+```
+┌──────────────┐        JSON-RPC over stdio        ┌───────────────────────┐
+│    Cline     │  ───────────────────────────────▶ │  Git MCP Server       │
+│  (MCP Host)  │  ◀─────────────────────────────── │  (Python, stdio)      │
+└──────────────┘        tools/resources/prompts    └───────────┬───────────┘
+                                                                │ subprocess args
+                                                                ▼
+                                                      ┌───────────────────┐
+                                                      │   git CLI         │
+                                                      │  (本地仓库/配置)   │
+                                                      └───────────────────┘
+```
+
+- Cline 作为 MCP Host 启动 Server 进程，维护会话与确认 UI；
+- Server 不监听网络端口（v1），所有 Git 操作在本机允许根内执行；
+- Server 的 stdout 只用于 MCP 协议消息，日志一律写 stderr，避免污染协议流。
+
+### 2.2 组件职责
+
+| 组件 | 职责 | 不负责 |
+|---|---|---|
+| `StdioServer` / MCP 适配层 | 初始化 MCP、注册 Tools/Resources/Prompts、协议错误映射 | Git 业务逻辑 |
+| `RepoRegistry` | alias → 绝对路径映射、允许根校验、is_git_repo 检查 | Git 操作 |
+| `PolicyEngine` | 只读/写/远端/破坏性开关、分支保护、路径与参数白名单 | 命令执行 |
+| `GitRunner` | 安全调用 `git` CLI、超时、输出截断、环境清洗、错误解析 | 结构化解析 |
+| `GitParsers` | `status --porcelain=v2`、`log`、`diff`、`show` 等结构化解析 | 策略 |
+| `ToolHandlers` | 每个 MCP 工具的参数校验、策略检查、调用 Runner/解析器 | 协议生命周期 |
+| `LockManager` | 每 repo 进程内锁 + 可选跨进程锁 | 业务 |
+| `AuditSink` | 可选 JSONL 审计：工具、repo、参数摘要、结果、耗时 | 业务决策 |
+
+### 2.3 建议目录结构
+
+```
+meowmeowclaw_mcp_git/
+├── __init__.py
+├── __main__.py          # python -m ... 入口
+├── server.py            # MCP Server 装配/注册
+├── config.py            # 启动参数与环境变量
+├── registry.py          # RepoRegistry(alias/allow roots)
+├── policy.py            # PolicyEngine(权限/分支/路径)
+├── runner.py            # GitRunner(subprocess/timeout/limits)
+├── parsers/
+│   ├── status.py
+│   ├── diff.py
+│   ├── log.py
+│   └── ...
+├── tools/
+│   ├── read.py          # git_status/git_diff/git_log/...
+│   ├── write.py         # git_stage/git_commit/git_branch/...
+│   ├── remote.py        # git_fetch/git_list_remotes
+│   └── stash.py
+├── prompts.py           # MCP prompts
+├── resources.py         # MCP resources
+├── audit.py             # 可选审计
+└── errors.py
+```
+
+### 2.4 与 MeowMeowClaw 主项目的关系
+
+- v1 **不修改** `meowmeowclaw/` 现有模块；
+- 未来两种协同方式：
+  1. Git MCP Server 作为 MeowMeowClaw 的 MCP Client 后端，提供 Git 工具；
+  2. 与 `docs/SUBAGENT_DESIGN.md` 的 workspace 变更锁共用同一把 lock 文件，
+     让 Cline 的 Git 写操作与 MeowMeowClaw 子代理的 write/exec 不互相踩踏；
+- 上述协同不在 MG1–MG6 首版范围内，作为 §12 优化项。
+
+---
+
+## 3. 配置与仓库策略
+
+### 3.1 启动参数与环境变量
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `--root PATH` / `MCP_GIT_ROOT` | 当前目录 | 单仓库模式根目录 |
+| `--roots PATH1:PATH2` / `MCP_GIT_ROOTS` | 空 | 多根模式允许根（按平台注入分隔符） |
+| `--repos alias=path,...` | 空 | 显式 alias；未配置时用根目录 basename 作为 alias |
+| `--read-only {true,false}` | `true` | false 时允许写工具（仍需逐工具确认） |
+| `--allow-remote {true,false}` | `false` | 是否暴露 fetch/remote 写（fetch 本身只读远端状态） |
+| `--allow-destructive {true,false}` | `false` | reset --hard/clean/push --force 等，v1 即使 true 也不实现 |
+| `--protected-branches main,master` | `main,master` | 禁止直接 commit/push 的分支名，可配置 |
+| `--timeout SECONDS` | `30` | 单条 git 命令超时 |
+| `--max-output-bytes` | `131072` | 单工具输出上限（超出截断并标记） |
+| `--audit-log PATH` | 空 | 可选审计 JSONL 路径 |
+| `--lock-dir PATH` | 空 | 跨进程锁目录；与 MeowMeowClaw workspace 锁共用时填写同一路径 |
+
+### 3.2 RepoRegistry 规则
+
+- 允许根统一 `realpath` 规范化；
+- 所有 repo 路径必须落在允许根内，且通过 `git rev-parse --is-inside-work-tree`；
+- alias 唯一，大小写敏感策略由配置决定；
+- 工具调用只接受 `repo`（alias）与仓库内相对路径，禁止绝对路径、`..`、工作区外路径；
+- worktree/submodule 额外校验（见 §6.5）。
+
+### 3.3 安全等级
+
+每个工具注册时标记 `read | write | remote | destructive` 等级：
+
+- `read`：只读查询，可 autoApprove；
+- `write`：修改工作区/index/本地历史，Cline 需逐次确认；
+- `remote`：访问远端（fetch/pull/push），默认不暴露或需显式确认；
+- `destructive`：不可逆或高风险，v1 不实现。
+
+---
+
+## 4. MCP 能力设计
+
+### 4.1 Tools 总览
+
+#### A. 只读/分析类（默认可用，可 autoApprove）
+
+| 工具 | 作用 | 关键参数 | 备注 |
+|---|---|---|---|
+| `git_status` | 工作区/暂存区/分支状态 | `repo`、`short` | porcelain v2 结构化 |
+| `git_diff` | 工作区/暂存/commit/range 差异 | `repo`、`mode`、`base`、`head`、`paths`、`stat_only`、`context_lines` | 默认限制输出 |
+| `git_log` | 提交历史 | `repo`、`max_count`、`author`、`since`、`until`、`path`、`grep` | 默认 20 条 |
+| `git_show` | 单个 commit/tag/对象 | `repo`、`ref`、`stat_only` | 限制大小 |
+| `git_blame` | 行级 blame | `repo`、`file`、`start_line`、`end_line` | 大文件需范围 |
+| `git_file_at_revision` | 指定 ref 的文件内容 | `repo`、`ref`、`path` | 返回文本+编码/大小 |
+| `git_list_branches` | 分支列表 | `repo`、`remote`、`verbose` | 含 tracking |
+| `git_list_tags` | tag 列表 | `repo`、`pattern` | — |
+| `git_list_remotes` | remote 列表 | `repo` | URL 脱敏 |
+| `git_grep` | 仓库内文本搜索 | `repo`、`pattern`、`paths`、`ref` | 正则/大小写选项 |
+| `git_search_history` | 历史 diff 搜索 | `repo`、`pattern`、`pickaxe`、`max_count` | `-S`/`-G` |
+| `git_rev_parse` | ref 解析 | `repo`、`ref`、`short` | — |
+| `git_config_get` | 读取配置 | `repo`、`key` | 只读 |
+
+#### B. 安全写类（默认不 autoApprove；需 `read_only=false`）
+
+| 工具 | 作用 | 关键参数 | 安全约束 |
+|---|---|---|---|
+| `git_stage` | 暂存文件 | `repo`、`paths`、`all` | 路径必须在 repo 内 |
+| `git_unstage` | 取消暂存 | `repo`、`paths` | — |
+| `git_restore` | 恢复工作区/暂存区 | `repo`、`paths`、`staged`、`force` | dirty 检查；默认拒绝覆盖 |
+| `git_commit` | 创建提交 | `repo`、`message`、`paths`、`amend`、`signoff`、`allow_empty` | 禁止空 message；保护分支策略 |
+| `git_branch_create` | 创建分支 | `repo`、`name`、`start_point`、`switch` | 名字校验 |
+| `git_branch_switch` | 切换分支 | `repo`、`name`、`force` | 默认 dirty 拒绝 |
+| `git_branch_delete` | 删除分支 | `repo`、`name`、`force` | 默认拒绝未合并/当前分支 |
+| `git_stash` | stash 管理 | `repo`、`action(list/push/pop/apply/drop)`、`message`、`paths` | drop 需显式确认 |
+| `git_fetch` | 拉取远端对象 | `repo`、`remote`、`prune` | 默认不合并/rebase |
+
+#### C. 预留 v2（v1 不实现或默认关闭）
+
+| 工具 | 说明 |
+|---|---|
+| `git_pull` / `git_push` | 远端同步；push 默认禁 force、目标分支白名单 |
+| `git_merge` / `git_cherry_pick` / `git_revert` | 返回结构化冲突，不自动解决 |
+| `git_rebase` | 仅显式确认；默认不暴露 |
+| `git_worktree` | list/add/remove；与子代理独立工作区结合 |
+| `git_submodule` | list/update；默认只读 |
+| `git_reset` / `git_clean` / `git_gc` | 破坏性/重量级，默认永久不暴露或独立高权限开关 |
+
+### 4.2 工具参数与返回约定
+
+- 所有工具都接受 `repo`（alias）；
+- 路径类参数一律是**仓库相对路径**；
+- 所有写工具返回 `before` / `after` 状态摘要（HEAD、分支、dirty 文件数）；
+- 文本/diff 类工具支持 `max_bytes` / `max_lines` / `stat_only` / `paths` 过滤；
+- 失败时返回 `ok=false`、`error_code`、`message`，不抛未处理异常。
+
+统一返回示例：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "branch": "main",
+    "ahead": 1,
+    "behind": 0,
+    "staged": ["src/a.py"],
+    "unstaged": [],
+    "untracked": ["notes.md"],
+    "conflicts": []
+  },
+  "meta": {
+    "repo": "my-app",
+    "cwd": "/allowed/roots/my-app",
+    "command": ["git", "status", "--porcelain=v2", "--branch"],
+    "exit_code": 0,
+    "truncated": false,
+    "elapsed_ms": 12
+  }
+}
+```
+
+错误码建议：
+
+`not_a_repo` / `repo_not_found` / `policy_denied` / `dirty_worktree` / `protected_branch` /
+`invalid_path` / `invalid_argument` / `command_timeout` / `command_failed` / `output_truncated` /
+`unsupported_in_v1`。
+
+### 4.3 Resources
+
+MCP Resources 适合低频、可读、可订阅的资源，但 Git 工作区变化频繁，v1 只做少量只读资源：
+
+| URI | 内容 |
+|---|---|
+| `git://{repo}/status` | 当前状态摘要 |
+| `git://{repo}/head` | HEAD 与当前分支 |
+| `git://{repo}/file/{ref}/{path}` | 指定 revision 的文件内容 |
+| `git://{repo}/log/{ref}` | 最近提交列表 |
+
+Resources 仅作为补充；Cline 的主路径仍是 Tools。
+
+### 4.4 Prompts
+
+| Prompt | 参数 | 用途 |
+|---|---|---|
+| `write_commit_message` | `repo`、`staged_only` | 基于 staged diff 生成规范提交信息 |
+| `review_staged_changes` | `repo` | 生成代码 review 提示词（diff 摘要 + 风险点） |
+| `summarize_branch` | `repo`、`base` | 汇总当前分支相对 base 的变更 |
+| `explain_conflict` | `repo`、`path` | 解释冲突文件与解决思路（不自动写） |
+
+Prompts 只生成消息内容，不执行写操作。
+
+---
+
+## 5. Git 执行层
+
+### 5.1 子进程规则
+
+`GitRunner` 统一执行 Git，禁止任何 shell：
+
+```text
+git -C <repo_path> [--no-pager] <subcommand> [args...]
+```
+
+- `subprocess` 使用参数列表，禁止 `shell=True`；
+- 命令与参数由各 ToolHandler 拼装，不接受模型传入的任意 `git` 子命令/flag；
+- 每个工具只允许自己的参数白名单（例如 `git_diff.mode` 枚举）；
+- 默认 `--no-pager`，同时设置环境 `GIT_PAGER=cat`；
+- 统一超时（默认 30s，可在配置中调整）与输出上限（默认 128KB）。
+
+### 5.2 环境变量策略
+
+| 变量 | 设置 | 原因 |
+|---|---|---|
+| `GIT_PAGER` / `PAGER` | `cat` | 防交互分页 |
+| `GIT_EDITOR` / `EDITOR` | `true` | 防止命令弹编辑器；提交统一用 `-m` |
+| `GIT_TERMINAL_PROMPT` | `0` | 禁止凭证弹窗卡死 |
+| `LC_ALL` | `C` | 结构化解析不被本地化字符串影响 |
+| `HOME` | 继承 Host 环境 | 保持 `.gitconfig`/credential helper 行为 |
+| 其他 secret 变量 | 不主动注入、不打印 | 避免 API key 泄漏到日志 |
+
+> 注意：Git credential helper 可能依赖 Host 环境；Server 不主动清理 `HOME`，但审计与日志必须脱敏。
+
+### 5.3 结构化解析
+
+| 数据 | 解析方式 |
+|---|---|
+| status | `git status --porcelain=v2 --branch` |
+| diff | `git diff --stat` / `--numstat` + 可选原始 patch |
+| log | `git log --pretty=format:%H%x00%h%x00%an%x00%aI%x00%s%x00` 等稳定的 NUL 分隔格式 |
+| branch | `git for-each-ref --format=...` |
+| tag | `git tag --format=...` |
+| blame | `git blame --line-porcelain`（按行范围采样） |
+| 文件内容 | `git show <ref>:<path>` + 编码/大小检查 |
+
+解析失败时保留原始 stdout/stderr，返回 `command_failed` 或 `parse_failed`，不做静默丢数据。
+
+### 5.4 超时、截断与取消
+
+- 所有命令有硬超时；超时后 kill 进程组（POSIX `killpg` / Windows `taskkill` 兜底）；
+- 输出超过 `max-output-bytes` 时截断并设置 `meta.truncated=true`；
+- 大 diff/log 默认优先返回结构化/stat 摘要，完整 patch 由参数显式请求；
+- MCP 请求取消时不留下后台 git 进程。
+
+### 5.5 并发与锁
+
+- 每 repo 一把 `asyncio.Lock`，写操作（stage/commit/branch/switch/stash/restore/fetch）串行；
+- 可选跨进程锁：通过 `--lock-dir` 指向目录，使用 `flock`/`msvcrt`（与 MeowMeowClaw `memory/filelock.py` 同思路）；
+- 与 MeowMeowClaw 子代理协同：若配置同一 lock 目录/文件，Cline Git 写操作与子代理 `write_file`/`exec`
+  会互相排队；v1 只提供配置接口，不强制耦合；
+- 只读操作不持锁（避免大仓 log/diff 阻塞）。
+
+---
+
+## 6. 安全设计
+
+### 6.1 威胁模型
+
+| # | 威胁 | 例子 | 对策 |
+|---|---|---|---|
+| T1 | 越界仓库 | 模型传 `/etc` 或其它项目路径 | allowlist 根 + alias + realpath 校验 |
+| T2 | 覆盖未提交工作 | `switch/restore/checkout` 丢失本地修改 | dirty 检查 + 默认拒绝 + `force` 显式 |
+| T3 | 破坏历史 | `reset --hard`、`clean -fdx`、force push | v1 不暴露；保护分支 |
+| T4 | 凭证泄漏 | 日志打印 remote URL/token | URL 脱敏、stdout 不写 stderr、不注入 secret |
+| T5 | Shell 注入 | 文件名/路径含 shell 元字符 | subprocess 参数列表，禁止 shell |
+| T6 | hooks 执行任意代码 | commit/push 触发 hooks | hooks 信任边界归属用户；可选 `--no-verify` 开关 |
+| T7 | 大输出耗尽上下文 | `git log` 全历史 | 默认 limit + 截断 + `stat_only` |
+| T8 | 并发写坏 index | 多 tool 同时 add/commit | 每 repo 锁 + Git 自身 index.lock |
+| T9 | 远端误操作 | push 到错误分支/force | v1 无 push；fetch 只更新 remote refs |
+
+### 6.2 默认权限矩阵
+
+| 能力 | v1 默认 | 开启方式 |
+|---|---|---|
+| 只读 tools | ✅ 开放 | 默认 |
+| 写 tools | ❌ 关闭 | `--read-only=false`；Cline 逐次确认 |
+| fetch | ❌ 默认关闭 | `--allow-remote=true` |
+| push/pull | ❌ 不实现 | v2 |
+| destructive | ❌ 不实现 | v2 独立高权限开关 |
+| resources | ✅ 只读 | 默认 |
+| prompts | ✅ 只读 | 默认 |
+
+### 6.3 分支与 dirty 保护
+
+- `protected_branches` 默认 `main,master`：禁止直接 `git_commit`（可通过配置覆盖）；
+- `git_commit` 前检查 staged 文件非空（`allow_empty` 显式）；
+- `git_branch_switch` / `git_restore` / `git_stash apply`：工作区 dirty 时默认拒绝；
+- `git_branch_delete`：当前分支、未合并分支默认拒绝；
+- `git_commit --amend` 默认关闭，需显式参数。
+
+### 6.4 凭证与 URL 脱敏
+
+- 返回 remote URL 时去掉 userinfo（`https://user:token@host` → `https://***@host`）；
+- 不打印 `git config` 中的 `http.*.extraheader`、credential 配置值；
+- 审计记录只存命令摘要与结果状态，不存完整环境变量；
+- 若用户显式配置 `--audit-log`，审计文件权限 0o600。
+
+### 6.5 worktree / submodule / 路径
+
+- worktree/submodule 操作在 v2 才实现；v1 只读 `git_list_worktrees` / `git_list_submodules`（可选）；
+- 未来实现时：worktree 路径必须落在 allowlist 根内；
+- 对 `git show <ref>:<path>` 与文件工具做同一套路径规范化，拒绝 `..` 与绝对路径；
+- 符号链接：使用 `realpath` 校验；不跟随指向工作区外的链接。
+
+### 6.6 残余风险（诚实记录）
+
+- Git hooks、credential helper、用户全局配置属于 Host 信任边界，Server 不隔离其代码执行；
+- 远端 fetch 可能引入大对象/慢网络；需要超时与磁盘监控（v2）；
+- 模型可能通过多次合法小操作组合出风险行为（如逐文件删除）——依赖 Cline 确认与审计；
+- Windows 路径/行尾/信号语义与 POSIX 有差异，测试需覆盖。
+
+---
+
+## 7. Cline 集成
+
+### 7.1 传输与进程约定
+
+- v1 采用 **stdio**：Cline 启动 Server 进程，通过 stdin/stdout 交换 JSON-RPC；
+- Server 的 **stdout 只允许 MCP 协议消息**；日志/调试输出一律走 stderr；
+- Server 收到 SIGINT/SIGTERM 时优雅退出，不遗留 git 子进程；
+- 首次握手由 MCP SDK 负责，Server 声明 `tools`、`resources`、`prompts` 能力。
+
+### 7.2 Cline 配置示例
+
+Cline 的 MCP 配置通常保存在其扩展全局设置文件（不同版本/系统路径不同，实现阶段确认）。
+配置形态：
+
+```json
+{
+  "mcpServers": {
+    "git": {
+      "command": "/path/to/python",
+      "args": [
+        "-m",
+        "meowmeowclaw_mcp_git",
+        "--root",
+        "/path/to/workspace",
+        "--read-only=false",
+        "--allow-remote=false",
+        "--protected-branches",
+        "main,master"
+      ],
+      "env": {
+        "MCP_GIT_AUDIT_LOG": "/path/to/workspace/.mcp-git-audit.jsonl"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_blame",
+        "git_list_branches",
+        "git_list_tags",
+        "git_list_remotes",
+        "git_grep",
+        "git_search_history",
+        "git_rev_parse",
+        "git_config_get"
+      ]
+    }
+  }
+}
+```
+
+- `autoApprove` **只放只读工具**；
+- `git_stage`/`git_commit`/`git_branch_*`/`git_stash`/`git_restore`/`git_fetch` 留给 Cline 用户确认；
+- 如果只做只读使用：配置 `--read-only=true`，写工具不注册。
+
+### 7.3 上下文预算
+
+- Cline 也有上下文窗口限制：默认 `git_log` 20 条、`git_diff` 优先 stat/数值、完整 patch 需显式参数；
+- 工具返回保留 `truncated` 与 `next_cursor`（如支持分页）；
+- 对超大文件/大 diff，返回摘要 + 可选的 `git_show` 分段读取。
+
+### 7.4 常见接入问题排查
+
+| 现象 | 排查 |
+|---|---|
+| Cline 看不到 `git` server | 检查配置 JSON、command 绝对路径、Python 环境是否有 `mcp` 依赖 |
+| Server 启动即退出 | 看 stderr 日志；确认 `--root` 存在且是 git 仓库 |
+| 工具报“repo 未找到” | 检查 alias/root 配置 |
+| 命令超时 | 大仓/网络；调 `--timeout` 或缩小查询范围 |
+| 输出截断 | 使用 `paths`/`max_count`/`stat_only` 缩小请求 |
+| 写操作被拒绝 | 检查 `--read-only=false`、保护分支、dirty 状态 |
+
+---
+
+## 8. 观测与审计
+
+- 日志：stderr 结构化/文本，级别 INFO；参数中的路径与 URL 做脱敏；
+- 工具调用审计（可选 JSONL）：`{ts, tool, repo, args_digest, status, exit_code, elapsed_ms, truncated}`；
+- 不把 Git 输出全文写入审计（只存摘要/哈希），避免敏感内容落盘；
+- 观测指标（v2 可选）：工具调用数、失败码分布、超时数、锁等待时间、输出截断次数；
+- 审计路径建议不与 repo `.git` 混放：默认用户配置，未配置则不写。
+
+---
+
+## 9. 测试策略
+
+### 9.1 单元测试
+
+- `RepoRegistry`：alias 解析、越界路径、非 git 仓库；
+- `PolicyEngine`：只读/写/远端矩阵、保护分支、dirty 拒绝、destructive 拒绝；
+- `GitRunner`：参数列表、环境变量、timeout、输出截断、错误码；
+- `GitParsers`：status/log/diff/branch 等固定 fixture 输入；
+- 每个 ToolHandler：参数校验、策略失败、成功返回结构。
+
+### 9.2 集成测试（本地临时 git 仓库）
+
+- 用 `git init` + 本地提交构造 fixture，不依赖网络；
+- 覆盖：status/diff/log/show/blame/stage/commit/branch/stash/restore/fetch（本地 remote）；
+- 并发测试：两个写工具同时调用，索引不损坏、串行化生效；
+- 失败注入：git 命令超时、非 git 仓库、路径越界、dirty 切换。
+
+### 9.3 MCP 协议测试
+
+- 使用官方 MCP SDK 的客户端测试工具握手/调用/错误映射；
+- 验证 stdout 无日志污染；
+- 验证 `autoApprove` 只读工具列表与 `read_only=true` 时不注册写工具。
+
+### 9.4 Cline 冒烟（人工验收）
+
+- 在 Cline 中安装/配置 MCP Server；
+- 验证：`git_status`/`git_diff`/`git_log` 可用且 autoApprove 生效；
+- 验证写操作会弹出确认，确认后 commit/switch 正常；
+- 验证只读模式下写工具不可见；
+- 记录 Cline 版本、配置路径与截图/日志（实现阶段）。
+
+---
+
+## 10. 里程碑计划
+
+> 命名：**GM = Git MCP**。每个里程碑独立提交；默认 `read_only=true`，未完成写能力前不暴露写工具。
+> 单线程预计 **8–11 个理想人日**；GM1/GM2 与 GM4 可部分并行。
+
+### 10.1 总览
+
+| 里程碑 | 内容 | 依赖 | 工期 |
+|---|---|---|---|
+| GM1 | MCP stdio 骨架 + RepoRegistry + `git_status` | — | 1–1.5d |
+| GM2 | 只读工具集 + 结构化解析 + 输出预算 | GM1 | 2–2.5d |
+| GM3 | 安全写工具 + dirty/分支保护 + 锁 | GM1+GM2 | 2d |
+| GM4 | fetch/remote 只读 + Prompts + Resources | GM1+GM2 | 1.5d |
+| GM5 | Cline 接入 + 配置模板 + 文档 | GM3+GM4 | 1–1.5d |
+| GM6 | 全量验收、真实 Cline 冒烟、打包收尾 | GM5 | 1d |
+
+### 10.2 GM1：MCP 骨架与最小可用（1–1.5d）
+
+**交付物**
+
+- `meowmeowclaw_mcp_git` 包骨架、`python -m` 入口、官方 MCP SDK 依赖可选组；
+- `RepoRegistry`（alias/allow roots/is_git_repo）；
+- `GitRunner` 最小实现（参数列表、timeout、stdout/stderr 捕获）；
+- `git_status` 工具（porcelain v2 结构化）；
+- Cline `cline_mcp_settings.json` 最小配置示例；
+- 单元测试：registry、runner、status parser。
+
+**验收**
+
+- `python -m meowmeowclaw_mcp_git --root /tmp/repo` 可由 MCP 客户端握手并列出 `git_status`；
+- 对临时 git 仓库返回正确 branch/ahead/behind/staged/unstaged/untracked；
+- stdout 无日志污染，stderr 日志正常；
+- 默认只读。
+
+**提交建议**：`feat(mcp-git): GM1 stdio 骨架与 git_status`
+
+### 10.3 GM2：只读工具集（2–2.5d）
+
+**交付物**
+
+- `git_diff` / `git_log` / `git_show` / `git_blame` / `git_file_at_revision`；
+- `git_list_branches` / `git_list_tags` / `git_list_remotes` / `git_rev_parse` / `git_config_get`；
+- `git_grep` / `git_search_history`；
+- 结构化解析、`max_bytes`/`max_count`/`stat_only`/`paths` 过滤、输出截断标记；
+- 测试 fixture 与 parser 单测、临时仓库集成测试。
+
+**验收**
+
+- 所有只读工具注册且可调用；
+- 大仓/大文件不会一次输出爆炸（截断/limit 生效）；
+- 错误码稳定；路径越界被拒绝；
+- `read_only=true` 下无任何写工具注册。
+
+**提交建议**：`feat(mcp-git): GM2 只读工具集与结构化解析`
+
+### 10.4 GM3：安全写工具（2d）
+
+**交付物**
+
+- `git_stage` / `git_unstage` / `git_restore` / `git_commit` / `git_branch_create` / `git_branch_switch` / `git_branch_delete` / `git_stash`；
+- dirty 检查、保护分支、force 显式参数、commit message 校验；
+- 每 repo 锁 + 跨进程锁配置接口；
+- 写操作前后状态摘要；
+- 单元/集成/并发测试。
+
+**验收**
+
+- `read_only=false` 时写工具注册；默认仍逐工具需 Cline 确认；
+- dirty 状态下 switch/restore 默认拒绝；
+- protected branch 默认拒绝直接 commit（可配置）；
+- 并发写不损坏 index；
+- commit/branch/stash 正常且返回 before/after。
+
+**提交建议**：`feat(mcp-git): GM3 安全写工具与仓库锁`
+
+### 10.5 GM4：远端只读、Prompts 与 Resources（1.5d）
+
+**交付物**
+
+- `git_fetch`（显式开启 `--allow-remote=true` 才注册）；
+- remote URL 脱敏；
+- MCP Prompts：`write_commit_message` / `review_staged_changes` / `summarize_branch` / `explain_conflict`；
+- MCP Resources：status/head/file@ref/log；
+- 文档：工具清单与 prompt 使用说明。
+
+**验收**
+
+- 默认不注册 fetch；开启后可 fetch 本地/远端 remote；
+- prompts 能基于 staged diff 生成有效消息；
+- resources 读取不修改仓库状态。
+
+**提交建议**：`feat(mcp-git): GM4 fetch 与 prompts/resources`
+
+### 10.6 GM5：Cline 接入与文档（1–1.5d）
+
+**交付物**
+
+- Cline 配置模板（只读/可写两套）；
+- README/独立接入说明：安装、`mcp` 依赖、命令/参数、autoApprove 清单、排障；
+- 可选的 `scripts/` 启动包装；
+- 只读模式下配置示例可直接复制。
+
+**验收**
+
+- 在真实 Cline 中完成：工具列表出现、只读查询可 autoApprove、写操作弹确认；
+- 配置错误时 stderr 有明确提示；
+- 只读模式写工具不可见。
+
+**提交建议**：`docs(mcp-git): GM5 Cline 接入指南与配置模板`
+
+### 10.7 GM6：全量验收与收尾（1d）
+
+**交付物**
+
+- 全量 pytest + ruff；
+- 临时仓库端到端脚本；
+- Cline 人工冒烟记录（版本/配置/结果）；
+- 发布说明与已知限制。
+
+**验收**
+
+- 所有 GM1–GM5 用例通过；
+- `read_only=true` / `false` 两种模式均验证；
+- 文档与实现一致；
+- 无残留 git 子进程、无 stdout 污染。
+
+**提交建议**：`docs(mcp-git): GM6 验收记录与首版收尾`
+
+---
+
+## 11. 验收清单
+
+- [ ] GM1：MCP 握手/工具列表/`git_status` 通过；
+- [ ] GM2：只读工具齐全、结构化、有输出预算；
+- [ ] GM3：写工具默认关闭、dirty/保护分支/锁生效；
+- [ ] GM4：fetch 默认关闭、prompts/resources 可用；
+- [ ] GM5：真实 Cline 接入并完成只读 autoApprove + 写确认；
+- [ ] GM6：全量 pytest + ruff + 人工冒烟记录；
+- [ ] 所有路径参数在 allowlist 根内；
+- [ ] stdout 仅 MCP 协议消息；
+- [ ] `read_only=true` 下无写工具注册；
+- [ ] 残余风险已写入文档。
+
+---
+
+## 12. 后期优化建议
+
+1. **远端能力**：push/pull/rebase/cherry-pick，分支白名单、dry-run、PR 辅助；
+2. **worktree/submodule**：与 MeowMeowClaw 子代理独立工作区结合，降低共享工作区锁竞争；
+3. **HTTP/streamable transport**：远程 Cline/多客户端接入，鉴权与 TLS；
+4. **仓库索引/缓存**：大仓 log/diff 缓存、引用索引；
+5. **MCP Client 接入 MeowMeowClaw**：把 Git MCP Server 作为主 Agent 的可选工具来源；
+6. **权限审批整合**：把 Git destructive 操作接入 Cline/主项目的审批 UI；
+7. **观测导出**：审计 JSONL 之外的 metrics/OpenTelemetry；
+8. **多仓库批量操作**：workspace 级 status/diff 汇总，但写操作仍按 repo 隔离。
+
+---
+
+## 13. 风险与对策
+
+| 风险 | 影响 | 对策 |
+|---|---|---|
+| MCP SDK 版本/接口变化 | 启动/握手失败 | 锁定版本；用官方 client 做协议测试 |
+| Git 版本差异 | 参数/输出不兼容 | 记录最低版本（建议 git ≥2.30）；parser 容错 |
+| 路径/编码/CRLF | 文件解析错误 | `realpath` + bytes/text 明确编码 + Windows 测试 |
+| hooks/credential 阻塞 | 命令卡死 | 超时、`GIT_EDITOR=true`、`GIT_TERMINAL_PROMPT=0` |
+| 模型误调用写工具 | 工作区被改 | 默认只读、写工具需确认、dirty 保护、审计 |
+| Cline autoApprove 误配 | 写操作自动执行 | 文档明确只放只读工具；代码层不依赖 autoApprove |
+| 大输出撑爆上下文 | 工具失败/成本 | limit/截断/结构化摘要 |
+| 与主项目锁不协调 | 并发写冲突 | 预留 lock-dir 共用，后续与 `WorkspaceMutationGuard` 对齐 |
+
+---
+
+## 14. 实施状态（待更新）
+
+| 里程碑 | 状态 | 提交 | 备注 |
+|---|---|---|---|
+| GM1 | 待实现 | — | MCP 骨架 + RepoRegistry + git_status |
+| GM2 | 待实现 | — | 只读工具集 + 解析 + 输出预算 |
+| GM3 | 待实现 | — | 安全写 + dirty/分支保护 + 锁 |
+| GM4 | 待实现 | — | fetch + prompts/resources |
+| GM5 | 待实现 | — | Cline 接入 + 文档 |
+| GM6 | 待实现 | — | 全量验收 + 冒烟收尾 |
+
+### 14.1 实现记录
+
+（待各里程碑完成后回填提交号、用例数与验证结论。）
+
+---
+
+## 附录 A：只读模式 Cline 配置模板
+
+```json
+{
+  "mcpServers": {
+    "git": {
+      "command": "/path/to/python",
+      "args": ["-m", "meowmeowclaw_mcp_git", "--root", "/path/to/repo", "--read-only=true"],
+      "disabled": false,
+      "autoApprove": [
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_blame",
+        "git_list_branches",
+        "git_list_tags",
+        "git_list_remotes",
+        "git_grep",
+        "git_search_history",
+        "git_rev_parse",
+        "git_config_get"
+      ]
+    }
+  }
+}
+```
+
+## 附录 B：常用 Git 操作 → MCP Tool 映射
+
+| Git 命令 | MCP Tool |
+|---|---|
+| `git status` | `git_status` |
+| `git diff` / `git diff --cached` | `git_diff` |
+| `git log` | `git_log` |
+| `git show` | `git_show` |
+| `git blame` | `git_blame` |
+| `git show ref:path` | `git_file_at_revision` |
+| `git branch` | `git_list_branches` |
+| `git tag` | `git_list_tags` |
+| `git remote -v` | `git_list_remotes` |
+| `git grep` | `git_grep` |
+| `git log -S/-G` | `git_search_history` |
+| `git add` | `git_stage` |
+| `git restore --staged` | `git_unstage` |
+| `git restore` | `git_restore` |
+| `git commit` | `git_commit` |
+| `git switch -c` | `git_branch_create` |
+| `git switch` | `git_branch_switch` |
+| `git branch -d` | `git_branch_delete` |
+| `git stash` | `git_stash` |
+| `git fetch` | `git_fetch` |
+
+---
+
+> 本文是 Git MCP Server 的实现依据。评审通过后按 §10 里程碑 MG1–MG6 推进；
+> 每个阶段完成后回填 §14 实施状态，并同步对应 README/接入说明。
